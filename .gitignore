@@ -1,0 +1,27 @@
+# Xcode
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.moved-away-*
+*.xcuserstate
+
+# macOS
+.DS_Store
+.AppleDouble
+**/.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+VintageSequencer/VintageSequencer.xcodeproj/xcuserdata/
+VintageSequencer/VintageSequencer.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Local agent handoffs
+.agent_handoff/
