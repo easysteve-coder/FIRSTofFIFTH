@@ -10,6 +10,12 @@ instruments hosted inside the app.
 *Deutsch: Polyphoner, polyrhythmischer MIDI-Step-Sequencer für macOS. Die
 Oberfläche ist auf Englisch und Deutsch verfügbar.*
 
+### ⬇ [Download for macOS / Für macOS herunterladen](https://github.com/easysteve-coder/FIRSTofFIFTH/releases/latest)
+
+On the release page, click the `.dmg` file under **Assets**, open it and drag
+FIRSTofFIFTH into *Applications*. *Auf der Release-Seite unter **Assets** die
+`.dmg`-Datei anklicken, öffnen und FIRSTofFIFTH in den Programme-Ordner ziehen.*
+
 ## What's new
 
 **1.13.17** — Pad tracks with steps up to 8 bars for pads and drones; chord rolling with
