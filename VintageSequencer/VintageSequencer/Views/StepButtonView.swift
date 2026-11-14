@@ -74,6 +74,17 @@ struct StepButtonView: View {
             // GUI-02: Step-Profil — gleichmäßig beleuchteter, matter Kunststoff statt Standard-Tasterverlauf.
             PlasticKeyBackground(tint: step.isActive ? accentColor : nil, tintStrength: 0.24, cornerRadius: 5,
                                  profile: .step)
+            if track.lane.isPad {
+                // Pad-Steps (v1.13.19): weicher Farbverlauf nach rechts (der Klang hält an)
+                // und eine Kontur in Spurfarbe — auf einen Blick von Step-Spuren zu
+                // unterscheiden.
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(LinearGradient(colors: [accentColor.opacity(step.isActive ? 0.42 : 0.10),
+                                                  accentColor.opacity(step.isActive ? 0.10 : 0.02)],
+                                         startPoint: .leading, endPoint: .trailing))
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(accentColor.opacity(step.isActive ? 0.7 : 0.3), lineWidth: 1)
+            }
             if isSelected || isLearnTarget {
                 RoundedRectangle(cornerRadius: 5).fill(bgColor)
                 RoundedRectangle(cornerRadius: 5).stroke(borderColor, lineWidth: 1.25)

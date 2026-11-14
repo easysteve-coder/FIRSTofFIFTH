@@ -199,11 +199,18 @@ struct PlaybackStateBundle: Sendable {
     /// Tick-Thread wechselt an der Track-0-Grenze selbst darauf (Aktivierung `serial + 1`)
     /// — der erste Step des neuen Patterns fällt exakt auf die Grenze, ohne Main-Hop.
     let queued:   PatternSnapshot?
+    /// Song (v1.14.0): absoluter Puls (seit Sitzungsbeginn), auf dem zu `queued` gewechselt
+    /// wird — eine Taktgrenze. −1 = an der Track-0-Grenze (manueller Wechsel).
+    let switchAtPulse: Int
+    /// Song-Ende ohne Loop: ab diesem Puls schlägt der Tick-Thread nichts mehr an. −1 = nie.
+    let stopAtPulse:   Int
 
     init(snapshot: PatternSnapshot, bpm: Double, swing: Double,
-         serial: Int = 0, queued: PatternSnapshot? = nil) {
+         serial: Int = 0, queued: PatternSnapshot? = nil,
+         switchAtPulse: Int = -1, stopAtPulse: Int = -1) {
         self.snapshot = snapshot; self.bpm = bpm; self.swing = swing
         self.serial = serial; self.queued = queued
+        self.switchAtPulse = switchAtPulse; self.stopAtPulse = stopAtPulse
     }
 }
 

@@ -173,6 +173,7 @@ final class TrackData: Identifiable {
         laneCopy.direction             = lane.direction
         laneCopy.stepLengthNumerator   = lane.stepLengthNumerator
         laneCopy.isPad                 = lane.isPad
+        laneCopy.padWidth              = lane.padWidth
         laneCopy.fixedNote             = lane.fixedNote
         laneCopy.stepLengthDenominator = lane.stepLengthDenominator
         // CC-Lane payload (CC-Lane Slice 1): für .step sind diese Felder leer/default

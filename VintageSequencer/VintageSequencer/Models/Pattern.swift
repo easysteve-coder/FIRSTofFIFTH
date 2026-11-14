@@ -3,6 +3,8 @@ import Combine
 
 final class Pattern: ObservableObject, Identifiable {
     let id = UUID()
+    /// Pattern-Plätze A–P (v1.14.0; bis v1.13.19 A–D).
+    static let slotNames: [String] = (0..<16).map { String(UnicodeScalar(UInt8(65 + $0))) }
     @Published var name:   String
     @Published var tracks: [TrackData]
 

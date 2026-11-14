@@ -82,6 +82,36 @@ struct GUI01SceneRenderTests {
         UserDefaults.standard.removeObject(forKey: "appLanguage")
     }
 
+    /// Pad-Spur (v1.13.19): eigene Optik, eigene Breite, Längenetikett — Bild für den Menschen.
+    @Test func renderPadTrackScene() {
+        let notes = NotesStore()
+        let engine = scene(lang: "de")
+        let pad = engine.addTrack(kind: .step, pad: true).first!.track
+        pad.colorIndex = 3
+        UserDefaults.standard.set("epic", forKey: SequencerEngine.padChordFamilyKey)
+        engine.randomize(track: pad)
+        UserDefaults.standard.removeObject(forKey: SequencerEngine.padChordFamilyKey)
+        pad.lane.padWidth = 3
+        pad.lane.steps[3].isHold = true
+        engine.stepWidthState.size = 54
+        #expect(render(mainView(engine, notes: notes), size: CGSize(width: 1600, height: 1400), name: "pad-de"))
+        UserDefaults.standard.removeObject(forKey: "appLanguage")
+    }
+
+    @Test func renderSongScene() {
+        let notes = NotesStore()
+        let engine = scene(lang: "de")
+        engine.replaceSong(Song(scenes: [SongScene(pattern: 0, bars: 4), SongScene(pattern: 1, bars: 8),
+                                         SongScene(pattern: 0, bars: 4), SongScene(pattern: 2, bars: 2),
+                                         SongScene(pattern: 9, bars: 16)],
+                                enabled: true, loops: true))
+        engine.songState.playingScene = 1
+        engine.currentPatternIndex = 1
+        engine.transportState.queuedPatternIndex = 0
+        #expect(render(mainView(engine, notes: notes), size: CGSize(width: 1600, height: 900), name: "song-de"))
+        UserDefaults.standard.removeObject(forKey: "appLanguage")
+    }
+
     @Test func renderStepButtonStates() {
         let engine = scene(lang: "en")
         let track = engine.viewModel(for: engine.currentPattern.tracks[0])

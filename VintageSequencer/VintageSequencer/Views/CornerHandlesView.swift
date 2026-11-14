@@ -33,6 +33,10 @@ struct CornerHandlesView: View {
     private var interactionController: InteractionController { engine.interactionController }
     @Environment(\.undoManager) private var undoManager
 
+    /// Ziehen am Längen-Anfasser läuft (nur Anzeige): bei Pad-Lanes erscheint die Länge
+    /// am Anfasser, weil sich die Breite im kompakten Raster nicht ändert (v1.13.18).
+    @State private var isDraggingLength = false
+
     private var currentRatioIndex: Int {
         track.lane.ratioOptions.firstIndex(where: {
             $0.num == track.lane.stepLengthNumerator && $0.den == track.lane.stepLengthDenominator
@@ -61,6 +65,7 @@ struct CornerHandlesView: View {
                 color: accentColor.opacity(0.7),
                 dotAtTop: true,
                 onStart: {
+                    isDraggingLength = true
                     let contentUnit = CGFloat(track.lane.stepCount)
                                     * (stepWidthSize + VintageTheme.stepSpacing)
                     interactionController.beginRatioDrag(
@@ -73,6 +78,7 @@ struct CornerHandlesView: View {
                     interactionController.updateRatioDrag(totalX: totalX, track: track.data)
                 },
                 onEnd: {
+                    isDraggingLength = false
                     interactionController.commitRatioDrag(
                         track:       track.data,
                         undoManager: undoManager
@@ -82,6 +88,20 @@ struct CornerHandlesView: View {
                     interactionController.applyEdgeScroll(velocity: velocity)
                 }
             )
+            .overlay(alignment: .topTrailing) {
+                if isDraggingLength && track.lane.isPad {
+                    Text(TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
+                                              den: track.lane.stepLengthDenominator))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: 3).fill(accentColor))
+                        .fixedSize()
+                        .offset(x: 6, y: -18)
+                        .allowsHitTesting(false)
+                }
+            }
 
             Spacer()
 

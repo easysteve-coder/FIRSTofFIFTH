@@ -5,6 +5,62 @@ Format: [Semantische Versionierung](https://semver.org/lang/de/)
 
 ---
 
+## [1.14.0] — 2026-11-14
+
+### Song-Lane und 16 Patterns
+
+**Neu**
+- **Song-Lane** über den Spuren: Szenen aneinanderreihen, je Szene ein Pattern und eine Länge
+  in Takten (1–64). Klick auf eine Szene wählt Pattern und Länge, Rechtsklick dupliziert,
+  verschiebt oder löscht; alles mit Undo. Die laufende Szene leuchtet.
+- **Song-Modus** (ON/OFF): Play beginnt mit der ersten Szene; die Patterns wechseln exakt auf
+  dem Taktstrich, unabhängig von der Länge von Track 1. Folgen zwei Szenen mit demselben
+  Pattern, läuft es ohne Neustart durch. **LOOP/ENDE** je Song: am Ende von vorn oder anhalten.
+- **16 Patterns (A–P)** statt 4; in der Transportleiste in zwei Reihen. ⌘1 … ⌘9 wählen A … I,
+  J … P stehen im Menü *Sequencer*.
+
+**Geändert**
+- Pattern-Wechsel per CC in Achterschritten: 0–7 = A, 8–15 = B … 120–127 = P (bisher 0–31 = A
+  … 96–127 = D). Wer A–D über einen Controller umschaltet, muss die Werte anpassen.
+- Während der Song läuft, sind die Pattern-Tasten ohne Wirkung — die Szenen bestimmen das
+  Pattern.
+
+**Presetformat:** neuer optionaler Schlüssel `song`; Dateien enthalten jetzt 16 Patterns.
+Ältere Versionen laden sie, ignorieren den Song und zeigen nur A–D.
+
+---
+
+## [1.13.19] — 2026-11-14
+
+### Pad-Spuren: eigene Breite, eigene Optik
+
+**Neu**
+- Pad-Spuren haben eine eigene Rasterbreite: ↔-Taste im Spurkopf, 1 bis 8 Step-Breiten je
+  Pad-Step, mit Undo. Die Breite ist nur Anzeige — die Steplänge bleibt, wie sie ist. Neue
+  Pad-Spuren starten mit doppelter Breite.
+- Pad-Spuren sehen anders aus als Step-Spuren: PAD-Schild im Spurkopf, Pad-Steps mit Verlauf
+  in Spurfarbe nach rechts (der Klang hält an) und farbiger Kontur.
+
+**Presetformat:** neuer optionaler Schlüssel `padWidth` (nur bei Pad-Spuren mit Breite ≠ 1).
+Ältere Versionen ignorieren ihn.
+
+---
+
+## [1.13.18] — 2026-11-14
+
+### Pad-Länge ziehen mit Anzeige
+
+**Behoben**
+- Pad-Tracks: Die Steplänge ließ sich am oberen Anfasser (Punkt) nicht ziehen — der Ziehweg
+  war in echter Dauer gerechnet und für 1 → 2 Takte unerreichbar lang. Jetzt wechselt je
+  Step-Breite Ziehweg eine Längenstufe (1/4 … 8 Takte).
+
+**Neu**
+- Jeder Pad-Step zeigt seine Länge („2 T“) oben rechts; sie folgt dem Ziehen live. Beim Ziehen
+  am Anfasser erscheint die Länge zusätzlich groß am Anfasser.
+
+---
+
 ## [1.13.17] — 2026-11-14
 
 ### Spurkopf: ganze Tasten klickbar, Rechtsklick überall

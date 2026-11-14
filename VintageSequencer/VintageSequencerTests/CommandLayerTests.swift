@@ -166,13 +166,13 @@ private func makeEngine() -> (SequencerEngine, UndoManager) {
         #expect(!um.canUndo, "Undo-Einträge des alten Projekts dürfen das neue nicht verändern")
     }
 
-    @Test func fewerThanFourPatternsArePaddedAndIndexStaysValid() throws {
+    @Test func fewerThanSixteenPatternsArePaddedAndIndexStaysValid() throws {
         let (engine, _) = makeEngine()
         let two = try JSONEncoder().encode(
             PresetManager.PresetFile(bpm: 100, swing: 50, patterns: [Pattern(name: "A"), Pattern(name: "B")]))
-        engine.switchPattern(3)
+        engine.switchPattern(12)
         #expect(engine.loadData(two))
-        #expect(engine.patterns.count == 4)
+        #expect(engine.patterns.count == Pattern.slotNames.count)
         #expect(engine.patterns.indices.contains(engine.currentPatternIndex))
         _ = engine.currentPattern   // darf nicht trappen
     }

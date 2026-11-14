@@ -10,7 +10,7 @@ extension SequencerEngine {
     func handleIncomingCC(_ number: Int, _ value: Int) {
         // Pattern switch via CC
         if patternSwitchCC >= 0, number == patternSwitchCC {
-            let idx = min(value / 32, 3)   // 0-31=A, 32-63=B, 64-95=C, 96-127=D
+            let idx = min(value / 8, Pattern.slotNames.count - 1)   // 0–7=A, 8–15=B … 120–127=P (v1.14.0)
             switchPattern(idx)
         }
         // Track mute toggle via CC

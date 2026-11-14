@@ -200,12 +200,17 @@ struct VintageSequencerApp: App {
 
                 Divider()
 
-                ForEach(0..<4) { i in
-                    Button(s.patternMenuItem(["A","B","C","D"][i])) {
+                ForEach(0..<9, id: \.self) { i in
+                    Button(s.patternMenuItem(Pattern.slotNames[i])) {
                         engine.switchPattern(i)
                     }
                     .keyboardShortcut(KeyEquivalent(Character(String(i + 1))),
                                       modifiers: .command)
+                }
+                Menu(s.patternMenuMore) {
+                    ForEach(9..<Pattern.slotNames.count, id: \.self) { i in
+                        Button(s.patternMenuItem(Pattern.slotNames[i])) { engine.switchPattern(i) }
+                    }
                 }
 
                 Divider()

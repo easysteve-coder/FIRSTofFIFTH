@@ -179,15 +179,24 @@ struct TransportView: View {
                     .font(VintageTheme.monoSmall)
                     .foregroundColor(VintageTheme.textSecondary)
                     .fixedSize()
-                HStack(spacing: 4) {
-                    ForEach(0..<4) { i in
-                        Button(["A","B","C","D"][i]) { engine.switchPattern(i) }
-                            .buttonStyle(VintagePatternButtonStyle(
-                                isActive: ts.currentPatternIndex == i,
-                                isQueued: ts.queuedPatternIndex == i))
-                            .help(tip(ts.queuedPatternIndex == i
-                                  ? s.patternQueuedTip(["A","B","C","D"][i])
-                                  : s.patternSwitchTip(["A","B","C","D"][i], i + 1)))
+                // 16 Patterns (v1.14.0) in zwei Reihen A–H / I–P.
+                VStack(spacing: 2) {
+                    ForEach(0..<2, id: \.self) { row in
+                        HStack(spacing: 2) {
+                            ForEach(0..<8, id: \.self) { col in
+                                let i = row * 8 + col
+                                let name = Pattern.slotNames[i]
+                                Button(name) { engine.switchPattern(i) }
+                                    .buttonStyle(VintagePatternButtonStyle(
+                                        isActive: ts.currentPatternIndex == i,
+                                        isQueued: ts.queuedPatternIndex == i,
+                                        compact: true))
+                                    .help(tip(ts.queuedPatternIndex == i
+                                          ? s.patternQueuedTip(name)
+                                          : (i < 9 ? s.patternSwitchTip(name, i + 1)
+                                                   : s.patternSwitchTipNoKey(name))))
+                            }
+                        }
                     }
                 }
             }

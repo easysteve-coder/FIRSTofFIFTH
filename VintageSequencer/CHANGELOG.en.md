@@ -5,6 +5,61 @@ Notable changes per version. The detailed German changelog, including technical 
 
 ---
 
+## [1.14.0] — 2026-11-14
+
+### Song lane and 16 patterns
+
+**New**
+- **Song lane** above the tracks: chain scenes, each a pattern and a length in bars (1–64).
+  Click a scene to choose its pattern and length; right-click to duplicate, move or delete; all
+  with undo. The playing scene lights up.
+- **Song mode** (ON/OFF): Play starts with the first scene; patterns change exactly on the bar
+  line, regardless of how long track 1 is. Two scenes in a row with the same pattern play
+  through without restarting it. **LOOP/END** per song: start again or stop at the end.
+- **16 patterns (A–P)** instead of 4, in two rows in the transport bar. ⌘1 … ⌘9 select A … I;
+  J … P are in the *Sequencer* menu.
+
+**Changed**
+- Pattern switching via CC now uses steps of 8: 0–7 = A, 8–15 = B … 120–127 = P (previously
+  0–31 = A … 96–127 = D). If you switch A–D from a controller, adjust its values.
+- While the song plays, the pattern buttons have no effect — the scenes choose the pattern.
+
+**Preset format:** new optional key `song`; files now contain 16 patterns. Older versions load
+them, ignore the song and show only A–D.
+
+---
+
+## [1.13.19] — 2026-11-14
+
+### Pad tracks: own width, own look
+
+**New**
+- Pad tracks have their own grid width: the ↔ button in the track header sets 1 to 8 step widths
+  per pad step, with undo. The width only affects the display — the step length stays as it is.
+  New pad tracks start at double width.
+- Pad tracks look different from step tracks: a PAD badge in the track header, pad steps with a
+  gradient in the track colour fading to the right (the sound sustains) and a coloured outline.
+
+**Preset format:** new optional key `padWidth` (only on pad tracks with a width other than 1).
+Older versions ignore it.
+
+---
+
+## [1.13.18] — 2026-11-14
+
+### Drag pad step length with visual feedback
+
+**Fixed**
+- Pad tracks: the step length could not be dragged with the top handle (dot) — the drag
+  distance was computed in real time and was unreachably long for 1 → 2 bars. Now each step
+  width of drag changes one length level (1/4 … 8 bars).
+
+**New**
+- Every pad step shows its length ("2 T" = 2 bars) in the top right corner, updated live while
+  dragging. While dragging the handle, the length is also shown large next to it.
+
+---
+
 ## [1.13.17] — 2026-11-14
 
 ### Track header: whole buttons clickable, right-click anywhere

@@ -353,6 +353,21 @@ struct ModelWriter {
                     backward: { l in l.fixedNote = old; l.changed.send() }
                 )
             }
+
+        case let .setPadWidth(trackID, old, new):
+            assert(td.id == trackID,
+                   "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
+            let lane = td.lane
+            lane.padWidth = new
+            lane.changed.send()
+            if let um = undoManager {
+                registerReversibleUndo(
+                    um: um, target: lane,
+                    actionName: command.undoActionName,
+                    forward:  { l in l.padWidth = new; l.changed.send() },
+                    backward: { l in l.padWidth = old; l.changed.send() }
+                )
+            }
         }
     }
 }

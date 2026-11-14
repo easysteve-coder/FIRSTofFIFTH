@@ -279,7 +279,10 @@ final class InteractionController: ObservableObject {
             baseRatioIndex:      baseRatioIndex,
             contentUnit:         contentUnit,
             scrollOffsetAtStart: viewportController.scrollState.hScrollOffset,
-            ratios:              track.lane.ratioOptions
+            ratios:              track.lane.ratioOptions,
+            pxPerRatioStep:      track.lane.isPad
+                                    ? contentUnit / CGFloat(max(1, track.lane.stepCount))
+                                    : nil
         ))
         isSessionActive = true
         sessionCursorHint = .resizeHorizontal

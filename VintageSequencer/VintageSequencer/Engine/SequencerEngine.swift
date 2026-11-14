@@ -78,7 +78,7 @@ class SequencerEngine: ObservableObject {
         set { presetEditorState.swing = newValue }
     }
 
-    @Published var patterns: [Pattern] = ["A","B","C","D"].map { Pattern(name: $0) }
+    @Published var patterns: [Pattern] = Pattern.slotNames.map { Pattern(name: $0) }
     var numTracks: Int { currentPattern.tracks.count }  // D3: computed — kein manuelles Sync nötig
     /// Höhe der Step-Buttons — fix auf L (54 px).
     let stepDisplaySize: Double = 54
@@ -111,6 +111,10 @@ class SequencerEngine: ObservableObject {
     /// PlaybackDisplayState-Objekt, damit Drain-Timer-Writes keine Engine-weite
     /// SwiftUI-Re-Render-Kaskade auslösen. Analog zu scrollState.
     let playbackDisplay = PlaybackDisplayState()
+    /// Song (v1.14.0): Szenenfolge über allen Patterns; eigenes State-Objekt, nur die
+    /// Song-Lane beobachtet es.
+    let songState = SongState()
+    var song: Song { songState.song }
 
     /// Horizontaler Scroll-Offset — in eigenem ScrollState-Objekt,
     /// damit Scroll-Events keine Engine-weite Re-Render-Kaskade auslösen.
@@ -344,6 +348,24 @@ class SequencerEngine: ObservableObject {
     /// (= neue Aktivierungsnummer). Main gleicht damit `currentPatternIndex` ab. Zustellung
     /// über dieses Atomic ist verlustfrei; das Ring-Event ist nur der Weckruf.
     private let rtSwitchedSerial = ManagedAtomic<Int>(0)
+    /// Tick-Thread-only: Pulse seit Sitzungsbeginn (erster Tick = 0). Song-Wechsel und
+    /// Song-Ende sind als absolute Pulse im Bundle angegeben (v1.14.0).
+    private var rtPulse = 0
+    /// Puls, auf dem der Tick-Thread zuletzt gewechselt hat. Geschrieben VOR dem releasing-
+    /// Store von `rtSwitchedSerial`; Main liest ihn nach dessen acquiring-Load.
+    private let rtSwitchPulse = ManagedAtomic<Int>(0)
+    /// Vom Tick-Thread gesetzt, sobald das Songende (`stopAtPulse`) erreicht ist; Main hält an.
+    private let rtSongEnded = ManagedAtomic<Bool>(false)
+
+    // MARK: Song-Steuerung (Main-only, v1.14.0)
+    /// Szene, deren Lauf gerade spielt; nil = kein Song-Lauf.
+    private var songRunStart: Int? = nil
+    /// Puls, auf dem dieser Lauf begann.
+    private var songRunStartPulse = 0
+    /// Vorgemerkte nächste Szene (deren Pattern ist `queuedPatternIndex`).
+    private var songNextScene: Int? = nil
+    private var songSwitchAtPulse = -1
+    private var songStopAtPulse   = -1
 
     // MARK: Notenbuch (v1.12.19; v1.12.22: Offs werden erst kurz vor ihrem Zeitpunkt gesendet)
     //
@@ -1095,6 +1117,10 @@ class SequencerEngine: ObservableObject {
 
             // Falls das Weck-Event bei vollem Ring verworfen wurde: hier nachziehen.
             if self.reconcilePatternSwitch() { self.publishSnapshot() }
+            // Songende erreicht (Tick-Thread spielt nichts mehr an): anhalten.
+            if self.rtSongEnded.exchange(false, ordering: .acquiringAndReleasing), self.isPlaying {
+                self.stop()
+            }
 
             // --- 4. S01: abgebrochene Gesamttick sichtbar machen (StatusBar) ---
             self.syncSnapshotAcquireDisplay()
@@ -1311,7 +1337,105 @@ class SequencerEngine: ObservableObject {
         queuedPatternIndex  = nil
         currentPatternIndex = idx
         playbackDisplay.steps = Array(repeating: -1, count: patterns[idx].tracks.count)
+        // Das abgelöste Pattern gibt seine Runtime-Slots ab: der Tick-Thread spielt bereits
+        // die Vormerkung, und kehrt das Pattern später zurück (Song), beginnt es frisch.
+        releaseUnusedSlots(keeping: Set(patterns[idx].tracks.map(\.id)))
+        if let next = songNextScene {
+            // Song: der Wechsel lag auf `rtSwitchPulse` — dort beginnt der neue Lauf.
+            songRunStart      = next
+            songRunStartPulse = rtSwitchPulse.load(ordering: .relaxed)
+            scheduleSongNext()
+        }
         return true
+    }
+
+    // MARK: - Song (v1.14.0)
+
+    /// Song-Start (Main, im Stop-Zustand oder bei externem Neustart, vor `beginRuntimeSession`):
+    /// erstes Szenen-Pattern aktivieren, ersten Lauf ab Puls 0, nächsten Wechsel vormerken.
+    private func beginSongIfActive() {
+        clearSongSchedule()
+        rtSongEnded.store(false, ordering: .releasing)
+        guard song.isActive else { return }
+        let first = song.scenes[0].pattern
+        if patterns.indices.contains(first), first != currentPatternIndex { applyPatternSwitch(first) }
+        songRunStart      = 0
+        songRunStartPulse = 0
+        scheduleSongNext()
+    }
+
+    /// Merkt aus dem laufenden Lauf den nächsten Wechsel (Pattern + absoluter Puls) oder das
+    /// Songende vor. Publiziert nicht — der Aufrufer tut das (bzw. publishSnapshot baut danach).
+    private func scheduleSongNext() {
+        guard let start = songRunStart, song.isActive, song.scenes.indices.contains(start) else {
+            clearSongSchedule(); return
+        }
+        let run = song.run(from: start, playing: currentPatternIndex)
+        let end = songRunStartPulse + run.bars * Song.pulsesPerBar
+        songState.playingScene = start
+        switch run.then {
+        case .scene(let i) where patterns.indices.contains(song.scenes[i].pattern):
+            songNextScene      = i
+            songSwitchAtPulse  = end
+            songStopAtPulse    = -1
+            queuedPatternIndex = song.scenes[i].pattern
+        case .scene, .end:
+            songNextScene      = nil
+            songSwitchAtPulse  = -1
+            songStopAtPulse    = end
+            queuedPatternIndex = nil
+        case .never:
+            songNextScene      = nil
+            songSwitchAtPulse  = -1
+            songStopAtPulse    = -1
+            queuedPatternIndex = nil
+        }
+    }
+
+    /// Hebt jede Song-Vormerkung auf (Stop, Song aus). Lässt `queuedPatternIndex` nur dann
+    /// stehen, wenn er nicht vom Song stammt.
+    private func clearSongSchedule() {
+        if songNextScene != nil { queuedPatternIndex = nil }
+        songRunStart      = nil
+        songNextScene     = nil
+        songSwitchAtPulse = -1
+        songStopAtPulse   = -1
+        if songState.playingScene != nil { songState.playingScene = nil }
+    }
+
+    /// Ersetzt den Song mit Undo. Läuft gerade ein Song, gilt die Änderung ab dem nächsten
+    /// Wechsel (der laufende Lauf wird neu berechnet).
+    func setSongUndoable(_ new: Song, actionName: String) {
+        let old = song
+        guard new != old else { return }
+        applySong(new)
+        guard let um = undoManager else { return }
+        registerReversibleUndo(um: um, target: self, actionName: actionName,
+                               forward:  { $0.applySong(new) },
+                               backward: { $0.applySong(old) })
+    }
+
+    private func applySong(_ new: Song) {
+        var s = new
+        s.clamp(patternCount: patterns.count)
+        songState.song = s
+        hasUnsavedChanges = true
+        guard isPlaying, songRunStart != nil else { return }
+        reconcilePatternSwitch()
+        if !song.isActive {
+            clearSongSchedule()
+        } else {
+            songRunStart = min(songRunStart ?? 0, song.scenes.count - 1)
+            scheduleSongNext()
+        }
+        publishSnapshot()
+    }
+
+    /// Ohne Undo (Laden/Neu): der Undo-Stapel wird dort ohnehin geleert.
+    func replaceSong(_ new: Song) {
+        var s = new
+        s.clamp(patternCount: patterns.count)
+        songState.song = s
     }
 
     /// Veröffentlicht einen neuen PlaybackStateBundle atomar — kein Lock, kein Blocking.
@@ -1342,8 +1466,11 @@ class SequencerEngine: ObservableObject {
             live.formUnion(patterns[q].tracks.map(\.id))
         }
         releaseUnusedSlots(keeping: live)
+        let songQueued = queued != nil && songNextScene != nil
         let bundle = PlaybackStateBundle(snapshot: snap, bpm: bpmOverride ?? bpm, swing: swing,
-                                         serial: patternSerial, queued: queued)
+                                         serial: patternSerial, queued: queued,
+                                         switchAtPulse: songQueued ? songSwitchAtPulse : -1,
+                                         stopAtPulse: songStopAtPulse)
         let newBox = PlaybackBundleBox(bundle)
 
         let superseded = bundleCurrent   // bisher aktuelle Box — wird jetzt abgelöst
@@ -1524,6 +1651,8 @@ class SequencerEngine: ObservableObject {
             sendPendingNoteOffs()
         }
         // Runtime und Snapshot aufbauen, bevor die Clock startet.
+        // Song-Modus: erstes Szenen-Pattern aktivieren und den ersten Wechsel vormerken.
+        beginSongIfActive()
         let trackCount           = currentPattern.tracks.count
         // Neue Sitzung: frische Slot-Epochen → jeder Track startet mit frischer Runtime.
         // Quieszent — die Clock läuft noch nicht, isPlayingRT ist false.
@@ -1604,6 +1733,7 @@ class SequencerEngine: ObservableObject {
         // aussteht, bekommt jetzt ein sofortiges Off (Notenbuch). Im Deferred-Pfad
         // läuft das erst nach bewiesener Quieszenz (scheduleDeferredRTStateCleanup).
         if !stopCleanupPending { sendPendingNoteOffs() }
+        clearSongSchedule()
         queuedPatternIndex  = nil
         extResetRequested.store(true, ordering: .releasing)   // EXT-Messzustand: MIDI-Thread setzt selbst zurück
         for td in currentPattern.tracks {
@@ -1974,6 +2104,8 @@ class SequencerEngine: ObservableObject {
     /// alten gelegen hätte. Main zieht Index und Anzeige nach (reconcilePatternSwitch).
     func switchPattern(_ idx: Int) {
         guard (0..<patterns.count).contains(idx) else { return }
+        // Im laufenden Song bestimmt die Szenenfolge das Pattern.
+        if isPlaying && songRunStart != nil { return }
         if isPlaying {
             reconcilePatternSwitch()
             // Das aktuelle Pattern erneut wählen hebt eine Vormerkung auf.
@@ -2006,6 +2138,7 @@ class SequencerEngine: ObservableObject {
             // Lebenszyklus (resume/suspend) ein zweites Mal zu durchlaufen.
             guard !isContinue else { return }
             queuedPatternIndex = nil
+            beginSongIfActive()
             beginRuntimeSession()
             playbackDisplay.steps = Array(repeating: -1, count: currentPattern.tracks.count)
             publishSnapshot()
@@ -2265,11 +2398,30 @@ class SequencerEngine: ObservableObject {
             if let q = bundle.queued, rtActiveSerial == bundle.serial &+ 1 {
                 snap = q
             } else {
+                // Höhere Aktivierung ohne Vormerkung = neue Sitzung: Pulszähler von vorn.
+                if bundle.serial > rtActiveSerial { rtPulse = 0 }
                 rtActiveSerial = bundle.serial
             }
         }
-        if rtActiveSerial == bundle.serial, let q = bundle.queued, track0WillWrap(in: snap) {
+        let pulse = rtPulse
+        rtPulse &+= 1
+        // Songende (v1.14.0): ab `stopAtPulse` kein neuer Anschlag mehr; Main hält an.
+        // Fällige Offs laufen weiter aus.
+        if bundle.stopAtPulse >= 0, pulse >= bundle.stopAtPulse {
+            rtSongEnded.store(true, ordering: .releasing)
+            displaySignal?.or(data: 1)
+            flushDueNoteOffs(upTo: tickTime)
+            return true
+        }
+        // Wechselgrenze: im Song der vorgegebene Takt-Puls, sonst das Ende von Track 0. Liegt
+        // der Puls schon zurück (Song während des Laufs gekürzt), an der nächsten Taktgrenze.
+        let atBoundary = bundle.switchAtPulse >= 0
+            ? pulse >= bundle.switchAtPulse
+              && (pulse &- bundle.switchAtPulse) % Song.pulsesPerBar == 0
+            : track0WillWrap(in: snap)
+        if rtActiveSerial == bundle.serial, let q = bundle.queued, atBoundary {
             rtActiveSerial = bundle.serial &+ 1
+            rtSwitchPulse.store(pulse, ordering: .relaxed)
             rtSwitchedSerial.store(rtActiveSerial, ordering: .releasing)
             engineEventBuffer.pushPatternSwitch(patternIdx: 0)   // Weckruf für Main
             displaySignal?.or(data: 1)
@@ -2520,6 +2672,7 @@ class SequencerEngine: ObservableObject {
         if pad, kind == .step {
             // Pad-Lane (v1.13.16): 4 Steps à 1 Takt, legato.
             lane.isPad = true
+            lane.padWidth = 2
             lane.stepLengthNumerator = 16
             lane.stepLengthDenominator = 1
             for i in lane.steps.indices { lane.steps[i].gate = 1.0 }

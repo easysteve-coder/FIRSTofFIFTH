@@ -327,6 +327,18 @@ struct StepGridView: View {
                 },
                 onEdit: { editIndex = i })
             .equatable()    // P3: nur bei isCurrentStep / isSelected / width re-rendern
+            .overlay(alignment: .topTrailing) {
+                // Pad-Lane: Länge jedes Steps sichtbar, folgt dem Ziehen live (v1.13.18).
+                if track.lane.isPad {
+                    Text(TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
+                                              den: track.lane.stepLengthDenominator))
+                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .foregroundColor(accentColor.opacity(0.85))
+                        .padding(.top, 4)
+                        .padding(.trailing, 5)
+                        .allowsHitTesting(false)
+                }
+            }
             .overlay(alignment: .bottom) {
                 // Pad-Lane: lange Steps zeigen, wie weit der laufende Step ist.
                 if isCurrent && track.lane.isPad {

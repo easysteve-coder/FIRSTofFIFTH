@@ -58,6 +58,7 @@ struct Str {
                 : e("Mute Track \(n)",   "Spur \(n) stummschalten")
     }
     func patternMenuItem(_ letter: String) -> String { "Pattern \(letter)" }
+    var patternMenuMore: String { e("Patterns J–P", "Patterns J–P") }
 
     // MARK: - Transport
 
@@ -201,6 +202,40 @@ struct Str {
     var padLengthHelp:       String { e("Step length of the pad track (4/4 bars).",
                                         "Steplänge des Pad-Tracks (4/4-Takte).") }
     var holdLabel:           String { e("HOLD", "HALTEN") }
+    var padWidthHeader:      String { e("PAD WIDTH", "PAD-BREITE") }
+    // Song (v1.14.0)
+    var songHeader:          String { "SONG" }
+    var songLoopLabel:       String { "LOOP" }
+    var songEndLabel:        String { e("END", "ENDE") }
+    var songPatternHeader:   String { "PATTERN" }
+    var songBarsHeader:      String { e("BARS", "TAKTE") }
+    func songBars(_ n: Int) -> String { "\(n) T" }
+    var songEmptyHint:       String { e("No scenes yet — + adds one. A scene plays a pattern for a number of bars.",
+                                        "Noch keine Szenen — + fügt eine hinzu. Eine Szene spielt ein Pattern für eine Anzahl Takte.") }
+    var songEnableTip:       String { e("Song mode: Play runs the scenes in order; patterns change exactly on the bar line",
+                                        "Song-Modus: Play spielt die Szenen der Reihe nach; Patterns wechseln genau auf dem Taktstrich") }
+    var songDisableTip:      String { e("Song mode is on — click to play single patterns again",
+                                        "Song-Modus ist an — klicken, um wieder einzelne Patterns zu spielen") }
+    var songLoopTip:         String { e("At the end the song starts again — click: stop at the end",
+                                        "Am Ende beginnt der Song von vorn — klicken: am Ende anhalten") }
+    var songEndTip:          String { e("At the end the song stops — click: loop",
+                                        "Am Ende hält der Song an — klicken: Schleife") }
+    var songAddTip:          String { e("Add scene", "Szene hinzufügen") }
+    var songSceneTip:        String { e("Click: choose pattern and length · right-click: menu",
+                                        "Klick: Pattern und Länge wählen · Rechtsklick: Menü") }
+    var songDeleteScene:     String { e("Delete Scene", "Szene löschen") }
+    var songDuplicateScene:  String { e("Duplicate Scene", "Szene duplizieren") }
+    var songMoveLeft:        String { e("Move Left", "Nach links") }
+    var songMoveRight:       String { e("Move Right", "Nach rechts") }
+    var undoSong:            String { e("Edit Song", "Song bearbeiten") }
+    var patternSongLockedTip: String { e("Song is playing — the scenes choose the pattern",
+                                         "Song läuft — die Szenen bestimmen das Pattern") }
+    func patternSwitchTipNoKey(_ letter: String) -> String {
+        e("Switch to Pattern \(letter) · switches at end of Track 1",
+          "Pattern \(letter) wechseln · Wechsel erfolgt am Ende von Track 1")
+    }
+    var padWidthHelp:        String { e("Display width of this pad track's steps, in normal step widths. Only changes the view, not the sound.",
+                                        "Anzeigebreite der Steps dieses Pad-Tracks in normalen Stepbreiten. Ändert nur die Ansicht, nicht den Klang.") }
     var fixedNoteLabel:      String { e("ONE NOTE", "EIN TON") }
     var fixedNoteHelp:       String { e("One note for the whole track: every step plays this note (e.g. a kick). The steps keep their own notes and get them back when switched off.",
                                         "Ein Ton für die ganze Spur: Jeder Step spielt diesen Ton (z. B. eine Kick). Die Steps behalten ihre eigenen Noten und bekommen sie beim Ausschalten zurück.") }
@@ -342,8 +377,8 @@ struct Str {
     var settingsRefreshPorts: String { e("Refresh MIDI Ports", "MIDI-Ports aktualisieren") }
     var settingsCCRemote:    String { e("CC REMOTE CONTROL", "CC-FERNSTEUERUNG") }
     var settingsPatternCC:   String { e("Pattern switch CC#", "Pattern-Wechsel CC#") }
-    var settingsPatternCCHint: String { e("Values 0–31=A  32–63=B  64–95=C  96–127=D",
-                                          "Werte 0–31=A  32–63=B  64–95=C  96–127=D") }
+    var settingsPatternCCHint: String { e("Steps of 8: 0–7=A  8–15=B  16–23=C … 120–127=P",
+                                          "Achterschritte: 0–7=A  8–15=B  16–23=C … 120–127=P") }
     func settingsMuteCC(_ n: Int) -> String { e("Mute Track \(n) CC#", "Spur \(n) stumm CC#") }
     var settingsOff:         String { e("Off", "Aus") }
 

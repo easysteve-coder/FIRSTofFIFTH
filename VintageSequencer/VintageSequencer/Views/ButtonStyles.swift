@@ -38,13 +38,15 @@ struct VintageSmallButtonStyle: ButtonStyle {
 struct VintagePatternButtonStyle: ButtonStyle {
     var isActive: Bool
     var isQueued: Bool = false   // Pattern ist eingereiht — blinkt
+    /// Kleine Ausführung für die 16 Pattern-Tasten der Transportleiste (v1.14.0).
+    var compact: Bool = false
 
     func makeBody(configuration: Configuration) -> some View {
         let queueColor = Color(red: 0.3, green: 0.8, blue: 1.0)
         configuration.label
-            .font(VintageTheme.monoBold)
+            .font(compact ? .system(size: 9, weight: .bold, design: .monospaced) : VintageTheme.monoBold)
             .foregroundColor(isActive ? .black : (isQueued ? queueColor : VintageTheme.textPrimary))
-            .frame(width: 28, height: 24)
+            .frame(width: compact ? 18 : 28, height: compact ? 15 : 24)
             .background(
                 ZStack {
                     PlasticKeyBackground(tint: configuration.isPressed ? VintageTheme.amber : nil, tintStrength: 0.25,

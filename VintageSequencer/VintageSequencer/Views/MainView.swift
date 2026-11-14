@@ -36,6 +36,8 @@ struct MainView: View {
             GeometryReader { geo in
                 ScrollView(.vertical, showsIndicators: true) {
                     VStack(spacing: 8) {
+                        // Song-Lane über allen Patterns (v1.14.0).
+                        SongLaneView(songState: engine.songState)
                         ForEach(
                             Array(engine.currentPattern.tracks.enumerated()),
                             id: \.element.id
@@ -390,7 +392,7 @@ struct StatusBar: View {
             Text("•")
                 .foregroundColor(VintageTheme.textDim)
 
-            Text("PATTERN \(["A","B","C","D"][ts.currentPatternIndex])")
+            Text("PATTERN \(Pattern.slotNames[ts.currentPatternIndex])")
                 .font(VintageTheme.monoSmall)
                 .foregroundColor(VintageTheme.textSecondary)
 

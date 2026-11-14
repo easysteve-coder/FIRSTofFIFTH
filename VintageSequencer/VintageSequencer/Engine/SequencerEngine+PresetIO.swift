@@ -64,7 +64,8 @@ extension SequencerEngine {
         rack.captureStates()
         guard let data = presetManager.encode(bpm: bpm, swing: swing, patterns: patterns,
                                               instruments: rack.channels,
-                                              masterVolume: rack.masterVolume) else {
+                                              masterVolume: rack.masterVolume,
+                                              song: song) else {
             lastErrorMessage = strings.errPresetEncode
             return nil
         }
@@ -80,12 +81,14 @@ extension SequencerEngine {
         var fileTempo: (bpm: Double, swing: Double)?
         var fileInstruments: [InstrumentChannelData] = []
         var fileMaster: Float = 1
+        var fileSong = Song()
         switch presetManager.decode(data) {
         case .success(.modern(let file)):
             loaded    = file.patterns
             fileTempo = (file.bpm, file.swing)
             fileInstruments = file.instruments ?? []
             fileMaster = file.masterVolume ?? 1
+            fileSong = file.song ?? Song()
         case .success(.legacy(let legacy)):
             // Legacy format: bpm and swing are not serialized — preserve current values.
             loaded = legacy
@@ -93,7 +96,7 @@ extension SequencerEngine {
             lastErrorMessage = strings.errPresetLoad(PresetManager.describe(error))
             return false
         }
-        // Die App arbeitet mit genau vier Pattern-Slots (A–D). Eine Datei ohne Pattern
+        // Die App arbeitet mit 16 Pattern-Slots (A–P; bis v1.13.19 A–D). Eine Datei ohne Pattern
         // ist kein gültiges Preset; fehlende Slots werden mit leeren Patterns aufgefüllt,
         // damit kein Pattern-Index ins Leere zeigt.
         guard !loaded.isEmpty else {
@@ -101,7 +104,8 @@ extension SequencerEngine {
             return false
         }
         var slots = loaded
-        let slotNames = ["A", "B", "C", "D"]
+        let slotNames = Pattern.slotNames
+        if slots.count > slotNames.count { slots.removeLast(slots.count - slotNames.count) }
         while slots.count < slotNames.count { slots.append(Pattern(name: slotNames[slots.count])) }
 
         stop()
@@ -115,6 +119,7 @@ extension SequencerEngine {
             swing = t.swing
         }
         patterns = slots
+        replaceSong(fileSong)
         // Das Rack gehört zum Projekt: Kanäle ersetzen, Plug-ins laden (asynchron).
         rack.replaceAll(fileInstruments, masterVolume: fileMaster)
         // B4: Clamp all decoded values to valid ranges before applying to live state.
@@ -212,7 +217,8 @@ extension SequencerEngine {
         learnTarget = nil
         bpm      = 120.0
         swing    = 50.0
-        patterns = ["A", "B", "C", "D"].map { Pattern(name: $0) }
+        patterns = Pattern.slotNames.map { Pattern(name: $0) }
+        replaceSong(Song())
         rack.replaceAll([])
         currentPatternIndex = 0
         currentPresetURL    = nil

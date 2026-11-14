@@ -19,6 +19,7 @@ struct TrackHeaderView: View {
     @FocusState private var nameFocused: Bool
     @State private var showScalePicker = false
     @State private var showFeelPopover = false
+    @State private var showPadWidth    = false
     // nameEdit: lokaler @State für den TextField. Wird bei Focus-In aus track.name
     // initialisiert; ModelWriter-Commit beim Focus-Out. Verhindert, dass jeder
     // Tastendruck direkt in track.name schreibt (Slice E). Undo bleibt erhalten.
@@ -63,7 +64,17 @@ struct TrackHeaderView: View {
                 // Anzeige-Only (v1.12.1): Der Farbpunkt ist rein visuell und
                 // nicht mehr interaktiv. Farbwahl läuft über das
                 // Track-Kontextmenü (siehe TrackRowView.trackContextMenu).
-                Circle().fill(accentColor).frame(width: 6, height: 6)
+                // Pad-Spuren tragen statt des Punkts ein „PAD“-Schild (v1.13.19).
+                if track.lane.isPad {
+                    Text("PAD")
+                        .font(.system(size: 8, weight: .heavy, design: .monospaced))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 3)
+                        .padding(.vertical, 1)
+                        .background(RoundedRectangle(cornerRadius: 2).fill(accentColor))
+                } else {
+                    Circle().fill(accentColor).frame(width: 6, height: 6)
+                }
 
                 // TextField bindet an lokalen nameEdit-State, nicht direkt an track.name.
                 // Commit (ModelWriter) erfolgt beim Verlassen des Fokus — Undo bleibt.
@@ -95,6 +106,16 @@ struct TrackHeaderView: View {
                     .onAppear { nameEdit = track.name }
                     .onSubmit   { nameFocused = false }
                     .onExitCommand { nameFocused = false }
+
+                if track.lane.isPad {
+                    // Breite der Pad-Steps dieser Spur (eigene Weitenregelung, v1.13.19).
+                    Button("↔\(track.lane.padWidth)") { showPadWidth = true }
+                        .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: accentColor))
+                        .popover(isPresented: $showPadWidth, arrowEdge: .bottom) {
+                            PadWidthPopover(track: track, accentColor: accentColor)
+                        }
+                        .help(tip(s.padWidthHelp))
+                }
 
                 Button(track.isMuted ? "M" : "m") {
                     writer.apply(.setMuted(trackID: track.id,
@@ -479,4 +500,46 @@ private struct PadChordMenuItems: View {
     }
 
     private func mark(_ on: Bool) -> String { on ? "✓ " : "    " }
+}
+
+// MARK: - Pad width popover
+
+/// Breite der Pad-Steps einer Spur in Normal-Stepbreiten. Jeder Klick ist ein Undo-Schritt.
+fileprivate struct PadWidthPopover: View {
+    @ObservedObject var track: TrackViewModel
+    var accentColor: Color
+    @Environment(\.undoManager) private var undoManager
+    @AppStorage("appLanguage") private var lang: String = "en"
+    private var s: Str { Str(lang) }
+    private let writer = ModelWriter()
+
+    private func set(_ w: Int) {
+        let clamped = max(LaneData.padWidthRange.lowerBound, min(LaneData.padWidthRange.upperBound, w))
+        guard clamped != track.lane.padWidth else { return }
+        writer.apply(.setPadWidth(trackID: track.id, old: track.lane.padWidth, new: clamped),
+                     to: track.data, undoManager: undoManager)
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Text(s.padWidthHeader)
+                .font(VintageTheme.monoBold)
+                .foregroundColor(VintageTheme.textAmber)
+            HStack(spacing: 4) {
+                ForEach(Array(LaneData.padWidthRange), id: \.self) { w in
+                    Button("\(w)") { set(w) }
+                        .buttonStyle(VintageSmallButtonStyle(isActive: track.lane.padWidth == w,
+                                                             accent: accentColor))
+                }
+            }
+            Text(s.padWidthHelp)
+                .font(VintageTheme.monoSmall)
+                .foregroundColor(VintageTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 240)
+        }
+        .padding(14)
+        .background(VintageTheme.panelDark)
+        .preferredColorScheme(.dark)
+    }
 }

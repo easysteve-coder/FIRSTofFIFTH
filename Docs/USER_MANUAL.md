@@ -22,7 +22,8 @@ FIRSTofFIFTH ist ein MIDI-Step-Sequencer für macOS. Er erzeugt keine eigenen Kl
 - **Polyrhythmus:** Jede Spur kann eine eigene Step-Länge haben. Eine Spur spielt Triolen, eine andere punktierte Sechzehntel — gleichzeitig, synchron.
 - **Akkorde pro Step:** Jeder Step kann mehrere Noten gleichzeitig spielen.
 - **Wahrscheinlichkeit & Ratchets:** Steps können zufällig aussetzen oder mehrfach pro Schritt triggern.
-- **4 Patterns:** Sofort umschaltbar, quantisiert am Ende des Takts.
+- **16 Patterns (A–P):** Sofort umschaltbar, quantisiert am Ende von Track 1.
+- **Song-Lane:** Szenenfolge über allen Patterns, Wechsel exakt auf dem Taktstrich.
 
 ---
 
@@ -93,10 +94,19 @@ Jede Spur hat eine eigene Abspielrichtung:
 
 ### Patterns
 
-Es gibt 4 Patterns: **A, B, C, D**. Jedes Pattern enthält alle Spuren mit eigenen Step-Daten.
+Es gibt 16 Patterns: **A bis P** (Transportleiste, zwei Reihen). Jedes Pattern enthält alle Spuren mit eigenen Step-Daten. ⌘1 … ⌘9 wählen A … I, die übrigen stehen im Menü *Sequencer*.
 
-- Während des Abspielens: Pattern-Wechsel wird **am Ende des Takts** (Track 1 erreicht Step 1) ausgeführt — kein abrupter Schnitt.
+- Während des Abspielens: Pattern-Wechsel wird **am Ende von Track 1** (Track 1 erreicht Step 1) ausgeführt — kein abrupter Schnitt.
 - Im Stopp-Zustand: Pattern-Wechsel erfolgt sofort.
+
+### Song
+
+Die **Song-Lane** über den Spuren reiht Szenen aneinander. Eine Szene spielt ein Pattern für eine Anzahl Takte (4/4).
+
+- **+** fügt eine Szene hinzu (Kopie der letzten). Klick auf eine Szene wählt Pattern und Länge (1–64 Takte); Rechtsklick: duplizieren, verschieben, löschen. Alles mit Undo.
+- **ON/OFF** schaltet den Song-Modus. Ist er an, beginnt Play mit der ersten Szene; die Patterns wechseln **exakt auf dem Taktstrich**, unabhängig davon, wie lang Track 1 ist. Folgen zwei Szenen mit demselben Pattern, läuft es ohne Neustart durch.
+- **LOOP/ENDE**: am Songende von vorn beginnen oder anhalten.
+- Während der Song läuft, bestimmen die Szenen das Pattern; die Pattern-Tasten sind dann ohne Wirkung. Änderungen am Song gelten ab dem nächsten Wechsel.
 
 ---
 
@@ -415,7 +425,7 @@ Mit MIDI Learn kannst du Steps oder Parameter direkt von deinem MIDI-Controller 
 
 In den **Settings** kannst du CC-Nummern für Fernsteuerung zuweisen:
 
-- **Pattern Switch CC:** Ein eingehender CC wechselt das Pattern (0–31 = A, 32–63 = B, 64–95 = C, 96–127 = D).
+- **Pattern Switch CC:** Ein eingehender CC wechselt das Pattern in Achterschritten (0–7 = A, 8–15 = B … 120–127 = P).
 - **Mute Track CC:** Pro Spur eine CC-Nummer, um Mute per Controller zu schalten.
 
 Setze den Wert auf **−1**, um die Fernsteuerung zu deaktivieren.
@@ -428,7 +438,7 @@ Setze den Wert auf **−1**, um die Fernsteuerung zu deaktivieren.
 
 - **⌘S** oder Menü **File → Save Preset**
 - Wähle einen Dateinamen und Speicherort.
-- Das Preset enthält: alle 4 Patterns, alle Spuren, alle Steps, BPM und Swing.
+- Das Preset enthält: alle 16 Patterns, den Song, alle Spuren, alle Steps, BPM und Swing.
 
 Ein orangefarbener Punkt neben dem Dateinamen zeigt an, dass es ungespeicherte Änderungen gibt.
 
@@ -493,7 +503,7 @@ So kannst du schnell Variationen erstellen: Pattern A kopieren, in Pattern B ein
 
 ### Live-Performance
 
-1. Bereite 4 Patterns vor (A = Intro, B = Verse, C = Chorus, D = Break).
+1. Bereite Patterns vor (A = Intro, B = Verse, C = Chorus, D = Break).
 2. Starte Playback auf Pattern A.
 3. Klicke auf **B** — der Wechsel passiert am nächsten Taktanfang.
 4. Mute und Unmute einzelne Spuren live mit dem **M-Button** oder per MIDI-Controller (CC Remote).
@@ -520,7 +530,7 @@ So kannst du schnell Variationen erstellen: Pattern A kopieren, in Pattern B ein
 ### Typische Fehler vermeiden
 
 - **Kein Sound?** Prüfe: MIDI-Output gewählt? Richtiger MIDI-Kanal? Empfänger auf dem gleichen Kanal?
-- **Pattern klingt anders als erwartet?** Prüfe, ob du im richtigen Pattern bist (A/B/C/D).
+- **Pattern klingt anders als erwartet?** Prüfe, ob du im richtigen Pattern bist (A–P).
 - **Steps klingen zu lang/kurz?** Prüfe den Gate-Wert im Step-Editor.
 - **Spur klingt nicht?** Prüfe den Mute-Status (M-Button) und Solo-Status anderer Spuren.
 

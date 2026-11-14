@@ -5,14 +5,55 @@ Prinzip: Evolutionär, kein Big Bang. RT-Pfad bleibt unberührt.
 
 ---
 
+## Song-Lane und 16 Patterns (v1.14.0)
+
+**Modell.** `Song` (Wertetyp, `Models/Song.swift`): `scenes: [SongScene]` (Pattern-Index +
+Takte 1…64), `enabled`, `loops`. UI-Zustand im eigenen `SongState` (`song`, `playingScene`);
+nur `SongLaneView` beobachtet ihn. Änderungen über `setSongUndoable` (Undo, Ziel: Engine);
+Laden/Neu setzen ohne Undo (`replaceSong`). `SongScene.id` ist nur SwiftUI-Identität — nicht
+persistiert, nicht Teil der Gleichheit.
+
+**Taktgrenze im Tick-Thread.** Der Tick-Thread zählt Pulse seit Sitzungsbeginn (`rtPulse`,
+Rücksetzen, wenn er eine höhere Aktivierung ohne Vormerkung übernimmt = neue Sitzung).
+`PlaybackStateBundle` trägt `switchAtPulse` (absoluter Puls des Wechsels zu `queued`; −1 =
+Track-0-Grenze wie bisher) und `stopAtPulse` (Songende ohne Loop; −1 = nie). Wechsel, wenn
+`pulse ≥ switchAtPulse` und auf einem Takt dazu (Modulo 96) — liegt der Puls schon zurück
+(Song im Lauf gekürzt), an der nächsten Taktgrenze. Der Wechselpuls geht über `rtSwitchPulse`
+(relaxed, vor dem releasing-Store von `rtSwitchedSerial`) an Main. Ab `stopAtPulse` schlägt
+der Tick nichts mehr an (fällige Offs laufen aus), setzt `rtSongEnded`; der Drain ruft `stop()`.
+
+**Main.** `beginSongIfActive()` (in `play()` und beim externen Neustart, vor
+`beginRuntimeSession`): erstes Szenen-Pattern aktivieren, Lauf ab Puls 0, `scheduleSongNext()`.
+`Song.run(from:playing:)` fasst direkt folgende Szenen desselben Patterns zu einem Lauf
+zusammen (kein Wechsel, kein Neustart) und liefert `.scene(i)`, `.end` oder `.never`.
+`reconcilePatternSwitch` übernimmt nach einem Song-Wechsel den Startpuls, merkt den nächsten vor
+und gibt die Runtime-Slots des abgelösten Patterns frei — sonst behielte ein Pattern, das der
+Song sofort wieder vormerkt, seine alte Runtime und begänne beim Rücksprung nicht auf Step 1.
+Manuelle Patternwahl ist im laufenden Song wirkungslos. Song-Änderungen im Lauf rechnen den
+nächsten Wechsel neu (gelten ab dort). Song an/aus im Lauf: aus hebt die Vormerkung auf; an
+wirkt ab dem nächsten Start.
+
+**16 Patterns.** `Pattern.slotNames` (A–P) ist die einzige Quelle. Laden füllt auf 16 auf und
+kürzt darüber. Pattern-CC in Achterschritten (`value / 8`).
+
+**Presetformat.** Optionaler Schlüssel `song` (nur geschrieben, wenn nicht leer). Dateien
+haben jetzt 16 Patterns. Ältere Versionen lesen sie: Song ignoriert, Patterns E–P im Modell,
+aber nicht anwählbar.
+
 ## Pad-Lane, Halten, fester Ton, Pad-Akkorde (v1.13.16)
 
 **Pad-Lane.** `LaneData.isPad` (Schlüssel `pad`, optional) markiert eine Step-Lane mit langen
 Steps. Steplängen kommen aus `TrackData.padRatios` (Vielfache einer 16tel: 4, 8, 12, 16, 32,
 48, 64, 128 = 1/4 … 8 Takte); `lane.ratioOptions` liefert je Lane die gültige Liste, die
-Zieh-Sitzungen (`RatioDragSession`, `StretchRatioDragSession`) tragen sie als `ratios`. Das
-Raster rechnet mit `displayNumerator/displayDenominator` — bei Pad-Lanes 1/1, also kompakt,
-nicht zeitgetreu. Der Tick-Pfad ist unverändert: `pulsesPerStep = 6·num/den`, also 96 Pulse
+Zieh-Sitzungen (`RatioDragSession`, `StretchRatioDragSession`) tragen sie als `ratios`; der
+Anfasser zieht bei Pad-Lanes stufenweise (`pxPerRatioStep` = eine Step-Breite je Stufe, v1.13.18),
+weil der zeitgetreue Ziehweg bei Längen bis 128/1 unbedienbar wäre. Das
+Raster rechnet mit `displayNumerator/displayDenominator` — bei Pad-Lanes `padWidth`/1, also
+kompakt, nicht zeitgetreu. `LaneData.padWidth` (1…8 Normal-Stepbreiten, Schlüssel `padWidth`,
+nur bei Pad-Lanes ≠ 1 geschrieben, v1.13.19) ist reine Anzeige; gesetzt über
+`ModelCommand.setPadWidth` mit Undo (Popover ↔N im Spurkopf), neue Pad-Spuren starten mit 2.
+Optik: Pad-Steps tragen über dem Kunststoffkörper einen Verlauf in Spurfarbe nach rechts und eine
+Kontur; der Spurkopf zeigt statt des Farbpunkts ein PAD-Schild. Der Tick-Pfad ist unverändert: `pulsesPerStep = 6·num/den`, also 96 Pulse
 je Takt. Lange Offs stehen im Notenbuch wie Drone-Offs. `clampToValidRanges` setzt eine
 Pad-Lane mit unbekannter Länge auf 1 Takt. Die Fortschrittsanzeige (`PadProgressBar`) ist
 eine lineare Animation ab Erscheinen des aktuellen Steps, kein Timer; Dauer aus BPM und

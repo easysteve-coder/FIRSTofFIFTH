@@ -26,6 +26,8 @@ final class PresetManager {
         var instruments: [InstrumentChannelData]?
         /// Summenpegel des Racks (v1.13.1), 0 … 1. Optional; fehlt → 1.
         var masterVolume: Float?
+        /// Song (v1.14.0). Optional; fehlt → leerer Song, Song-Modus aus.
+        var song: Song?
     }
 
     // MARK: - Decode Result
@@ -43,10 +45,12 @@ final class PresetManager {
     /// Encodes engine state into JSON data.
     /// Returns nil on encoding failure; caller is responsible for setting an error message.
     func encode(bpm: Double, swing: Double, patterns: [Pattern],
-                instruments: [InstrumentChannelData] = [], masterVolume: Float = 1) -> Data? {
+                instruments: [InstrumentChannelData] = [], masterVolume: Float = 1,
+                song: Song = Song()) -> Data? {
         try? JSONEncoder().encode(PresetFile(bpm: bpm, swing: swing, patterns: patterns,
                                              instruments: instruments.isEmpty ? nil : instruments,
-                                             masterVolume: instruments.isEmpty ? nil : masterVolume))
+                                             masterVolume: instruments.isEmpty ? nil : masterVolume,
+                                             song: song == Song() ? nil : song))
     }
 
     // MARK: - Decode

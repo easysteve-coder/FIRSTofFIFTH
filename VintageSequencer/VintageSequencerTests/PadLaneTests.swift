@@ -107,7 +107,7 @@ struct PadLaneTests {
                 == ["1/4", "1/2", "3/4", "1 T", "2 T", "3 T", "4 T", "8 T"])
         #expect(TrackData.ratioLabel(num: 3, den: 2) == "3/2")
         let lane = LaneData(stepCount: 4); lane.isPad = true; lane.stepLengthNumerator = 64
-        #expect(lane.displayNumerator == 1 && lane.displayDenominator == 1)
+        #expect(lane.displayNumerator == lane.padWidth && lane.displayDenominator == 1)
         #expect(lane.ratioOptions.count == TrackData.padRatios.count)
     }
 
@@ -211,5 +211,54 @@ struct PadLaneTests {
         #expect(td.lane.fixedNote == nil)
         let plain = try JSONEncoder().encode(td.lane)
         #expect(!String(decoding: plain, as: UTF8.self).contains("fixedNote"))
+    }
+
+    // MARK: Länge ziehen
+
+    /// Pad-Lanes: der Anfasser zieht stufenweise (eine Step-Breite je Längenstufe).
+    @Test func padRatioDragMovesOneLengthPerStepWidth() {
+        let session = RatioDragSession(trackID: UUID(), snapshotNumerator: 16, snapshotDenominator: 1,
+                                       baseRatioIndex: 3, contentUnit: 160, scrollOffsetAtStart: 0,
+                                       ratios: TrackData.padRatios, pxPerRatioStep: 40)
+        #expect(session.proposedRatio(translationX: 0, currentScrollOffset: 0) == (16, 1))
+        #expect(session.proposedRatio(translationX: 41, currentScrollOffset: 0) == (32, 1))
+        #expect(session.proposedRatio(translationX: -80, currentScrollOffset: 0) == (8, 1))
+        #expect(session.proposedRatio(translationX: 4000, currentScrollOffset: 0) == (128, 1))
+        #expect(session.proposedRatio(translationX: -4000, currentScrollOffset: 0) == (4, 1))
+    }
+
+    // MARK: Pad-Breite
+
+    /// Pad-Breite: bestimmt nur die Rasterbreite, nicht die Steplänge; optionaler Key,
+    /// geklemmt auf 1…8, rückgängig zu machen, wird kopiert.
+    @MainActor @Test func padWidthDrivesDisplayRoundTripsClampsAndIsUndoable() throws {
+        let lane = LaneData(stepCount: 4); lane.isPad = true; lane.stepLengthNumerator = 64
+        #expect(!String(decoding: try JSONEncoder().encode(lane), as: UTF8.self).contains("padWidth"))
+
+        let td = TrackData(name: "P", lane: lane)
+        let um = UndoManager()
+        ModelWriter().apply(.setPadWidth(trackID: td.id, old: 1, new: 3), to: td, undoManager: um)
+        #expect(lane.displayNumerator == 3 && lane.displayDenominator == 1)
+        #expect(lane.stepLengthNumerator == 64, "Steplänge unberührt")
+        #expect(try JSONDecoder().decode(LaneData.self, from: JSONEncoder().encode(lane)).padWidth == 3)
+        #expect(td.freshCopy().lane.padWidth == 3)
+
+        um.undo()
+        #expect(lane.padWidth == 1)
+
+        lane.padWidth = 99; lane.clampToValidRanges()
+        #expect(lane.padWidth == 8)
+        lane.padWidth = 0; lane.clampToValidRanges()
+        #expect(lane.padWidth == 1)
+
+        let step = LaneData(stepCount: 4); step.padWidth = 5
+        #expect(step.displayNumerator == 1, "Step-Lanes ignorieren die Pad-Breite")
+        #expect(!String(decoding: try JSONEncoder().encode(step), as: UTF8.self).contains("padWidth"))
+    }
+
+    @MainActor @Test func newPadTrackIsTwoStepsWide() throws {
+        let engine = SequencerEngine()
+        let td = try #require(engine.addTrack(kind: .step, pad: true).first?.track)
+        #expect(td.lane.padWidth == 2 && td.lane.displayNumerator == 2)
     }
 }
