@@ -18,10 +18,9 @@ FIRSTofFIFTH into *Applications*. *Auf der Release-Seite unter **Assets** die
 
 ## What's new
 
-**1.13.17** — Pad tracks with steps up to 8 bars for pads and drones; chord rolling with
-progressions from Lizzio and Callipari or from the track's scale; *hold* steps; one note for a
-whole track (e.g. a kick); track header fixes; no more security prompt when loading certain
-Audio Units. Download: [latest release](https://github.com/easysteve-coder/FIRSTofFIFTH/releases/latest).
+**1.14.0** — Song lane: chain scenes (pattern + length in bars) above all tracks; patterns change
+exactly on the bar line; loop or stop at the end. 16 patterns (A–P) instead of 4. Pad tracks get
+their own display width and look. Download: [latest release](https://github.com/easysteve-coder/FIRSTofFIFTH/releases/latest).
 
 All changes: [`CHANGELOG.en.md`](VintageSequencer/CHANGELOG.en.md) (English) ·
 [`CHANGELOG.md`](VintageSequencer/CHANGELOG.md) (German, detailed).
@@ -32,12 +31,14 @@ All changes: [`CHANGELOG.en.md`](VintageSequencer/CHANGELOG.en.md) (English) ·
   play direction, timing offset.
 - **Steps:** chords, velocity, gate, probability, ratchets, drone steps that
   hold across the whole track length, hold steps, scale quantisation.
-- **Pad tracks:** steps from a quarter note to 8 bars for pads and drones;
+- **Pad tracks:** steps from a quarter note to 8 bars for pads and drones, own display width;
   RND rolls chord progressions (from Lizzio's *Chord Progression Codex* and
   Callipari's *Illustrierte Harmonie*, or from the track's scale).
 - **Lanes:** note lanes and CC lanes; a CC lane can drive an instrument
   parameter directly.
-- **Patterns A–D**, switched quantised while playing.
+- **16 patterns (A–P)**, switched quantised while playing.
+- **Song lane:** a sequence of scenes (pattern + bars) above all tracks; patterns change exactly on
+  the bar line, loop or stop at the end.
 - **Clock:** internal clock on a dedicated real-time thread, or external
   MIDI clock (24 PPQN). All events are scheduled ahead with CoreMIDI host
   timestamps.
