@@ -72,6 +72,7 @@ extension SequencerEngine {
     /// Würfelt die sichtbaren Steps neu. Läuft über ModelWriter; das Undo hält Vor- und
     /// Nachzustand fest (Redo würfelt nicht neu).
     func randomize(track td: TrackData, lockNotes: Bool = false) {
+        if td.lane.isPad { randomizePadChords(track: td); return }
         let lane = td.lane
         let old  = lane.steps
         var steps = old
@@ -87,6 +88,54 @@ extension SequencerEngine {
             // CC-Randomize gehört in die eigene CC-Lane.
         }
         let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
+        ModelWriter().apply(.setSteps(trackID: td.id, oldSteps: old, newSteps: steps,
+                                      actionName: s.undoRandomize),
+                            to: td, undoManager: undoManager)
+    }
+}
+
+// MARK: - Pad-Akkorde
+
+extension SequencerEngine {
+
+    /// UserDefaults-Schlüssel der RND-Wahl für Pad-Spuren: Quelle (`PadChordSource`) und
+    /// optional eine feste Folge (`ChordProgressionFamily.id`, leer = zufällige Folge).
+    static let padChordSourceKey = "padChordSource"
+    static let padChordFamilyKey = "padChordFamily"
+
+    /// Würfelt Akkorde für eine Pad-Spur: eine Folge aus Lizzio/Callipari oder leitereigen
+    /// (Einstellung im RND-Menü), transponiert auf den Grundton der Spur, mit Stimmführung.
+    /// Ein Undo-Schritt über ModelWriter; Redo würfelt nicht neu.
+    func randomizePadChords(track td: TrackData) {
+        let defaults = UserDefaults.standard
+        let source = PadChordSource(rawValue: defaults.string(forKey: Self.padChordSourceKey) ?? "")
+            ?? .books
+        let lane = td.lane
+        let count = min(lane.stepCount, lane.steps.count)
+        var rng = SystemRandomNumberGenerator()
+        let chords: [ChordSymbol]
+        switch source {
+        case .books:
+            let fixed = PadChords.family(id: defaults.string(forKey: Self.padChordFamilyKey) ?? "")
+            let family = fixed ?? PadChords.families.randomElement(using: &rng)!
+            chords = PadChords.progression(family, count: count, using: &rng)
+        case .free:
+            chords = PadChords.freeProgression(scaleIndex: td.scaleIndex, count: count, using: &rng)
+        }
+        let voiced = PadChords.voice(chords, tonic: td.scaleRoot)
+        let old = lane.steps
+        var steps = old
+        for i in 0..<count {
+            steps[i].isActive    = true
+            steps[i].isHold      = false
+            steps[i].isDrone     = false
+            steps[i].notes       = voiced[i]
+            steps[i].velocity    = Int.random(in: 80...100)
+            steps[i].gate        = 1.0
+            steps[i].probability = 1.0
+            steps[i].ratchet     = .x1
+        }
+        let s = Str(defaults.string(forKey: "appLanguage") ?? "en")
         ModelWriter().apply(.setSteps(trackID: td.id, oldSteps: old, newSteps: steps,
                                       actionName: s.undoRandomize),
                             to: td, undoManager: undoManager)

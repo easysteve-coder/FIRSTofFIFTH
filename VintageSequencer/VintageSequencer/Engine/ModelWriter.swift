@@ -338,6 +338,21 @@ struct ModelWriter {
             lane.ccIsMuted = new
             lane.changed.send()
             // No undo — Mute-Commands tragen heute kein Undo.
+
+        case let .setFixedNote(trackID, old, new):
+            assert(td.id == trackID,
+                   "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
+            let lane = td.lane
+            lane.fixedNote = new
+            lane.changed.send()
+            if let um = undoManager {
+                registerReversibleUndo(
+                    um: um, target: lane,
+                    actionName: command.undoActionName,
+                    forward:  { l in l.fixedNote = new; l.changed.send() },
+                    backward: { l in l.fixedNote = old; l.changed.send() }
+                )
+            }
         }
     }
 }

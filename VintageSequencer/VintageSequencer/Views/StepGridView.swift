@@ -60,7 +60,7 @@ struct StepGridView: View {
         LaneGeometry.stepIndex(contentX: p.x + scrollOffsetNow, y: p.y,
                                rowHeight: stepRowHeight, cellHeight: CGFloat(engine.stepDisplaySize),
                                stepCount: track.lane.stepCount,
-                               num: track.lane.stepLengthNumerator, den: track.lane.stepLengthDenominator,
+                               num: track.lane.displayNumerator, den: track.lane.displayDenominator,
                                stepWidthSize: stepWidthState.size)
     }
 
@@ -224,8 +224,8 @@ struct StepGridView: View {
                             } else if interactionController.activeSession == nil {
                                 // ── Neuen Rubber-Band starten ─────────────────
                                 let stepW = (CGFloat(stepWidthState.size) + VintageTheme.stepSpacing)
-                                            * CGFloat(track.lane.stepLengthNumerator)
-                                            / CGFloat(track.lane.stepLengthDenominator)
+                                            * CGFloat(track.lane.displayNumerator)
+                                            / CGFloat(track.lane.displayDenominator)
 
                                 let contentX = value.startLocation.x + scrollOffsetNow
                                 interactionController.beginRubberBand(
@@ -315,8 +315,8 @@ struct StepGridView: View {
                 size:  CGFloat(engine.stepDisplaySize),
                 width: VintageTheme.distributedStepWidth(
                            index: i,
-                           num: track.lane.stepLengthNumerator,
-                           den: track.lane.stepLengthDenominator,
+                           num: track.lane.displayNumerator,
+                           den: track.lane.displayDenominator,
                            stepWidthSize: stepWidthState.size),
                 onToggleSelect: {
                     if grid.selectedSteps.contains(i) {
@@ -327,6 +327,15 @@ struct StepGridView: View {
                 },
                 onEdit: { editIndex = i })
             .equatable()    // P3: nur bei isCurrentStep / isSelected / width re-rendern
+            .overlay(alignment: .bottom) {
+                // Pad-Lane: lange Steps zeigen, wie weit der laufende Step ist.
+                if isCurrent && track.lane.isPad {
+                    PadProgressBar(seconds: 60.0 / max(1, engine.bpm)
+                                            * Double(track.lane.stepLengthNumerator)
+                                            / Double(track.lane.stepLengthDenominator) / 4.0,
+                                   color: accentColor)
+                }
+            }
         }
         .popover(isPresented: Binding(get: { editIndex == i },
                                       set: { if !$0, editIndex == i { editIndex = nil } }),
@@ -371,8 +380,8 @@ struct StepGridView: View {
                             )
                         } else {
                             let sw = (CGFloat(stepWidthState.size) + VintageTheme.stepSpacing)
-                                     * CGFloat(track.lane.stepLengthNumerator)
-                                     / CGFloat(track.lane.stepLengthDenominator)
+                                     * CGFloat(track.lane.displayNumerator)
+                                     / CGFloat(track.lane.displayDenominator)
                             interactionController.beginStepSwap(
                                 track: track.data, sourceIndex: i, stepWidth: sw
                             )

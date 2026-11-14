@@ -90,6 +90,23 @@ final class TrackData: Identifiable {
         (9,8), (5,4), (4,3), (3,2), (7,4), (2,1)
     ]
 
+    /// Steplängen der Pad-Lane (Vielfache einer 16tel): Viertel, Halbe, punktierte Halbe,
+    /// 1, 2, 3, 4 und 8 Takte (4/4).
+    static let padRatios: [(num: Int, den: Int)] = [
+        (4,1), (8,1), (12,1), (16,1), (32,1), (48,1), (64,1), (128,1)
+    ]
+
+    /// Anzeige einer Steplänge: Pad-Werte in Takten bzw. Notenwerten, sonst „n/d“.
+    static func ratioLabel(num: Int, den: Int) -> String {
+        guard den == 1, num >= 4 else { return "\(num)/\(den)" }
+        switch num {
+        case 4:  return "1/4"
+        case 8:  return "1/2"
+        case 12: return "3/4"
+        default: return num % 16 == 0 ? "\(num / 16) T" : "\(num)/16"
+        }
+    }
+
     // MARK: - Change notification (NOT Codable)
 
     /// Fires synchronously on the Main Thread after any container-field mutation.
@@ -155,6 +172,8 @@ final class TrackData: Identifiable {
         laneCopy.steps                 = lane.steps
         laneCopy.direction             = lane.direction
         laneCopy.stepLengthNumerator   = lane.stepLengthNumerator
+        laneCopy.isPad                 = lane.isPad
+        laneCopy.fixedNote             = lane.fixedNote
         laneCopy.stepLengthDenominator = lane.stepLengthDenominator
         // CC-Lane payload (CC-Lane Slice 1): für .step sind diese Felder leer/default
         // und werden trotzdem übernommen — kein Schaden, kein Seiteneffekt.

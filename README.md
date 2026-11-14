@@ -10,12 +10,25 @@ instruments hosted inside the app.
 *Deutsch: Polyphoner, polyrhythmischer MIDI-Step-Sequencer für macOS. Die
 Oberfläche ist auf Englisch und Deutsch verfügbar.*
 
+## What's new
+
+**1.13.17** — Pad tracks with steps up to 8 bars for pads and drones; chord rolling with
+progressions from Lizzio and Callipari or from the track's scale; *hold* steps; one note for a
+whole track (e.g. a kick); track header fixes; no more security prompt when loading certain
+Audio Units. Download: [latest release](https://github.com/easysteve-coder/FIRSTofFIFTH/releases/latest).
+
+All changes: [`CHANGELOG.en.md`](VintageSequencer/CHANGELOG.en.md) (English) ·
+[`CHANGELOG.md`](VintageSequencer/CHANGELOG.md) (German, detailed).
+
 ## Features
 
 - **Polyrhythm per track:** 1–64 steps, step length as a musical ratio,
   play direction, timing offset.
 - **Steps:** chords, velocity, gate, probability, ratchets, drone steps that
-  hold across the whole track length, scale quantisation.
+  hold across the whole track length, hold steps, scale quantisation.
+- **Pad tracks:** steps from a quarter note to 8 bars for pads and drones;
+  RND rolls chord progressions (from Lizzio's *Chord Progression Codex* and
+  Callipari's *Illustrierte Harmonie*, or from the track's scale).
 - **Lanes:** note lanes and CC lanes; a CC lane can drive an instrument
   parameter directly.
 - **Patterns A–D**, switched quantised while playing.
@@ -67,8 +80,7 @@ render observer of hosted instruments follows the same rules. All model
 edits from the UI go through one command layer with undo.
 
 Details: [`VintageSequencer/ENGINEERING.md`](VintageSequencer/ENGINEERING.md)
-(German). Version history:
-[`VintageSequencer/CHANGELOG.md`](VintageSequencer/CHANGELOG.md).
+(German).
 User manual: [`Docs/USER_MANUAL.md`](Docs/USER_MANUAL.md).
 
 ## Status

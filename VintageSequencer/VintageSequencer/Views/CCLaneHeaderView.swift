@@ -331,7 +331,6 @@ struct CCTargetButton: View {
             .buttonStyle(.fullArea)
             .help(target.map { resolved ? s.ccTargetParameterHelp($0.name, channel.name)
                                         : s.ccTargetUnresolvedHelp($0.name) } ?? s.ccTargetChooseHelp)
-            .contextMenu {}
         }
     }
 

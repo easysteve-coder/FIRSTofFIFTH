@@ -22,6 +22,7 @@ INCLUDE=(
   Docs/GUI_DESIGN_SYSTEM.md
   VintageSequencer/VERSION
   VintageSequencer/CHANGELOG.md
+  VintageSequencer/CHANGELOG.en.md
   VintageSequencer/ENGINEERING.md
   VintageSequencer/PROJECT_LOG.md
   VintageSequencer/Tools

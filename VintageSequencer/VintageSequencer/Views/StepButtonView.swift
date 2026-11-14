@@ -31,6 +31,11 @@ struct StepButtonView: View {
     private var step: Step { track.lane.steps[index] }
 
     private var noteLabel: String {
+        if let fixed = track.lane.fixedNote {          // fester Ton der Spur (v1.13.16)
+            if track.isDrum, let drumName = GMDrumMap.name(for: fixed) { return drumName }
+            var single = Step(); single.notes = [fixed]
+            return single.shortChordName
+        }
         if track.isDrum,
            let drumName = GMDrumMap.name(for: step.note) { return drumName }
         return step.shortChordName   // Einzelnote: "C4", Akkord: "Cmaj7", "Dm7" etc.
@@ -82,14 +87,18 @@ struct StepButtonView: View {
                     .shadow(color: ledColor.opacity(ledGlow), radius: ledGlowR)
                     .padding(.top, 5)
 
-                Text(step.isActive ? noteLabel : "·")
+                Text(step.isActive ? (step.isHold ? "→" : noteLabel) : "·")
                     .font(.system(size: track.isDrum ? 8 : noteLabelFontSize,
                                   weight: .medium, design: .monospaced))
                     .foregroundColor(step.isActive ? VintageTheme.textPrimary : VintageTheme.textDim)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
 
-                if step.isActive && step.isDrone {
+                if step.isActive && step.isHold {
+                    Text("HOLD")
+                        .font(.system(size: 7, weight: .bold, design: .monospaced))
+                        .foregroundColor(accentColor.opacity(0.8))
+                } else if step.isActive && step.isDrone {
                     Text("DRONE")
                         .font(.system(size: 7, weight: .bold, design: .monospaced))
                         .foregroundColor(accentColor)

@@ -38,6 +38,13 @@ struct StepDetailView: View {
                      undoManager: dragging ? nil : undoManager)
     }
 
+    /// Fester Ton der Spur setzen/lösen (v1.13.16) — eigener Befehl mit Undo.
+    private func setFixedNote(_ note: Int?) {
+        guard note != track.lane.fixedNote else { return }
+        writer.apply(.setFixedNote(trackID: track.id, old: track.lane.fixedNote, new: note),
+                     to: track.data, undoManager: undoManager)
+    }
+
     private func knobEditingChanged(_ editing: Bool) {
         if editing {
             knobEdit.baseline = track.lane.steps
@@ -135,6 +142,31 @@ struct StepDetailView: View {
                         .help(s.droneHelp)
                 }
 
+                // Fester Ton: alle Steps der Spur spielen denselben Ton (z. B. Kick).
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(s.fixedNoteLabel)
+                        .font(VintageTheme.monoSmall)
+                        .foregroundColor(VintageTheme.textSecondary)
+                    Button(track.lane.fixedNote != nil ? "ON" : "OFF") {
+                        setFixedNote(track.lane.fixedNote == nil ? step.note : nil)
+                    }
+                        .buttonStyle(VintageSmallButtonStyle(isActive: track.lane.fixedNote != nil,
+                                                             accent: accentColor))
+                        .help(s.fixedNoteHelp)
+                }
+
+                // Halten: verlängert den vorherigen Step statt anzuschlagen.
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(s.holdLabel)
+                        .font(VintageTheme.monoSmall)
+                        .foregroundColor(VintageTheme.textSecondary)
+                    Button(step.isHold ? "ON" : "OFF") {
+                        modify { $0.isHold.toggle(); if $0.isHold { $0.isActive = true; $0.isDrone = false } }
+                    }
+                        .buttonStyle(VintageSmallButtonStyle(isActive: step.isHold, accent: accentColor))
+                        .help(s.holdHelp)
+                }
+
                 Spacer()
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -150,7 +182,7 @@ struct StepDetailView: View {
                         }
                     }
                 }
-                .opacity(step.isDrone ? 0.4 : 1)     // gilt bei Drone nicht
+                .opacity(step.isDrone || step.isHold ? 0.4 : 1)     // gilt bei Drone/Halten nicht
             }
 
             // ── Akkord / Drum picker ────────────────────────────────────────
@@ -160,16 +192,28 @@ struct StepDetailView: View {
                         .font(VintageTheme.monoSmall)
                         .foregroundColor(VintageTheme.textSecondary)
                     DrumPickerGrid(
-                        note: Binding(get: { step.note },
-                                      set: { v in modify { $0.note = v } }),
+                        note: Binding(get: { track.lane.fixedNote ?? step.note },
+                                      set: { v in
+                                          if track.lane.fixedNote != nil { setFixedNote(v) }
+                                          else { modify { $0.note = v } }
+                                      }),
                         accentColor: accentColor,
                         track: track)
                 }
             } else {
                 PianoKeyboardView(
                     notes: Binding(
-                        get: { step.notes },
-                        set: { v in modify { $0.notes = v.isEmpty ? [60] : v } }),
+                        get: { track.lane.fixedNote.map { [$0] } ?? step.notes },
+                        set: { v in
+                            if track.lane.fixedNote != nil {
+                                // Fester Ton: zuletzt gewählte Taste gilt für die ganze Spur.
+                                if let n = v.first(where: { $0 != track.lane.fixedNote }) ?? v.first {
+                                    setFixedNote(n)
+                                }
+                            } else {
+                                modify { $0.notes = v.isEmpty ? [60] : v }
+                            }
+                        }),
                     accentColor: accentColor,
                     track: track,
                     onUnison: step.notes.count > 1 ? { modify { $0.notes = [$0.note] } } : nil)

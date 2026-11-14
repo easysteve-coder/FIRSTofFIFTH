@@ -21,6 +21,10 @@ struct Step: Identifiable, Codable {
     /// Durchlauf nicht neu angeschlagen, solange der Step aktiv bleibt. `gate` und `ratchet`
     /// gelten dann nicht.
     var isDrone:     Bool         = false
+    /// Halten (v1.13.16): der Step schlägt nichts an, sondern verlängert den Ton des
+    /// vorhergehenden Steps (in Vorwärtsrichtung) um seine Länge. Mehrere Halte-Steps
+    /// hintereinander verlängern weiter.
+    var isHold:      Bool         = false
 
     // Backward-compat: reads/writes the root note (first of chord)
     var note: Int {
@@ -35,6 +39,7 @@ struct Step: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case isActive, notes, note, velocity, gate, probability, ratchet
         case isDrone = "drone"
+        case isHold  = "hold"
     }
 
     init(from decoder: Decoder) throws {
@@ -51,6 +56,7 @@ struct Step: Identifiable, Codable {
         probability = (try? c.decode(Double.self,       forKey: .probability)) ?? 1.0
         ratchet     = (try? c.decode(RatchetCount.self, forKey: .ratchet))    ?? .x1
         isDrone     = (try? c.decode(Bool.self,         forKey: .isDrone))    ?? false
+        isHold      = (try? c.decode(Bool.self,         forKey: .isHold))     ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -62,6 +68,7 @@ struct Step: Identifiable, Codable {
         try c.encode(probability, forKey: .probability)
         try c.encode(ratchet,     forKey: .ratchet)
         if isDrone { try c.encode(true, forKey: .isDrone) }   // nur schreiben, wenn gesetzt
+        if isHold  { try c.encode(true, forKey: .isHold) }
     }
 
     // MARK: - Gate steps (musikalische Notenwerte, 1.0 = 1/16-Note = 1 Step)

@@ -56,6 +56,11 @@ struct StepSnapshot: Sendable {
     let ratchet:     RatchetCount
     /// Drone: Ton hält einen ganzen Durchlauf der Spur (v1.13.12).
     var isDrone:     Bool = false
+    /// Halten (v1.13.16): schlägt nicht an; der Ton des vorherigen Steps läuft weiter.
+    var isHold:      Bool = false
+    /// Anzahl der direkt folgenden aktiven Halte-Steps (Vorwärtsrichtung, zyklisch), um
+    /// deren Länge dieser Step klingt. Auf Main vorberechnet, der Tick-Pfad liest nur.
+    var holdSpan:    Int  = 0
     // Step-Lane-Purify (P1/P3): per-Step-CC-Felder wurden in P1 aus dem
     // RT-Snapshot und in P3 (v1.11.0) aus dem Modell entfernt. CC-Verläufe
     // laufen ausschließlich über echte CC-Lanes (LaneSnapshotPayload.cc).

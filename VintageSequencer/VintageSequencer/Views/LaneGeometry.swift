@@ -106,7 +106,7 @@ struct LaneShape: Hashable {
     }
     init(track: TrackData) {
         self.init(stepCount: track.lane.stepCount,
-                  num: track.lane.stepLengthNumerator, den: track.lane.stepLengthDenominator)
+                  num: track.lane.displayNumerator, den: track.lane.displayDenominator)
     }
 }
 

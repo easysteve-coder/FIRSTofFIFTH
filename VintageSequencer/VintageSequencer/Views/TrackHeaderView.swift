@@ -104,7 +104,6 @@ struct TrackHeaderView: View {
                 }
                 .buttonStyle(VintageSmallButtonStyle(isActive: track.isMuted, accent: .orange))
                 .help(tip(track.isMuted ? s.mutedTooltip : s.muteTooltip))
-                .contextMenu {}
 
                 Button(track.isSolo ? "S" : "s") {
                     writer.apply(.setSolo(trackID: track.id,
@@ -115,7 +114,6 @@ struct TrackHeaderView: View {
                 .buttonStyle(VintageSmallButtonStyle(isActive: track.isSolo,
                     accent: Color(red: 0.9, green: 0.9, blue: 0.1)))
                 .help(tip(track.isSolo ? s.soloActiveTooltip : s.soloTooltip))
-                .contextMenu {}
 
                 if let onDuplicate {
                     Button { onDuplicate() } label: {
@@ -125,7 +123,6 @@ struct TrackHeaderView: View {
                     }
                     .buttonStyle(.fullArea)
                     .help(tip(s.duplicateTooltip))
-                    .contextMenu {}
                 }
             }
 
@@ -148,7 +145,6 @@ struct TrackHeaderView: View {
                         }
                         .buttonStyle(.fullArea)
                         .help(tip(directionTooltip(dir)))
-                        .contextMenu {}
                     }
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 4))
@@ -163,7 +159,6 @@ struct TrackHeaderView: View {
                 TrackOutputMenu(track: track, directory: engine.rack.directory,
                                 accent: accentColor, s: s)
                     .padding(.trailing, 2)
-                    .contextMenu {}
                 Picker("", selection: Binding(
                     get: { track.midiChannel },
                     set: { ch in
@@ -184,7 +179,6 @@ struct TrackHeaderView: View {
                 .font(VintageTheme.monoSmall)
                 .frame(width: 52)
                 .help(tip(s.midiChannelTooltip))
-                .contextMenu {}
             }
 
             // ── Row 3: FEEL · SCL  ·  RND · CLR ──────────────────────────
@@ -201,7 +195,6 @@ struct TrackHeaderView: View {
                     FeelPopover(track: track, accentColor: accentColor)
                 }
                 .help(tip(s.feelTooltip))
-                .contextMenu {}
 
                 let scaleActive = track.scaleIndex > 0
                 Button(scaleActive
@@ -214,21 +207,37 @@ struct TrackHeaderView: View {
                     ScalePickerPopover(track: track, accentColor: accentColor)
                 }
                 .help(tip(s.scaleTooltip))
-                .contextMenu {}
 
                 Spacer()
 
                 // RND/CLR laufen über ModelWriter (engine.randomize bzw. onClear) und
                 // registrieren ihr Undo dort — keine Direktmutation aus der View.
+                // RND; auf Pad-Spuren daneben die Wahl der Akkordquelle (▾).
                 Button("RND") { onRandomize?() }
                 .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: accentColor))
-                .help(tip(s.randomizeTooltip))
-                .contextMenu {}
+                .help(tip(track.lane.isPad ? s.padRandomizeTooltip : s.randomizeTooltip))
+                if track.lane.isPad {
+                    Menu {
+                        PadChordMenuItems(s: s, german: lang == "de") { onRandomize?() }
+                    } label: {
+                        Text("▾")
+                            .font(VintageTheme.monoSmall)
+                            .foregroundColor(VintageTheme.textPrimary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 3)
+                            .background(PlasticKeyBackground(tint: nil, tintStrength: 0.3,
+                                                             cornerRadius: 3, pressed: false))
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help(tip(s.padChordSourceTooltip))
+                }
 
                 Button("CLR") { onClear?() }
                 .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: .red))
                 .help(tip(s.clearTooltip))
-                .contextMenu {}
             }
         }
         .padding(.horizontal, 10)
@@ -246,7 +255,6 @@ struct TrackHeaderView: View {
                 .padding(.top, 9)
                 .padding(.leading, 8)
                 .help(tip(s.deleteTooltip))
-                .contextMenu {}
             }
         }
     }
@@ -441,4 +449,34 @@ struct TrackOutputMenu: View {
         )
         .help(routed.map { s.trackOutputHelp($0.name) } ?? s.trackOutputChooseHelp)
     }
+}
+
+/// Menü der Pad-RND-Taste: Quelle (Bücher/leitereigen) und optional eine feste Folge.
+/// Die Wahl bleibt für weitere Klicks auf RND gespeichert.
+private struct PadChordMenuItems: View {
+    let s: Str
+    let german: Bool
+    let roll: () -> Void
+    @AppStorage(SequencerEngine.padChordSourceKey) private var source: String = PadChordSource.books.rawValue
+    @AppStorage(SequencerEngine.padChordFamilyKey) private var family: String = ""
+
+    var body: some View {
+        Button(mark(source == PadChordSource.books.rawValue && family.isEmpty) + s.padChordsBooksAny) {
+            source = PadChordSource.books.rawValue; family = ""; roll()
+        }
+        Button(mark(source == PadChordSource.free.rawValue) + s.padChordsFree) {
+            source = PadChordSource.free.rawValue; family = ""; roll()
+        }
+        Divider()
+        Section(s.padChordsBooksHeader) {
+            ForEach(PadChords.families) { f in
+                Button(mark(source == PadChordSource.books.rawValue && family == f.id) + f.name(german: german)) {
+                    source = PadChordSource.books.rawValue; family = f.id; roll()
+                }
+                .help(f.source)
+            }
+        }
+    }
+
+    private func mark(_ on: Bool) -> String { on ? "✓ " : "    " }
 }

@@ -34,9 +34,9 @@ struct CornerHandlesView: View {
     @Environment(\.undoManager) private var undoManager
 
     private var currentRatioIndex: Int {
-        TrackData.sortedRatios.firstIndex(where: {
+        track.lane.ratioOptions.firstIndex(where: {
             $0.num == track.lane.stepLengthNumerator && $0.den == track.lane.stepLengthDenominator
-        }) ?? (TrackData.sortedRatios.count / 2)
+        }) ?? (track.lane.ratioOptions.count / 2)
     }
 
     var body: some View {
@@ -95,8 +95,8 @@ struct CornerHandlesView: View {
             CornerDotHandle(
                 onStart: {
                     let pxPerStep = (stepWidthSize + VintageTheme.stepSpacing)
-                                   * CGFloat(track.lane.stepLengthNumerator)
-                                   / CGFloat(track.lane.stepLengthDenominator)
+                                   * CGFloat(track.lane.displayNumerator)
+                                   / CGFloat(track.lane.displayDenominator)
                     interactionController.beginHandleDrag(
                         track:     track.data,
                         pxPerStep: pxPerStep

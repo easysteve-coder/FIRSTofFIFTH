@@ -5,6 +5,54 @@ Format: [Semantische Versionierung](https://semver.org/lang/de/)
 
 ---
 
+## [1.13.17] — 2026-11-14
+
+### Spurkopf: ganze Tasten klickbar, Rechtsklick überall
+
+**Behoben**
+- Tasten im Spurkopf reagierten nur auf ihre Beschriftung. Jetzt nimmt die ganze Taste Klicks an.
+- Rechtsklick öffnete das Spurmenü nur auf Tasten. Jetzt öffnet es sich auf jeder Stelle des
+  Spurkopfs, auch auf freien Flächen; ebenso bei CC-Spuren.
+- Beim Laden mancher Instrumente (z. B. UADx Opal, Odin 2) fragte macOS, ob die
+  Sicherheitseinstellungen für FIRSTofFIFTH gesenkt werden sollen. Ursache: FoF läuft in der
+  App-Sandbox, und diese Plug-ins erklären sich nicht als sandbox-tauglich. FoF trägt jetzt das
+  dafür vorgesehene Recht für Plug-in-Hosts (`temporary-exception.audio-unit-host`).
+
+**Geändert**
+- Pad-Tracks: RND würfelt sofort; die Akkordquelle wählt die kleine Taste ▾ daneben (vorher
+  RND gedrückt halten).
+
+---
+
+## [1.13.16] — 2026-11-14
+
+### Pad-Tracks für Flächen und Drones, Akkorde würfeln, Halten, ein Ton pro Spur
+
+**Neu**
+- **Pad-Track** („Pad-Track hinzufügen“ im Plus-Menü und im Spur-Kontextmenü): Steps von einer
+  Viertel bis zu 8 Takten (1/4, 1/2, 3/4, 1, 2, 3, 4, 8 Takte), legato, für Pads, Drones und
+  sphärische Klänge. Polyrhythmus bleibt möglich, z. B. 3 Steps à 3 Takte gegen 4 Takte. Die
+  Steps stehen kompakt im Raster; ein Balken zeigt, wie weit der laufende Step ist. Neuer
+  Pad-Track: 4 Steps à 1 Takt.
+- **Akkorde würfeln:** RND auf einem Pad-Track würfelt Akkorde in der Tonart des Tracks (SCL-Grundton),
+  mit Bass und weicher Stimmführung. Gedrückt halten öffnet die Auswahl: zufällige Folge aus
+  den Büchern von Lizzio („Chord Progression Codex“) und Callipari („Illustrierte Harmonie“),
+  eine bestimmte Folge (u. a. Pop-Netz, Andalusisch, Episch, Götterakkorde, Spuk, Line-Klischee,
+  Quintfall, Neapolitaner, Hexatonik, Zwölftakt-Blues; Quelle mit Seitenangabe im Tooltip)
+  oder leitereigene Akkorde aus der Skala des Tracks.
+- **Halten** (Edit-Card eines Steps): Der Step schlägt nichts an, sondern verlängert den Ton
+  des vorherigen Steps um seine Länge. So klingt ein Akkord z. B. zwei Steps lang und der
+  nächste nur einen. Gilt auf allen Step-Tracks.
+- **Ein Ton** (Edit-Card): Alle Steps der Spur spielen denselben Ton, z. B. eine Kick. Die
+  Tonwahl in der Karte gilt dann für die ganze Spur; die eigenen Noten der Steps bleiben
+  erhalten und kommen beim Ausschalten zurück.
+
+**Presetformat:** drei neue optionale Schlüssel (`pad`, `hold`, `fixedNote`). Ältere Versionen
+laden solche Dateien, spielen Pad-Tracks aber als normale Spur mit langen Steps, Halte-Steps
+mit ihren eigenen Noten und ohne festen Ton.
+
+---
+
 ## [1.13.15] — 2026-11-13
 
 ### Neues App-Icon

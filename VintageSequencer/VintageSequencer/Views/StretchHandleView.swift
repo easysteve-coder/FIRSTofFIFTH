@@ -42,9 +42,9 @@ struct StretchHandleView: View {
     @State private var showCountPopover: Bool = false
 
     private var currentRatioIndex: Int {
-        TrackData.sortedRatios.firstIndex(where: {
+        track.lane.ratioOptions.firstIndex(where: {
             $0.num == track.lane.stepLengthNumerator && $0.den == track.lane.stepLengthDenominator
-        }) ?? (TrackData.sortedRatios.count / 2)
+        }) ?? (track.lane.ratioOptions.count / 2)
     }
 
     private func gcd(_ a: Int, _ b: Int) -> Int { b == 0 ? a : gcd(b, a % b) }
@@ -117,10 +117,13 @@ struct StretchHandleView: View {
             Button(action: { showRatioPopover = true }) {
                 // Immer als Zahl (1/1 gedämpft) — ein namenloser Griff verriet nicht,
                 // was hier einstellbar ist.
-                Text("\(reducedRatio.num)/\(reducedRatio.den)")
+                Text(track.lane.isPad
+                     ? TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
+                                            den: track.lane.stepLengthDenominator)
+                     : "\(reducedRatio.num)/\(reducedRatio.den)")
                     .font(.system(size: isRatioDragging ? 11 : 10, weight: .medium, design: .monospaced))
                     .foregroundColor(accentColor)
-                    .opacity(isRatioDragging || isStretched ? 1.0 : 0.45)
+                    .opacity(isRatioDragging || isStretched || track.lane.isPad ? 1.0 : 0.45)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -244,7 +247,12 @@ private struct StepLengthPopover: View {
         (9, 8), (5, 4), (4, 3), (3, 2), (7, 4), (2, 1),
     ]
     private var ratioOptions: [(label: String, num: Int, den: Int, tooltip: String)] {
-        Self.ratioPairs.map { p in
+        if track.lane.isPad {
+            return TrackData.padRatios.map { p in
+                (TrackData.ratioLabel(num: p.num, den: p.den), p.num, p.den, s.padLengthHelp)
+            }
+        }
+        return Self.ratioPairs.map { p in
             let o = s.ratioOption(num: p.num, den: p.den)
             return (o.label, p.num, p.den, o.tooltip)
         }
@@ -256,8 +264,15 @@ private struct StepLengthPopover: View {
                 .font(VintageTheme.monoBold)
                 .foregroundColor(VintageTheme.textAmber)
 
-            // Fraction display
+            // Fraction display (Pad-Lane: Länge in Takten/Notenwerten)
             let r = reducedRatio
+            if track.lane.isPad {
+                Text(TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
+                                          den: track.lane.stepLengthDenominator))
+                    .font(.system(size: 30, weight: .bold, design: .monospaced))
+                    .foregroundColor(accentColor)
+                    .frame(maxWidth: .infinity)
+            } else {
             VStack(spacing: 3) {
                 Text("\(r.num)")
                     .font(.system(size: 22, weight: .semibold, design: .monospaced))
@@ -271,6 +286,7 @@ private struct StepLengthPopover: View {
                     .foregroundColor(accentColor)
             }
             .frame(maxWidth: .infinity)
+            }
 
             Text(s.ratioQuickSelect)
                 .font(VintageTheme.monoSmall)
@@ -295,11 +311,12 @@ private struct StepLengthPopover: View {
             }
 
             Button(s.ratioReset) {
+                let base = track.lane.isPad ? (num: 16, den: 1) : (num: 1, den: 1)
                 writer.apply(.setRatio(trackID: track.id,
                                        oldNum: track.lane.stepLengthNumerator,
                                        oldDen: track.lane.stepLengthDenominator,
-                                       newNum: 1,
-                                       newDen: 1),
+                                       newNum: base.num,
+                                       newDen: base.den),
                              to: track.data, undoManager: engine.undoManager)
             }
             .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: .gray))

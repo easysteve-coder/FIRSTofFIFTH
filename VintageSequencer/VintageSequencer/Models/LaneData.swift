@@ -42,6 +42,19 @@ final class LaneData: Identifiable {
     /// Step length as a ratio of a 16th note: numerator / denominator.
     var stepLengthNumerator:   Int = 1
     var stepLengthDenominator: Int = 1
+    /// Pad-Lane (v1.13.16): lange Steps (Viertel bis 8 Takte) für Flächen und Drones.
+    /// Steplänge kommt aus `TrackData.padRatios`; im Raster kompakt dargestellt (ein Step
+    /// = eine Standardbreite) statt zeitgetreu. Nur bei `kind == .step` sinnvoll.
+    var isPad: Bool = false
+    /// Fester Ton (v1.13.16): gesetzt spielen alle Steps diese Note statt ihrer eigenen
+    /// (z. B. eine Kick über die ganze Spur). Die Noten der Steps bleiben erhalten.
+    var fixedNote: Int? = nil
+
+    /// Erlaubte Steplängen dieser Lane, aufsteigend.
+    var ratioOptions: [(num: Int, den: Int)] { isPad ? TrackData.padRatios : TrackData.sortedRatios }
+    /// Verhältnis für die Rasterbreite: Pad-Lanes kompakt (1/1), sonst zeitgetreu.
+    var displayNumerator:   Int { isPad ? 1 : stepLengthNumerator }
+    var displayDenominator: Int { isPad ? 1 : stepLengthDenominator }
 
     // MARK: - Step-Lane Payload (semantisch nur bei kind == .step)
 
@@ -88,6 +101,8 @@ extension LaneData: Codable {
     enum CodingKeys: String, CodingKey {
         case id, kind, stepCount, direction
         case stepLengthNumerator, stepLengthDenominator
+        case isPad = "pad"
+        case fixedNote
         // step payload
         case steps
         // cc payload
@@ -105,6 +120,8 @@ extension LaneData: Codable {
         switch kind {
         case .step:
             try c.encode(Array(steps.prefix(stepCount)), forKey: .steps)
+            if isPad { try c.encode(true, forKey: .isPad) }   // optional, nur wenn gesetzt
+            try c.encodeIfPresent(fixedNote, forKey: .fixedNote)
         case .cc:
             try c.encode(Array(ccValues.prefix(stepCount)), forKey: .ccValues)
             try c.encode(ccNumber,  forKey: .ccNumber)
@@ -129,6 +146,8 @@ extension LaneData: Codable {
             var decoded = try c.decode([Step].self, forKey: .steps)
             while decoded.count < 64 { decoded.append(Step()) }
             self.steps = decoded
+            self.isPad = (try? c.decodeIfPresent(Bool.self, forKey: .isPad)) ?? false
+            self.fixedNote = (try? c.decodeIfPresent(Int.self, forKey: .fixedNote)) ?? nil
         case .cc:
             var decoded = try c.decode([Int].self, forKey: .ccValues)
             while decoded.count < 64 { decoded.append(64) }
@@ -152,6 +171,13 @@ extension LaneData {
         stepCount             = max(1, min(64, stepCount))
         stepLengthNumerator   = max(1, stepLengthNumerator)
         stepLengthDenominator = max(1, stepLengthDenominator)
+        if kind != .step { isPad = false; fixedNote = nil }
+        fixedNote = fixedNote.map { max(0, min(127, $0)) }
+        if isPad, !TrackData.padRatios.contains(where: {
+            $0.num == stepLengthNumerator && $0.den == stepLengthDenominator
+        }) {
+            stepLengthNumerator = 16; stepLengthDenominator = 1   // unbekannte Länge → 1 Takt
+        }
 
         switch kind {
         case .step:

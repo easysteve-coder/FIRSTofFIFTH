@@ -59,3 +59,28 @@ struct RubberBandLayer: View {
         }
     }
 }
+
+/// Fortschritt des laufenden Pad-Steps (v1.13.16). Erscheint, sobald der Step aktuell
+/// wird, und läuft linear über die Steplänge; kein Timer, nur eine Animation.
+struct PadProgressBar: View {
+    let seconds: Double
+    let color: Color
+    @State private var progress: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { geo in
+            Rectangle()
+                .fill(color.opacity(0.9))
+                .frame(width: geo.size.width * progress, height: 3)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        }
+        .frame(height: 3)
+        .padding(.horizontal, 4)
+        .padding(.bottom, 2)
+        .allowsHitTesting(false)
+        .onAppear {
+            progress = 0
+            withAnimation(.linear(duration: max(0.05, seconds))) { progress = 1 }
+        }
+    }
+}

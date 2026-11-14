@@ -102,6 +102,9 @@ enum ModelCommand {
     /// Mute-Zustand einer CC-Lane ändern.
     case setCCLaneMuted(trackID: UUID, old: Bool, new: Bool)
 
+    /// Fester Ton einer Step-Lane (v1.13.16): alle Steps spielen diese Note (nil = aus).
+    case setFixedNote(trackID: UUID, old: Int?, new: Int?)
+
     // MARK: - Metadata
 
     /// User-visible undo action name shown in the macOS Edit menu.
@@ -128,6 +131,7 @@ enum ModelCommand {
         case .setCCLaneParameter:            return "CC Target"
         case .setCCLaneLabel:                return "CC Label"
         case .setCCLaneMuted:                return "CC Mute"
+        case .setFixedNote:                  return "Fixed Note"
         }
     }
 }

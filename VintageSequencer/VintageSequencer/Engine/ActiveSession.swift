@@ -111,6 +111,9 @@ struct RatioDragSession {
     /// Horizontal scroll offset at drag-start.
     let scrollOffsetAtStart: CGFloat
 
+    /// Erlaubte Längen der Lane (Pad-Lanes haben eine eigene Liste, v1.13.16).
+    var ratios: [(num: Int, den: Int)] = TrackData.sortedRatios
+
     // MARK: - Pure computation
 
     /// Content-space displacement from anchor (same model as HandleDragSession).
@@ -125,13 +128,13 @@ struct RatioDragSession {
                                                 currentScrollOffset: currentScrollOffset),
             contentUnit:    contentUnit,
             baseRatioIndex: baseRatioIndex,
-            ratios:         TrackData.sortedRatios
+            ratios:         ratios
         )
     }
 
     func proposedRatio(translationX: CGFloat,
                        currentScrollOffset: CGFloat) -> (num: Int, den: Int) {
-        TrackData.sortedRatios[proposedRatioIndex(translationX: translationX,
+        ratios[proposedRatioIndex(translationX: translationX,
                                               currentScrollOffset: currentScrollOffset)]
     }
 
@@ -476,9 +479,12 @@ struct StretchRatioDragSession {
     let snapshotNumerator:   Int
     let snapshotDenominator: Int
 
-    /// Index of the drag-start ratio in `TrackData.sortedRatios`.
+    /// Index of the drag-start ratio in `ratios`.
     /// Used as the zero-offset reference for delta calculation.
     let snapshotRatioIndex: Int
+
+    /// Erlaubte Längen der Lane (Pad-Lanes haben eine eigene Liste, v1.13.16).
+    var ratios: [(num: Int, den: Int)] = TrackData.sortedRatios
 
     // MARK: - Constants
 
@@ -492,11 +498,11 @@ struct StretchRatioDragSession {
     /// Dragging UP (negative totalY) increases index (longer step); DOWN decreases.
     func proposedRatioIndex(totalY: CGFloat) -> Int {
         let delta = -Int((totalY / Self.pxPerIndex).rounded())
-        return max(0, min(TrackData.sortedRatios.count - 1, snapshotRatioIndex + delta))
+        return max(0, min(ratios.count - 1, snapshotRatioIndex + delta))
     }
 
     func proposedRatio(totalY: CGFloat) -> (num: Int, den: Int) {
-        TrackData.sortedRatios[proposedRatioIndex(totalY: totalY)]
+        ratios[proposedRatioIndex(totalY: totalY)]
     }
 
     // MARK: - Command production

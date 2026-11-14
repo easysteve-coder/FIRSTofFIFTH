@@ -50,6 +50,7 @@ struct Str {
     var defaultPreset:       String { "MyPreset.json" }
 
     func trackName(_ n: Int)    -> String { e("Track \(n)", "Spur \(n)") }
+    func padTrackName(_ n: Int) -> String { e("Pad \(n)", "Pad \(n)") }
     func trackDuplName(_ name: String) -> String { name + " 2" }
 
     func muteMenuItem(_ n: Int, isMuted: Bool) -> String {
@@ -196,6 +197,22 @@ struct Str {
     var undoCCLaneReset:     String { e("Reset CC Lane", "CC-Lane zurücksetzen") }
     var addStepTrack:        String { e("Add Step Track", "Step-Track hinzufügen") }
     var addCCTrack:          String { e("Add CC Track",   "CC-Track hinzufügen") }
+    var addPadTrack:         String { e("Add Pad Track (long steps)", "Pad-Track hinzufügen (lange Steps)") }
+    var padLengthHelp:       String { e("Step length of the pad track (4/4 bars).",
+                                        "Steplänge des Pad-Tracks (4/4-Takte).") }
+    var holdLabel:           String { e("HOLD", "HALTEN") }
+    var fixedNoteLabel:      String { e("ONE NOTE", "EIN TON") }
+    var fixedNoteHelp:       String { e("One note for the whole track: every step plays this note (e.g. a kick). The steps keep their own notes and get them back when switched off.",
+                                        "Ein Ton für die ganze Spur: Jeder Step spielt diesen Ton (z. B. eine Kick). Die Steps behalten ihre eigenen Noten und bekommen sie beim Ausschalten zurück.") }
+    var padRandomizeTooltip: String { e("RND: roll chords for this pad track, from the source chosen with ▾.",
+                                        "RND: Akkorde für diesen Pad-Track würfeln, aus der mit ▾ gewählten Quelle.") }
+    var padChordSourceTooltip: String { e("Chord source for RND: progressions from Lizzio (Chord Progression Codex) and Callipari (Illustrierte Harmonie), a specific progression, or chords from the track's scale.",
+                                          "Akkordquelle für RND: Folgen aus Lizzio (Chord Progression Codex) und Callipari (Illustrierte Harmonie), eine bestimmte Folge oder Akkorde aus der Skala des Tracks.") }
+    var padChordsBooksAny:   String { e("Progressions from the books (random)", "Folgen aus den Büchern (zufällig)") }
+    var padChordsFree:       String { e("Chords from the track's scale", "Akkorde aus der Skala des Tracks") }
+    var padChordsBooksHeader: String { e("Lizzio · Callipari", "Lizzio · Callipari") }
+    var holdHelp:            String { e("Hold: this step plays no new note but extends the previous step's sound by its length. Several hold steps in a row extend further.",
+                                        "Halten: Dieser Step schlägt nichts an, sondern verlängert den Klang des vorherigen Steps um seine Länge. Mehrere Halte-Steps hintereinander verlängern weiter.") }
 
     // MARK: - Step Button
 

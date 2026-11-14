@@ -38,6 +38,9 @@ struct TrackSideHeaderView: View {
                             onDelete:    onDelete,
                             onDuplicate: onDuplicate)
                 .frame(height: stepRowHeight)
+                // Ganze Kopffläche trifft — auch zwischen den Tasten öffnet der
+                // Rechtsklick das Spurmenü (v1.13.17).
+                .contentShape(Rectangle())
                 .contextMenu { headerContextMenu() }
 
         case .cc:
@@ -48,6 +51,7 @@ struct TrackSideHeaderView: View {
                 onDelete:    onDelete,
                 onDuplicate: onDuplicate
             )
+            .contentShape(Rectangle())
             .contextMenu { headerContextMenu() }
         }
     }

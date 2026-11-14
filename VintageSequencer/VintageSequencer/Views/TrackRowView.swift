@@ -86,6 +86,11 @@ struct TrackRowView: View {
             } label: {
                 Label(s.addCCTrack, systemImage: "dial.min")
             }
+            Button {
+                insertTrackBelow(kind: .step, pad: true)
+            } label: {
+                Label(s.addPadTrack, systemImage: "rectangle.split.3x1")
+            }
         } label: {
             Label(s.insertTrackBelow, systemImage: "plus")
         }
@@ -127,8 +132,8 @@ struct TrackRowView: View {
         .disabled(engine.currentPattern.tracks.count <= 1)
     }
 
-    private func insertTrackBelow(kind: LaneKind) {
-        engine.insertTrackUndoable(after: trackIndex, kind: kind, actionName: s.undoInsertTrack)
+    private func insertTrackBelow(kind: LaneKind, pad: Bool = false) {
+        engine.insertTrackUndoable(after: trackIndex, kind: kind, pad: pad, actionName: s.undoInsertTrack)
     }
 
     // MARK: - Body

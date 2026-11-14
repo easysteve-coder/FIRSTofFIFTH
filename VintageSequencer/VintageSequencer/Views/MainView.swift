@@ -20,8 +20,8 @@ struct MainView: View {
     @State private var scrollMonitor: Any?
     @State private var titlebarOverlap: CGFloat = 0
 
-    private func addTrack(kind: LaneKind) {
-        engine.addTrackUndoable(kind: kind, actionName: s.undoAddTrack)
+    private func addTrack(kind: LaneKind, pad: Bool = false) {
+        engine.addTrackUndoable(kind: kind, pad: pad, actionName: s.undoAddTrack)
     }
 
     var body: some View {
@@ -73,6 +73,9 @@ struct MainView: View {
                             }
                             Button { addTrack(kind: .cc) } label: {
                                 Label(s.addCCTrack, systemImage: "dial.min")
+                            }
+                            Button { addTrack(kind: .step, pad: true) } label: {
+                                Label(s.addPadTrack, systemImage: "rectangle.split.3x1")
                             }
                         } label: {
                             HStack(spacing: 6) {

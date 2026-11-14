@@ -1187,9 +1187,8 @@ class SequencerEngine: ObservableObject {
 
                 let steps = (0..<stepCount).map { i -> StepSnapshot in
                     let s = lane.steps[i]
-                    let notes = s.notes.isEmpty
-                        ? [60]
-                        : s.notes.map { max(0, min(127, $0)) }
+                    let notes = lane.fixedNote.map { [max(0, min(127, $0))] }
+                        ?? (s.notes.isEmpty ? [60] : s.notes.map { max(0, min(127, $0)) })
                     return StepSnapshot(
                         isActive:    s.isActive,
                         notes:       notes,
@@ -1197,7 +1196,9 @@ class SequencerEngine: ObservableObject {
                         gate:        max(0.001, s.gate),
                         probability: max(0.0, min(1.0, s.probability)),
                         ratchet:     s.ratchet,
-                        isDrone:     s.isDrone
+                        isDrone:     s.isDrone,
+                        isHold:      s.isActive && s.isHold,
+                        holdSpan:    Self.holdSpan(after: i, in: lane.steps, count: stepCount)
                     )
                 }
 
@@ -2124,6 +2125,19 @@ class SequencerEngine: ObservableObject {
         return runtime.currentStep
     }
 
+    /// Anzahl der aktiven Halte-Steps direkt nach `index` (Vorwärtsrichtung, zyklisch,
+    /// höchstens bis vor `index` selbst). Ein Halte-Step selbst hat Spanne 0.
+    static func holdSpan(after index: Int, in steps: [Step], count: Int) -> Int {
+        guard count > 1, steps.indices.contains(index), !(steps[index].isHold) else { return 0 }
+        var span = 0
+        var j = (index + 1) % count
+        while j != index, steps[j].isActive, steps[j].isHold {
+            span += 1
+            j = (j + 1) % count
+        }
+        return span
+    }
+
     /// Würde Track 0 des Patterns `snap` auf DIESEM Tick auf Step 0 zurückspringen?
     /// Rechnet auf Kopien von Runtime und PRNG — verändert nichts. Der spätere echte
     /// Advance liefert denselben Wert (gleicher Ausgangszustand, deterministisch).
@@ -2378,6 +2392,9 @@ class SequencerEngine: ObservableObject {
 
             let step = laneSteps[stepIdx]
             guard step.isActive else { continue }
+            // Halten: kein Anschlag; der vorherige Step hat seine Dauer schon um diesen
+            // Step verlängert (holdSpan).
+            guard !step.isHold else { continue }
             // RT-4b: RT-sicherer PRNG statt Double.random (SystemRandomNumberGenerator).
             guard rtRandom.nextUnitDouble() <= step.probability else { continue }
 
@@ -2394,7 +2411,8 @@ class SequencerEngine: ObservableObject {
 
             // Drone: ein Anschlag, kein Ratchet; die Note hält einen ganzen Durchlauf.
             let isDrone       = step.isDrone
-            let ratchets      = isDrone ? 1 : step.ratchet.rawValue
+            let holdSteps     = Double(step.holdSpan)
+            let ratchets      = (isDrone || step.holdSpan > 0) ? 1 : step.ratchet.rawValue
             let rInterval     = stepDuration / Double(ratchets)
             let capturedNotes = step.notes
             let capturedVel   = step.velocity
@@ -2406,8 +2424,11 @@ class SequencerEngine: ObservableObject {
                 let isChord  = capturedNotes.count > 1
                 let effectiveGate = ratchets > 1 ? min(capturedGate, 1.0) :
                                     isChord      ? max(capturedGate, 0.5)  : capturedGate
+                // Gehaltene Steps: volle eigene Länge plus jede Halte-Step-Länge, der letzte
+                // Abschnitt mit dem Gate dieses Steps (höchstens legato).
+                let heldGate = holdSteps > 0 ? holdSteps + min(effectiveGate, 1.0) : effectiveGate
                 let offDelay = onDelay + (isDrone ? stepDuration * Double(trackSnap.lane.stepCount)
-                                                  : max(0.010, rInterval * effectiveGate))
+                                                  : max(0.010, rInterval * heldGate))
 
                 let onTimeRaw = exactStepTime + Self.nanosToMachTime(UInt64(onDelay * 1_000_000_000))
                 let onTime: MIDITimeStamp
@@ -2426,7 +2447,7 @@ class SequencerEngine: ObservableObject {
                 // Wahrscheinlichkeit, andere Richtung), endet der Ton einen halben Step später.
                 let gateSeconds = isDrone
                     ? stepDuration * (Double(trackSnap.lane.stepCount) + 0.5)
-                    : max(0.010, rInterval * effectiveGate)
+                    : max(0.010, rInterval * heldGate)
                 let gateDurationMach = Self.nanosToMachTime(UInt64(gateSeconds * 1_000_000_000))
                 offTime = onTime + gateDurationMach
 
@@ -2489,24 +2510,33 @@ class SequencerEngine: ObservableObject {
         let index:   Int
     }
 
-    private func makeTrack(for pattern: Pattern, kind: LaneKind, strings s: Str) -> TrackData {
+    private func makeTrack(for pattern: Pattern, kind: LaneKind, pad: Bool = false,
+                           strings s: Str) -> TrackData {
         // v1.9.1 (Slice A): monotoner Ordnungszähler statt count+1 —
         // verhindert doppelte „Track N"-Namen nach Löschungen.
         let n = pattern.nextTrackOrdinal
         pattern.nextTrackOrdinal += 1
-        return TrackData(name: s.trackName(n),
+        let lane = LaneData(stepCount: pad ? 4 : 16, kind: kind)
+        if pad, kind == .step {
+            // Pad-Lane (v1.13.16): 4 Steps à 1 Takt, legato.
+            lane.isPad = true
+            lane.stepLengthNumerator = 16
+            lane.stepLengthDenominator = 1
+            for i in lane.steps.indices { lane.steps[i].gate = 1.0 }
+        }
+        return TrackData(name: pad ? s.padTrackName(n) : s.trackName(n),
                          midiChannel: min(n, 16),
                          colorIndex: firstFreeColorIndex(in: pattern.tracks),
-                         lane: LaneData(stepCount: 16, kind: kind))
+                         lane: lane)
     }
 
     /// Hängt in allen Patterns einen neuen leeren Track an.
     @discardableResult
-    func addTrack(kind: LaneKind = .step) -> [TrackPlacement] {
+    func addTrack(kind: LaneKind = .step, pad: Bool = false) -> [TrackPlacement] {
         guard canGrowTracks else { return [] }
         let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
         let set = patterns.map { p in
-            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, strings: s),
+            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, pad: pad, strings: s),
                            index: p.tracks.count)
         }
         insertPlacements(set)
@@ -2515,11 +2545,11 @@ class SequencerEngine: ObservableObject {
 
     /// Inserts a new empty track directly after `index` in all patterns.
     @discardableResult
-    func insertTrack(after index: Int, kind: LaneKind = .step) -> [TrackPlacement] {
+    func insertTrack(after index: Int, kind: LaneKind = .step, pad: Bool = false) -> [TrackPlacement] {
         guard canGrowTracks else { return [] }
         let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
         let set = patterns.map { p in
-            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, strings: s),
+            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, pad: pad, strings: s),
                            index: min(index + 1, p.tracks.count))
         }
         insertPlacements(set)
@@ -2625,11 +2655,12 @@ class SequencerEngine: ObservableObject {
                                backward: inserted ? remove : insert)
     }
 
-    func addTrackUndoable(kind: LaneKind, actionName: String) {
-        registerStructureUndo(addTrack(kind: kind), inserted: true, actionName: actionName)
+    func addTrackUndoable(kind: LaneKind, pad: Bool = false, actionName: String) {
+        registerStructureUndo(addTrack(kind: kind, pad: pad), inserted: true, actionName: actionName)
     }
-    func insertTrackUndoable(after index: Int, kind: LaneKind, actionName: String) {
-        registerStructureUndo(insertTrack(after: index, kind: kind), inserted: true, actionName: actionName)
+    func insertTrackUndoable(after index: Int, kind: LaneKind, pad: Bool = false, actionName: String) {
+        registerStructureUndo(insertTrack(after: index, kind: kind, pad: pad), inserted: true,
+                              actionName: actionName)
     }
     func duplicateTrackUndoable(at index: Int, actionName: String) {
         registerStructureUndo(duplicateTrack(at: index), inserted: true, actionName: actionName)

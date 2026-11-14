@@ -278,7 +278,8 @@ final class InteractionController: ObservableObject {
             snapshotDenominator: track.lane.stepLengthDenominator,
             baseRatioIndex:      baseRatioIndex,
             contentUnit:         contentUnit,
-            scrollOffsetAtStart: viewportController.scrollState.hScrollOffset
+            scrollOffsetAtStart: viewportController.scrollState.hScrollOffset,
+            ratios:              track.lane.ratioOptions
         ))
         isSessionActive = true
         sessionCursorHint = .resizeHorizontal
@@ -594,14 +595,16 @@ final class InteractionController: ObservableObject {
     /// Guards modal invariant — silently no-ops if a session is already active.
     func beginStretchRatioDrag(track: TrackData) {
         guard _session == nil else { return }
-        let idx = TrackData.sortedRatios.firstIndex(where: {
+        let options = track.lane.ratioOptions
+        let idx = options.firstIndex(where: {
             $0.num == track.lane.stepLengthNumerator && $0.den == track.lane.stepLengthDenominator
-        }) ?? (TrackData.sortedRatios.count / 2)
+        }) ?? (options.count / 2)
         _session = .stretchRatioDrag(StretchRatioDragSession(
             trackID:             track.id,
             snapshotNumerator:   track.lane.stepLengthNumerator,
             snapshotDenominator: track.lane.stepLengthDenominator,
-            snapshotRatioIndex:  idx
+            snapshotRatioIndex:  idx,
+            ratios:              options
         ))
         isSessionActive = true
         sessionCursorHint = .stretchVertical   // custom cursor, distinct from pitch drag

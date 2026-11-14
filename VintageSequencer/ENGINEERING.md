@@ -5,6 +5,40 @@ Prinzip: Evolutionär, kein Big Bang. RT-Pfad bleibt unberührt.
 
 ---
 
+## Pad-Lane, Halten, fester Ton, Pad-Akkorde (v1.13.16)
+
+**Pad-Lane.** `LaneData.isPad` (Schlüssel `pad`, optional) markiert eine Step-Lane mit langen
+Steps. Steplängen kommen aus `TrackData.padRatios` (Vielfache einer 16tel: 4, 8, 12, 16, 32,
+48, 64, 128 = 1/4 … 8 Takte); `lane.ratioOptions` liefert je Lane die gültige Liste, die
+Zieh-Sitzungen (`RatioDragSession`, `StretchRatioDragSession`) tragen sie als `ratios`. Das
+Raster rechnet mit `displayNumerator/displayDenominator` — bei Pad-Lanes 1/1, also kompakt,
+nicht zeitgetreu. Der Tick-Pfad ist unverändert: `pulsesPerStep = 6·num/den`, also 96 Pulse
+je Takt. Lange Offs stehen im Notenbuch wie Drone-Offs. `clampToValidRanges` setzt eine
+Pad-Lane mit unbekannter Länge auf 1 Takt. Die Fortschrittsanzeige (`PadProgressBar`) ist
+eine lineare Animation ab Erscheinen des aktuellen Steps, kein Timer; Dauer aus BPM und
+Steplänge zum Zeitpunkt des Stepwechsels.
+
+**Halten.** `Step.isHold` (Schlüssel `hold`, optional) schlägt nicht an. `holdSpan` (Anzahl
+direkt folgender aktiver Halte-Steps, Vorwärtsrichtung, zyklisch) wird auf Main im Snapshot
+vorberechnet; der Tick-Pfad liest nur `isHold` (→ überspringen) und `holdSpan` (Gate =
+`holdSpan + min(gate, 1)` Steps, Ratchet aus). Bei Rückwärts-, Pingpong- und Zufallsrichtung
+gilt dieselbe Vorwärts-Spanne — bewusst einfach.
+
+**Fester Ton.** `LaneData.fixedNote` (Schlüssel `fixedNote`, optional) ersetzt beim Bau des
+Snapshots die Noten jedes Steps durch diese eine Note; die Step-Noten bleiben im Modell.
+Gesetzt über `ModelCommand.setFixedNote` mit Undo.
+
+**Pad-Akkorde.** `PadChords` (Main, nur im Randomize-Befehl): 17 Folgen aus Lizzio, „Chord
+Progression Codex“, und Callipari, „Illustrierte Harmonie“ (Auswahl und Seitenangaben wie
+die Harmonie-Vorlagen in Planarium), notiert relativ zur Tonika, transponiert auf
+`scaleRoot`; alternativ leitereigen aus der Skala der Spur. Stimmführung: Bass auf dem
+Grundton (C2–B2), Akkord in enger Lage zwischen E3 und G5 mit kleinster Bewegung zum
+Vorgänger. Quelle/Folge stehen in UserDefaults (`padChordSource`, `padChordFamily`).
+
+**Presetformat.** Drei neue optionale Schlüssel, nur geschrieben wenn gesetzt. Ältere
+Versionen ignorieren sie: Pad-Lanes laden dort als normale Spur mit langen Steps (zeitgetreu
+breit), Halte-Steps spielen ihre eigenen Noten, der feste Ton entfällt.
+
 ## AU-Hosting — Ereignisgrenze und Rack (v1.13.0)
 
 Quelle: `Engine/AUEventQueue.swift`, `Engine/InstrumentRack.swift`, `Models/InstrumentChannelData.swift`,
@@ -201,6 +235,15 @@ Dateien: `Views/MixerView.swift` (Dock, Züge, Summe), `Views/MixerControls.swif
   Parameterliste liest `rack.parameters(for:)` einmal je geladenem Instrument aus dem Parameterbaum (Main, Cache).
 - **Klickflächen (v1.13.9):** Materialflächen sind nicht treffbar. Tastenstile setzen deshalb
   `.contentShape(Rectangle())`; statt `.buttonStyle(.plain)` gilt in Views `.buttonStyle(.fullArea)`.
+- **Sandbox und Plug-ins (v1.13.17):** FoF bleibt in der App-Sandbox (Container-Pfade für
+  Presets, Einstellungen und Diagnose). Nicht sandbox-taugliche AUs (ohne `sandboxSafe`, z. B.
+  UADx, Odin 2) lösen sonst eine Systemabfrage „Sicherheitseinstellungen senken“ aus; dafür
+  trägt die App `com.apple.security.temporary-exception.audio-unit-host`. Zulässig bei
+  Developer ID, nicht im App Store.
+- **Spurkopf (v1.13.17):** keine leeren `.contextMenu {}` an Tasten (sie sollten das Spurmenü
+  unterdrücken, beschränkten unter macOS aber die Trefferfläche auf die Beschriftung). Der Kopf
+  trägt `.contentShape(Rectangle())` vor `.contextMenu`, damit auch freie Flächen das Spurmenü
+  öffnen. Menüs (`Menu`) setzen die Trefferfläche an ihrem Label.
 - **Fensterkopf (v1.13.10):** `MainView` rückt um `titlebarOverlap` ein; `TitlebarOverlapReader` (NSView hinter der
   eingerückten Fläche) misst Oberkante gegen `window.contentLayoutRect` bei Layout, Größenänderung und Vollbild.
 - **Produktname (v1.13.10):** Build-Produkt `FIRSTofFIFTH.app` (`PRODUCT_NAME`), Modul weiter `VintageSequencer`
