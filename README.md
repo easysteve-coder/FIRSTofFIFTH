@@ -18,6 +18,8 @@ FIRSTofFIFTH into *Applications*. *Auf der Release-Seite unter **Assets** die
 
 ## What's new
 
+**1.18.38** — FoF survives crashing plug-ins (crashed plug-ins are removed at once and reloaded together; no more crash when a plug-in host dies); instruments always play MIDI channel 1, one output menu per track; no note burst after solo or kit loading.
+
 **1.18.32** — Since 1.14: audio loop tracks with time-stretching; time signature per pattern
 and free grouping of odd meters (7/8 as 3+4 …), per pattern or per track; step lengths as note
 values and long steps on every track; Apple Sampler (EXS/SoundFont/DLS) with drum choke groups;
