@@ -4,8 +4,8 @@ import Foundation
 //
 // Expliziter Lane-Typ-Diskriminator (Lane Slice 3).
 //
-// Heute existiert genau ein Case (`.step`). Der Enum ist dennoch bereits
-// eingeführt, damit:
+// Zwei Cases: `.step` (Noten-Steps; Pad ist eine Darstellungsvariante davon) und
+// `.cc`. Der Enum existiert, damit:
 //
 //   - das Persistenzschema (JSON) ein festes Typ-Tag trägt,
 //   - `LaneSnapshot.kind` im RT-Pfad denselben Diskriminator sichtbar macht,
@@ -18,7 +18,7 @@ import Foundation
 //   - Neue Cases dürfen NUR mit einer eigenen Slice-Entscheidung hinzugefügt
 //     werden; siehe ENGINEERING.md — „Lane-Typisierung (ab Slice 3)".
 //   - Kein `default`-Zweig in Switches über `LaneKind` — Exhaustiveness ist
-//     der einzige Zweck dieses Enums, solange es nur einen Case gibt.
+//     der Zweck dieses Enums.
 enum LaneKind: String, Codable, Sendable {
     case step
     case cc

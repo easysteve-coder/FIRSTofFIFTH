@@ -114,9 +114,10 @@ struct RatioDragSession {
     /// Erlaubte Längen der Lane (Pad-Lanes haben eine eigene Liste, v1.13.16).
     var ratios: [(num: Int, den: Int)] = TrackData.sortedRatios
 
-    /// Gesetzt (Pad-Lanes, v1.13.18): Ziehweg je Längenstufe statt zeitgetreuer Breite —
-    /// Pad-Längen reichen bis 128 16tel, zeitgetreu wäre der Weg unbedienbar lang.
-    var pxPerRatioStep: CGFloat? = nil
+    /// Ziehweg je Stufe der langen Längen (v1.13.18 für Pads, v1.18.29 jede Spur): lange
+    /// Längen reichen bis 128 16tel, zeitgetreu wäre der Weg unbedienbar lang. Kurze Längen
+    /// bleiben zeitgetreu.
+    var pxPerLongStep: CGFloat? = nil
 
     // MARK: - Pure computation
 
@@ -127,16 +128,13 @@ struct RatioDragSession {
     }
 
     func proposedRatioIndex(translationX: CGFloat, currentScrollOffset: CGFloat) -> Int {
-        if let px = pxPerRatioStep, px > 0 {
-            let d = contentDisplacement(translationX: translationX, currentScrollOffset: currentScrollOffset)
-            return max(0, min(ratios.count - 1, baseRatioIndex + Int((d / px).rounded())))
-        }
         return HandleDragLogic.ratioIndex(
             totalX:         contentDisplacement(translationX: translationX,
                                                 currentScrollOffset: currentScrollOffset),
             contentUnit:    contentUnit,
             baseRatioIndex: baseRatioIndex,
-            ratios:         ratios
+            ratios:         ratios,
+            longStepPx:     pxPerLongStep
         )
     }
 

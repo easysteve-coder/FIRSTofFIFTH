@@ -38,6 +38,7 @@ final class TrackViewModel: ObservableObject, Identifiable {
 
     private var dataSub: AnyCancellable?
     private var laneSub: AnyCancellable?
+    private var viewSub: AnyCancellable?
 
     // MARK: - Init
 
@@ -49,6 +50,10 @@ final class TrackViewModel: ObservableObject, Identifiable {
             .sink { [weak self] in self?.objectWillChange.send() }
         // Forward lane-field mutations.
         laneSub = data.lane.changed
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.objectWillChange.send() }
+        // Ansichtsänderungen (Einklappen) — nur die Zeile, kein Playback.
+        viewSub = data.viewChanged
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.objectWillChange.send() }
     }

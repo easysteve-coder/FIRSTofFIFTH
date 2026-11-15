@@ -122,4 +122,21 @@ import SwiftUI
         state.size = 5
         #expect(state.size == 30)
     }
+
+    /// v1.16.2: Jeder Start beginnt in der Mitte des Schiebers; ein alter gespeicherter Wert
+    /// wird ignoriert, Verstellen wird nicht mehr gespeichert.
+    @Test func stepWidthStartsAtMidpointAndIsNotPersisted() {
+        let key = "stepWidthSize"
+        let before = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let before { UserDefaults.standard.set(before, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        UserDefaults.standard.set(120.0, forKey: key)
+        let state = StepWidthState()
+        #expect(state.size == 75)
+        #expect(MaterialFaderMath.fraction(state.size, range: StepWidthState.range) == 0.5)
+        state.size = 100
+        #expect(UserDefaults.standard.double(forKey: key) == 120, "Verstellen schreibt nichts mehr")
+    }
 }

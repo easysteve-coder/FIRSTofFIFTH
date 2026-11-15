@@ -6,17 +6,20 @@ import AppKit
 
 struct TrackRowView: View {
     @ObservedObject var track: TrackViewModel
-    var accentColor:  Color      = VintageTheme.amber
+    /// Spurfarbe, aufgelöst hier — diese View beobachtet das TrackViewModel, also folgt sie
+    /// jeder Farbänderung sofort (v1.18.25).
+    private var accentColor: Color { VintageTheme.color(for: track.data) }
     var trackIndex:   Int        = 0
     var onRandomize:  (() -> Void)?
     var onClear:      (() -> Void)?
     var onDelete:     (() -> Void)?
-    var onDuplicate:  (() -> Void)?
 
     @EnvironmentObject private var engine: SequencerEngine
     @Environment(\.undoManager) private var undoManager
     @AppStorage("appLanguage")    private var lang:           String = "en"
+    @AppStorage("showTooltips")   private var showTooltips:   Bool   = true
     private var s: Str { Str(lang) }
+    private func tip(_ t: String) -> String { showTooltips ? t : "" }
     @State private var showMultiEdit = false
     // CC-Lane draw mode (nur für kind == .cc).
     // Step-Lane-Purify P1 (v1.10.0): cc1DrawMode/cc2DrawMode entfernt —
@@ -35,13 +38,10 @@ struct TrackRowView: View {
 
     // MARK: - Context menu
 
-    // Track-Farben-Slice v1.12.1: Farbwahl wandert vom Header-Farbpunkt
-    // ins Track-Kontextmenü. Der Farbpunkt im Header bleibt reine Anzeige.
-    // Kein neues Modell/Command — Auswahl geht weiterhin über
-    // `ModelCommand.setTrackColorIndex` + `ModelWriter` (Undo aktiv).
-    // Farbauflösung bleibt einziger Resolver-Ort `VintageTheme.color(forTrack:)`;
-    // die Swatches hier sind reine visuelle Palettenvorschau und berühren
-    // die Architekturregel „ein Resolver" nicht.
+    // Spurfarbe (Track-Farben-Slice v1.12.1, Palette 16 + Farbrad seit v1.18.25). Schreibweg
+    // `ModelCommand.setTrackColor` + `ModelWriter` (Undo). Die Swatches sind farbige
+    // Nicht-Vorlagen-Bilder — macOS färbt Menüsymbole sonst einheitlich ein, dann sah man die
+    // Farbe nicht (Stephan: „Farbe auswählen geht nicht").
     private let colorMenuWriter = ModelWriter()
 
     @ViewBuilder
@@ -49,22 +49,33 @@ struct TrackRowView: View {
         Menu {
             ForEach(Array(VintageTheme.trackColors.enumerated()), id: \.offset) { idx, swatch in
                 Button {
-                    let old = track.data.colorIndex
-                    guard idx != old else { return }
+                    let td = track.data
+                    guard idx != td.colorIndex || td.customColor != nil else { return }
                     colorMenuWriter.apply(
-                        .setTrackColorIndex(trackID: track.id, old: old, new: idx),
-                        to: track.data,
-                        undoManager: undoManager
-                    )
+                        .setTrackColor(trackID: td.id, oldIndex: td.colorIndex, oldCustom: td.customColor,
+                                       newIndex: idx, newCustom: nil),
+                        to: td, undoManager: undoManager)
                 } label: {
                     Label {
                         Text(s.colorName(idx + 1))
                     } icon: {
-                        if idx == track.data.colorIndex {
-                            Image(systemName: "checkmark")
-                        } else {
-                            Image(systemName: "circle.fill").foregroundColor(swatch)
-                        }
+                        Image(nsImage: TrackColorPanel.swatch(NSColor(swatch),
+                                                              selected: idx == track.data.colorIndex
+                                                                        && track.data.customColor == nil))
+                    }
+                }
+            }
+            Divider()
+            Button {
+                TrackColorPanel.shared.open(for: track.data, undoManager: undoManager, title: s.trackColorWheel)
+            } label: {
+                Label {
+                    Text(s.trackColorWheel)
+                } icon: {
+                    if track.data.customColor != nil {
+                        Image(nsImage: TrackColorPanel.swatch(NSColor(accentColor), selected: true))
+                    } else {
+                        Image(systemName: "paintpalette")
                     }
                 }
             }
@@ -87,10 +98,11 @@ struct TrackRowView: View {
                 Label(s.addCCTrack, systemImage: "dial.min")
             }
             Button {
-                insertTrackBelow(kind: .step, pad: true)
+                engine.addAudioLoopTrackUndoable(actionName: s.undoAddTrack)
             } label: {
-                Label(s.addPadTrack, systemImage: "rectangle.split.3x1")
+                Label(s.addAudioLoopTrack, systemImage: "waveform.circle")
             }
+            .disabled(!engine.rack.canAddChannel)
         } label: {
             Label(s.insertTrackBelow, systemImage: "plus")
         }
@@ -118,6 +130,27 @@ struct TrackRowView: View {
             Label(s.duplicateTrack, systemImage: "plus.square.on.square")
         }
 
+        // Zeile verschieben und einklappen (v1.17.3) — gilt in allen Patterns.
+        Button {
+            engine.moveTrackUndoable(from: trackIndex, to: trackIndex - 1, actionName: s.undoMoveTrack)
+        } label: {
+            Label(s.moveTrackUp, systemImage: "arrow.up")
+        }
+        .disabled(trackIndex == 0)
+        Button {
+            engine.moveTrackUndoable(from: trackIndex, to: trackIndex + 1, actionName: s.undoMoveTrack)
+        } label: {
+            Label(s.moveTrackDown, systemImage: "arrow.down")
+        }
+        .disabled(trackIndex >= engine.currentPattern.tracks.count - 1)
+        Button {
+            let c = track.data.isCollapsed
+            engine.setTrackCollapsedUndoable(at: trackIndex, !c, actionName: c ? s.expandTrack : s.collapseTrack)
+        } label: {
+            Label(track.data.isCollapsed ? s.expandTrack : s.collapseTrack,
+                  systemImage: track.data.isCollapsed ? "chevron.down" : "chevron.right")
+        }
+
         Divider()
 
         trackColorSubmenu
@@ -132,13 +165,37 @@ struct TrackRowView: View {
         .disabled(engine.currentPattern.tracks.count <= 1)
     }
 
-    private func insertTrackBelow(kind: LaneKind, pad: Bool = false) {
-        engine.insertTrackUndoable(after: trackIndex, kind: kind, pad: pad, actionName: s.undoInsertTrack)
+    private func insertTrackBelow(kind: LaneKind) {
+        engine.insertTrackUndoable(after: trackIndex, kind: kind, actionName: s.undoInsertTrack)
     }
 
     // MARK: - Body
 
     var body: some View {
+        Group {
+            if track.data.isCollapsed {
+                // Eingeklappt (v1.17.3): schmale Leiste, die Spur spielt weiter.
+                CollapsedTrackRow(track: track, accentColor: accentColor,
+                                  trackIndex: trackIndex) { trackContextMenu }
+            } else if track.data.isAudioLoop {
+                // Audio-Loop-Spur (v1.15.0): eigener Kopf und Wellenform statt Steps.
+                AudioLoopRowView(track: track, rack: engine.rack, accentColor: accentColor,
+                                 height: stepRowHeight,
+                                 edge: { rowEdge }) { trackContextMenu }
+            } else {
+                stepRow
+            }
+        }
+
+    }
+
+    private var rowEdge: TrackRowEdge {
+        TrackRowEdge(trackID: track.id, trackIndex: trackIndex, collapsed: false,
+                     accentColor: accentColor, s: s, tip: tip)
+    }
+
+    @ViewBuilder
+    private var stepRow: some View {
         #if DEBUG
         let _ = BodyRunCounter.shared.count("TrackRow")
         #endif
@@ -153,7 +210,6 @@ struct TrackRowView: View {
                 onRandomize:      onRandomize,
                 onClear:          onClear,
                 onDelete:         onDelete,
-                onDuplicate:      onDuplicate,
                 headerContextMenu: { AnyView(trackContextMenu) }
             )
             .frame(width: VintageTheme.trackHeaderWidth)
@@ -202,11 +258,8 @@ struct TrackRowView: View {
                     .onDisappear { grid.selectedSteps = [] }
             }
 
-            // Step-Lane-Purify P1 (v1.10.0): Expand/Collapse-Chevron entfernt.
-            // Step-Lanes haben kein CC-Panel mehr, daher nichts zum Expanden.
-            // Einheitlicher Platzhalter für beide Lane-Typen, damit die rechte
-            // Spurbreite konsistent bleibt.
-            Spacer().frame(width: 40)
+            // Rechter Rand (v1.17.3): Einklappen und Ziehgriff, gleiche Breite für alle Arten.
+            rowEdge
         }
         // GUI-01: gleicher Modulrahmen für Step- und CC-Spuren — gebürstetes dunkles Metall.
         .background(MetalSurface(tone: .darkMetal))

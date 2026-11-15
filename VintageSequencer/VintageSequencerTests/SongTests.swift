@@ -146,6 +146,35 @@ private let gap: UInt64 = 20_000_000
         #expect(log.all.filter { $0.note == 72 }.count == 1)
     }
 
+    /// A → B → C → A (je 1 Takt, Loop) über vier Grenzen, ohne dass Main nachzieht
+    /// (Codex H3): jeder Wechsel liegt exakt auf dem Taktstrich, das zurückkehrende A beginnt
+    /// frisch. Danach zieht Main in einem Schritt nach.
+    @MainActor @Test func songAdvancesSeveralScenesWithoutMain() throws {
+        let engine = SequencerEngine()
+        arm(engine, pattern: 0, note: 60, stepCount: 16)
+        arm(engine, pattern: 1, note: 62, stepCount: 16)
+        arm(engine, pattern: 2, note: 64, stepCount: 3)   // Track-0-Ende nicht auf dem Takt
+        engine.replaceSong(Song(scenes: [SongScene(pattern: 0, bars: 1), SongScene(pattern: 1, bars: 1),
+                                         SongScene(pattern: 2, bars: 1)], enabled: true, loops: true))
+        let log = attachOnLog(engine)
+        engine.setClockMode(.external)
+        engine.play()
+        defer { engine.stop() }
+        let b = engine._rt1PublishedBundle()
+        #expect(b?.planCount ?? 0 >= 3, "mehrere Wechsel vorausgeplant")
+        let t0 = mach_absolute_time() + 5_000_000_000
+        for p in 0...(4 * 96) { engine._rt3aDriveOneExternalTick(at: t0 + UInt64(p) * gap) }
+        let firsts = [0, 96, 192, 288, 384].map { bar in log.all.first { $0.ts == t0 + UInt64(bar) * gap }?.note }
+        #expect(firsts == [60, 62, 64, 60, 62], "A, B, C, A, B jeweils auf dem Taktstrich")
+        #expect(log.all.filter { $0.note == 64 }.count == 6, "C: Pulse 0, 18, … 90 seines Takts")
+        // Main zieht nach: aktuelles Pattern = B (fünfte Aktivierung), Szene 2.
+        engine.publishSnapshot()
+        #expect(engine.currentPatternIndex == 1)
+        #expect(engine.songState.playingScene == 1)
+        #expect(engine.queuedPatternIndex == 2)
+        #expect(engine._rt1PublishedBundle()?.switchAtPulse == 480)
+    }
+
     /// Song ohne Loop: ab dem Ende schlägt der Tick-Thread nichts mehr an.
     @MainActor @Test func songWithoutLoopFallsSilentAtTheEnd() throws {
         let engine = SequencerEngine()

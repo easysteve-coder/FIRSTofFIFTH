@@ -81,6 +81,14 @@ enum PadChordSource: String, CaseIterable {
     case free
 }
 
+/// Was RND auf eine Step-Spur würfelt (v1.16.2). Normale Spuren starten mit Einzeltönen,
+/// Pad-Spuren mit Akkorden; die Wahl gilt je Spurart (Schlüssel in `SequencerEngine`).
+enum RandomNoteMode: String, CaseIterable {
+    case single
+    case chords
+    case mixed
+}
+
 enum PadChords {
 
     // Seitenangaben übernommen aus den Planarium-Harmonievorlagen (Lizzio, Chord
@@ -155,6 +163,31 @@ enum PadChords {
 
     static func family(id: String) -> ChordProgressionFamily? { families.first { $0.id == id } }
 
+    // MARK: Skala (v1.18.14)
+
+    /// Tonklassen eines Akkords relativ zur Tonika.
+    static func pitchClasses(_ c: ChordSymbol) -> Set<Int> {
+        Set(c.quality.intervals.map { (c.root + $0) % 12 })
+    }
+
+    /// Liegen alle Töne des Akkords in der Skala (Intervalle relativ zur Tonika)?
+    static func fits(_ c: ChordSymbol, scale: Set<Int>) -> Bool { pitchClasses(c).isSubset(of: scale) }
+
+    /// Alle Akkorde, die eine Familie spielen kann; nil = nicht aufzählbar (Terzkette, chromatisch).
+    static func chords(of family: ChordProgressionFamily) -> [ChordSymbol]? {
+        switch family.shape {
+        case .sequence(let variants): return variants.flatMap { $0 }
+        case .net(let pool):          return pool
+        case .hub(let t, let others): return [t] + others
+        case .thirdChain:             return nil
+        }
+    }
+
+    /// Passt jede mögliche Folge der Familie in die Skala?
+    static func fits(_ family: ChordProgressionFamily, scale: Set<Int>) -> Bool {
+        chords(of: family)?.allSatisfy { fits($0, scale: scale) } ?? false
+    }
+
     // MARK: Folge erzeugen
 
     /// `count` Akkorde aus einer Familie (relativ zur Tonika 0).
@@ -195,12 +228,18 @@ enum PadChords {
     }
 
     /// Leitereigene Folge: Dreiklänge (gelegentlich Septakkorde bzw. add9) der Skala,
-    /// Zufallsweg bevorzugt über gemeinsame Töne. Für Skalen ohne sieben Stufen wird
-    /// Dur bzw. natürliches Moll genommen.
-    static func freeProgression<R: RandomNumberGenerator>(scaleIndex: Int, count: Int,
+    /// Zufallsweg bevorzugt über gemeinsame Töne. Ohne Skala (chromatisch) wird Dur bzw.
+    /// natürliches Moll genommen. `restrict` (v1.18.14, Skala eingestellt): jeder Akkord liegt
+    /// ganz in der Skala — Farben nur, wenn sie passen; Skalen ohne sieben Stufen (Pentatonik,
+    /// Blues, Ganzton) bekommen Akkorde aus ihren eigenen Tönen.
+    static func freeProgression<R: RandomNumberGenerator>(scaleIndex: Int, count: Int, restrict: Bool = false,
                                                           using rng: inout R) -> [ChordSymbol] {
         let scales = TrackData.scales
         var steps = scales.indices.contains(scaleIndex) ? scales[scaleIndex].intervals : []
+        if restrict, steps.count != 7, !steps.isEmpty {
+            return scaleChordWalk(scale: steps, count: count, using: &rng)
+        }
+        let scaleSet: Set<Int>? = restrict ? Set(steps) : nil
         if steps.count != 7 {
             let minorish = steps.contains(3) && !steps.contains(4)
             steps = minorish ? [0, 2, 3, 5, 7, 8, 10] : [0, 2, 4, 5, 7, 9, 11]
@@ -229,6 +268,7 @@ enum PadChords {
                 default: break
                 }
             }
+            if let scaleSet, !fits(ChordSymbol(r, q), scale: scaleSet) { q = base }
             let sym = ChordSymbol(r, q)
             return (sym, Set(q.intervals.map { (r + $0) % 12 }))
         }
@@ -241,6 +281,30 @@ enum PadChords {
             // Gewicht: gemeinsame Töne ×2 + 1, damit auch entfernte Stufen vorkommen.
             let weighted = options.flatMap { o in
                 Array(repeating: o.0, count: 1 + 2 * o.1.intersection(lastPCs).count)
+            }
+            out.append(weighted.randomElement(using: &rng) ?? tonic)
+        }
+        return out
+    }
+
+    /// Zufallsweg über alle Akkorde, die ganz aus den Tönen von `scale` bestehen (Skalen ohne
+    /// sieben Stufen). Start auf der Tonika, sonst wie `freeProgression` gewichtet.
+    static func scaleChordWalk<R: RandomNumberGenerator>(scale: [Int], count: Int,
+                                                         using rng: inout R) -> [ChordSymbol] {
+        let set = Set(scale)
+        let order: [ChordQuality] = [.maj, .min, .aug, .six, .min6, .maj7, .min7, .dom7, .add9, .minAdd9, .dim]
+        let all = scale.flatMap { r in order.map { ChordSymbol(r, $0) } }.filter { fits($0, scale: set) }
+        let triads = all.filter { [.maj, .min, .aug].contains($0.quality) }
+        guard let tonic = triads.first(where: { $0.root == 0 }) ?? all.first(where: { $0.root == 0 }) ?? all.first else {
+            return Array(repeating: ChordSymbol(0, .maj), count: max(1, count))  // Skala ohne Dreiklang
+        }
+        var out = [tonic]
+        while out.count < max(1, count) {
+            let last = out[out.count - 1], lastPCs = pitchClasses(last)
+            // Farben seltener als Dreiklänge; nicht zweimal derselbe Akkord.
+            let options = all.filter { $0 != last && $0.quality != .dim }
+            let weighted = options.flatMap { o in
+                Array(repeating: o, count: (triads.contains(o) ? 3 : 1) * (1 + pitchClasses(o).intersection(lastPCs).count))
             }
             out.append(weighted.randomElement(using: &rng) ?? tonic)
         }

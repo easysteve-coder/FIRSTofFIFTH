@@ -41,6 +41,15 @@ enum VintageTheme {
         Color(red: 0.60, green: 0.30, blue: 1.00), // purple
         Color(red: 1.00, green: 0.35, blue: 0.25), // red
         Color(red: 0.20, green: 0.90, blue: 0.80), // cyan
+        // v1.18.25: acht weitere (die ersten acht bleiben, Indizes alter Presets unverändert).
+        Color(red: 1.00, green: 0.78, blue: 0.30), // gold
+        Color(red: 0.45, green: 0.55, blue: 1.00), // indigo
+        Color(red: 0.65, green: 0.95, blue: 0.30), // lime
+        Color(red: 1.00, green: 0.50, blue: 0.75), // pink
+        Color(red: 0.95, green: 0.65, blue: 0.45), // peach
+        Color(red: 0.40, green: 0.80, blue: 0.95), // sky
+        Color(red: 0.75, green: 0.55, blue: 0.95), // lavender
+        Color(red: 0.85, green: 0.85, blue: 0.85), // silver
     ]
 
     /// Löst `TrackData.colorIndex` auf einen Palettenfarbwert auf.
@@ -57,6 +66,24 @@ enum VintageTheme {
     /// Sentinel-`-1` aus alten Presets (die der Pattern-Decoder in v1.9.1
     /// bereits positionsbasiert nachpatcht) und gegen zukünftige
     /// Paletten-Verkleinerungen — so kann der Resolver nie indexen außerhalb.
+    /// Farbe einer Spur (v1.18.25): eigene Farbe aus dem Farbrad, sonst Palette. Aufgerufen
+    /// von Views, die das TrackViewModel beobachten (TrackRowView, Mixer) — nur so folgt die
+    /// Anzeige einer Änderung (auch per Undo) sofort; bis v1.18.24 löste `MainView` die Farbe
+    /// auf und zeichnete bei einer reinen Spuränderung nicht neu.
+    static func color(for td: TrackData) -> Color {
+        if let hex = td.customColor, let c = color(hex: hex) { return c }
+        return color(forTrack: td.colorIndex)
+    }
+
+    /// "#RRGGBB" → Farbe; nil bei ungültiger Angabe.
+    static func color(hex: String) -> Color? {
+        var h = hex.trimmingCharacters(in: .whitespaces)
+        if h.hasPrefix("#") { h.removeFirst() }
+        guard h.count == 6, let v = UInt32(h, radix: 16) else { return nil }
+        return Color(red: Double(v >> 16 & 0xFF) / 255, green: Double(v >> 8 & 0xFF) / 255,
+                     blue: Double(v & 0xFF) / 255)
+    }
+
     static func color(forTrack colorIndex: Int) -> Color {
         let n = trackColors.count
         let normalized = ((colorIndex % n) + n) % n

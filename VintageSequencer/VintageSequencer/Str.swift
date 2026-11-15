@@ -7,6 +7,8 @@
 // Usage in non-SwiftUI code (AppDelegate, Engine):
 //   let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
 
+import Foundation
+
 struct Str {
     let de: Bool
     init(_ lang: String = "en") { de = lang == "de" }
@@ -51,6 +53,187 @@ struct Str {
 
     func trackName(_ n: Int)    -> String { e("Track \(n)", "Spur \(n)") }
     func padTrackName(_ n: Int) -> String { e("Pad \(n)", "Pad \(n)") }
+    func audioLoopTrackName(_ n: Int) -> String { e("Loop \(n)", "Loop \(n)") }
+
+    // Audio-Loop (v1.15.0)
+    var addAudioLoopTrack:   String { e("Add Audio Loop Track", "Audio-Loop-Spur hinzufügen") }
+    var mixerAudioLoopSource: String { "AUDIO-LOOP" }
+    var loopBadge:           String { "LOOP" }
+    var loopRecLabel:        String { "REC" }
+    var loopArmLabel:        String { "ARM" }
+    var loopEndLabel:        String { e("END", "ENDE") }
+    var loopUndoLabel:       String { "UNDO" }
+    var loopRedoLabel:       String { "REDO" }
+    var loopClearLabel:      String { "CLR" }
+    var loopMonLabel:        String { "MON" }
+    var loopGateLabel:       String { "GATE" }
+    var loopRecTip:          String { e("Arm recording (R): starts on the next bar and keeps overdubbing every pass",
+                                        "Aufnahme scharf schalten (R): beginnt am nächsten Takt und schichtet in jedem Durchlauf weiter") }
+    var loopArmedTip:        String { e("Armed — recording starts on the next bar. Click (R): cancel",
+                                        "Scharf — die Aufnahme beginnt am nächsten Takt. Klick (R): abbrechen") }
+    var loopRecordingTip:    String { e("Recording (overdub). Click (R): stop at the end of this pass",
+                                        "Nimmt auf (Overdub). Klick (R): am Ende dieses Durchlaufs beenden") }
+    var loopFinishingTip:    String { e("Stops at the end of this pass. Click (R): keep recording",
+                                        "Endet am Ende dieses Durchlaufs. Klick (R): weiter aufnehmen") }
+    var loopUndoTip:         String { e("Undo the last pass (click again: redo)",
+                                        "Letzten Durchlauf rückgängig (erneut: wiederherstellen)") }
+    var loopClearTip:        String { e("Erase the loop", "Loop löschen") }
+    var loopBarsTip:         String { e("Loop length in bars", "Loop-Länge in Takten") }
+    var loopBarsLockedTip:   String { e("Loop length — erase the loop to change it",
+                                        "Loop-Länge — zum Ändern erst den Loop löschen") }
+    var loopMonitorTip:      String { e("Monitor the input through this channel",
+                                        "Eingang über diesen Kanal mithören") }
+    var loopInputTip:        String { e("Audio input, channels and latency", "Audioeingang, Kanäle und Latenz") }
+    var loopInputLevelTip:   String { e("Input level (dBFS, peak hold). Active while monitoring, armed or recording",
+                                        "Eingangspegel (dBFS, Spitze gehalten). Aktiv beim Mithören, scharf oder bei der Aufnahme") }
+    var loopGateTip:         String { e("Noise gate: at the input, before or after the fader",
+                                        "Rauschgate: am Eingang, vor oder nach dem Fader") }
+    var loopInputHeader:     String { e("INPUT", "EINGANG") }
+    func loopInputChannel(_ c: Int, stereo: Bool) -> String { stereo ? "IN \(c + 1)-\(c + 2)" : "IN \(c + 1)" }
+    var loopStereo:          String { "Stereo" }
+    // Abtastrate des Instruments (v1.18.9)
+    var renderRateMenu: String { e("Plug-in sample rate", "Abtastrate des Plug-ins") }
+
+    // Kanal-EQ (v1.18.11)
+    var eqTitle:        String { e("Channel EQ", "Kanal-EQ") }
+    var eqOpenHelp:     String { e("Channel EQ — click to edit", "Kanal-EQ — Klick zum Bearbeiten") }
+    var eqFlat:         String { e("flat", "neutral") }
+    var eqOnHelp:       String { e("Turn the EQ on", "EQ einschalten") }
+    var eqOffHelp:      String { e("Turn the EQ off (bypass)", "EQ ausschalten (überbrücken)") }
+    var eqReset:        String { e("Reset", "Zurücksetzen") }
+    var eqResetHelp:    String { e("Reset all bands to their defaults", "Alle Bänder auf Grundeinstellung") }
+    var eqBandOnHelp:   String { e("Turn band on", "Band einschalten") }
+    var eqBandOffHelp:  String { e("Turn band off", "Band ausschalten") }
+    var eqFrequencyHelp: String { e("Frequency — drag or scroll (⌥ fine), double-click resets",
+                                    "Frequenz — ziehen oder scrollen (⌥ fein), Doppelklick setzt zurück") }
+    var eqGainHelp:     String { e("Gain — drag or scroll (⌥ fine), double-click = 0 dB",
+                                   "Pegel — ziehen oder scrollen (⌥ fein), Doppelklick = 0 dB") }
+    var eqQHelp:        String { e("Q (bandwidth) — drag or scroll (⌥ fine), double-click resets",
+                                   "Güte (Bandbreite) — ziehen oder scrollen (⌥ fein), Doppelklick setzt zurück") }
+    var eqSlopeHelp:    String { e("Slope", "Flankensteilheit") }
+    var eqGestureHint:  String { e("Drag a point: frequency/gain · ⌘-drag: Q · ⌥: fine · double-click: band on/off · ⌥-click: reset band",
+                                   "Punkt ziehen: Frequenz/Pegel · ⌘-Ziehen: Güte · ⌥: fein · Doppelklick: Band ein/aus · ⌥-Klick: Band zurücksetzen") }
+    func eqBandShort(_ kind: ChannelEQ.Kind, index: Int) -> String {
+        switch kind {
+        case .lowCut: return e("Low Cut", "Low Cut")
+        case .lowShelf: return e("Low Shelf", "Low Shelf")
+        case .bell: return "\(index - 1)"
+        case .highShelf: return e("High Shelf", "High Shelf")
+        case .highCut: return e("High Cut", "High Cut")
+        }
+    }
+    private func decimal(_ v: Double, digits: Int) -> String {
+        let p: Double = digits >= 2 ? 100 : (digits == 1 ? 10 : 1)
+        let r = (abs(v) * p).rounded()
+        let whole = Int(r / p), frac = Int(r) % Int(p)
+        let body = digits == 0 ? "\(whole)" : "\(whole)\(de ? "," : ".")" + String(repeating: "0", count: max(0, digits - String(frac).count)) + "\(frac)"
+        return (v < 0 && r > 0 ? "−" : "") + body
+    }
+    func eqFrequency(_ f: Double) -> String {
+        f >= 1000 ? decimal(f / 1000, digits: f >= 10_000 ? 1 : 2) + " kHz" : decimal(f, digits: 0) + " Hz"
+    }
+    func eqFrequencyShort(_ f: Double) -> String { f >= 1000 ? "\(Int(f / 1000))k" : "\(Int(f))" }
+    func eqGain(_ g: Double) -> String { (g > 0.04 ? "+" : "") + decimal(g, digits: 1) + " dB" }
+    func eqQ(_ q: Double) -> String { "Q " + decimal(q, digits: 2) }
+    func eqSlope(_ s: Int) -> String { e("\(s) dB/oct", "\(s) dB/Okt.") }
+    func kHz(_ rate: Double) -> String {
+        let tenths = Int((rate / 100).rounded())
+        let v = tenths % 10 == 0 ? "\(tenths / 10)" : (de ? "\(tenths / 10),\(tenths % 10)" : "\(tenths / 10).\(tenths % 10)")
+        return "\(v) kHz"
+    }
+    func renderRateDevice(_ rate: Double?) -> String {
+        let r = rate.map { " (\(kHz($0)))" } ?? ""
+        return e("Device rate\(r)", "Geräterate\(r)")
+    }
+    // Geräte von Aufnahme und Wiedergabe (v1.18.7)
+    var deviceInputRole:     String { e("RECORDING FROM (input)", "AUFNAHME VON (Eingang)") }
+    var deviceOutputRole:    String { e("PLAYBACK TO (output)", "WIEDERGABE ÜBER (Ausgang)") }
+    var deviceActive:        String { e("active", "aktiv") }
+    var deviceUnknown:       String { e("unknown device", "unbekanntes Gerät") }
+    var deviceNone:          String { e("no device", "kein Gerät") }
+    func deviceFormat(channels: Int, sampleRate: Double) -> String {
+        let tenths = Int((sampleRate / 100).rounded())
+        let khz = tenths % 10 == 0 ? "\(tenths / 10)" : "\(tenths / 10).\(tenths % 10)"
+        let sr = sampleRate > 0 ? " · \(khz) kHz" : ""
+        return e("\(channels) ch\(sr)", "\(channels) Kan.\(sr)")
+    }
+    func deviceInputOff(defaultName: String?) -> String {
+        let d = defaultName ?? deviceNone
+        return e("Input off — starts when a loop is armed, monitored or measured. It will then use the system default input: \(d).",
+                 "Eingang aus — startet beim Scharfschalten, Mithören oder Messen. Er nimmt dann vom Systemstandard-Eingang auf: \(d).")
+    }
+    func deviceOutputOff(defaultName: String?) -> String {
+        let d = defaultName ?? deviceNone
+        return e("Output off — starts when an instrument or loop is loaded. It will then use the system default output: \(d).",
+                 "Ausgang aus — startet, sobald ein Instrument oder Loop geladen ist. Er spielt dann über den Systemstandard-Ausgang: \(d).")
+    }
+    func deviceDiffers(defaultName: String?) -> String {
+        e("System default is now \(defaultName ?? deviceNone) — still running on the device above until the audio restarts.",
+          "Systemstandard ist jetzt \(defaultName ?? deviceNone) — läuft bis zum Neustart des Audios weiter über das Gerät oben.")
+    }
+    func loopChannelSelection(_ c: Int, stereo: Bool) -> String {
+        stereo ? e("Channels \(c + 1)–\(c + 2) · stereo", "Kanäle \(c + 1)–\(c + 2) · Stereo")
+               : e("Channel \(c + 1) · mono", "Kanal \(c + 1) · Mono")
+    }
+    func loopChannelMissing(_ c: Int, stereo: Bool, available: Int) -> String {
+        let need = stereo ? c + 2 : c + 1
+        return e("This device has \(available) input channel(s) — channel \(need) does not exist; the loop records silence.",
+                 "Dieses Gerät hat \(available) Eingangskanal/-kanäle — Kanal \(need) gibt es nicht; der Loop nimmt Stille auf.")
+    }
+    var deviceInputOffShort: String { e("input off", "Eingang aus") }
+    func deviceHeaderTip(input: String, output: String) -> String {
+        e("Input: \(input) · Output: \(output)", "Eingang: \(input) · Ausgang: \(output)")
+    }
+    var loopLatency:         String { e("Latency offset", "Latenzausgleich") }
+    var loopLatencyHelp:     String { e("Device latency is compensated automatically. If recordings land late, raise the value; early, lower it.",
+                                        "Die Gerätelatenz wird automatisch ausgeglichen. Liegt Aufgenommenes zu spät, Wert erhöhen; zu früh, verringern.") }
+    // Latenzmessung per Loopback (v1.15.2)
+    var loopMeasureLabel:    String { e("MEASURE", "MESSEN") }
+    var loopMeasureRunning:  String { e("measuring…", "misst…") }
+    var loopMeasureFailed:   String { e("no click received", "kein Klick empfangen") }
+    func loopMeasureResult(roundTripMs: Double, offsetMs: Double, clamped: Bool) -> String {
+        let rt = "\((roundTripMs * 10).rounded() / 10)"
+        let o = Int(offsetMs.rounded()), off = o >= 0 ? "+\(o)" : "\(o)"
+        return clamped ? e("\(rt) ms — offset limited to \(off) ms", "\(rt) ms — Ausgleich begrenzt auf \(off) ms")
+                       : e("\(rt) ms → offset \(off) ms", "\(rt) ms → Ausgleich \(off) ms")
+    }
+    var loopMeasureHelp:     String { e("Connect this channel's output to the selected input with a cable (channel not muted), then measure. The offset is set so recordings land on the beat.",
+                                        "Ausgang dieses Kanals per Kabel mit dem gewählten Eingang verbinden (Kanal nicht stumm), dann messen. Der Ausgleich wird so gesetzt, dass Aufnahmen auf dem Schlag liegen.") }
+    var gateHeader:          String { "GATE" }
+    func gatePosition(_ p: GatePosition) -> String {
+        switch p {
+        case .off:       return e("Off", "Aus")
+        case .input:     return e("Input", "Eingang")
+        case .preFader:  return "Pre-Fader"
+        case .postFader: return "Post-Fader"
+        }
+    }
+    var gateThreshold:       String { e("Threshold", "Schwelle") }
+    var gateRelease:         String { e("Release", "Ausklingen") }
+    var gateHold:            String { e("Hold", "Halten") }
+    var gateHelp:            String { e("Input: noise never reaches the loop. Pre-fader: after the effects. Post-fader: after the fader.",
+                                        "Eingang: Störgeräusche gelangen gar nicht in den Loop. Pre-Fader: nach den Effekten. Post-Fader: nach dem Fader.") }
+    var loopEmptyHint:       String { e("Empty — REC or R: recording starts on the next bar",
+                                        "Leer — REC oder R: die Aufnahme beginnt am nächsten Takt") }
+    var loopNoChannel:       String { e("No audio loop channel — choose one with the output button",
+                                        "Kein Audio-Loop-Kanal — über die Ausgangstaste zuweisen") }
+    func loopError(_ code: String) -> String {
+        switch code {
+        case "denied":  return e("Microphone access denied — allow FIRSTofFIFTH in System Settings › Privacy & Security › Microphone.",
+                                 "Mikrofonzugriff verweigert — FIRSTofFIFTH in Systemeinstellungen › Datenschutz & Sicherheit › Mikrofon erlauben.")
+        case "noInput": return e("No audio input available.", "Kein Audioeingang verfügbar.")
+        case "stretched": return e("Overdub only at the loop's own tempo and time signature — it is time-stretched now.",
+                                   "Overdub nur im Tempo und in der Taktart des Loops — er wird gerade gedehnt.")
+        case "tooLong": return e("Loop too long at this tempo (max. 120 s).", "Loop bei diesem Tempo zu lang (höchstens 120 s).")
+        case "budget":  return e("Audio loop memory budget reached (1 GB for all loops of the project).",
+                                 "Speicherbudget der Audio-Loops erreicht (1 GB für alle Loops des Projekts).")
+        case "noOutput": return e("No audio output — the audio engine is not running.", "Kein Audioausgang — die Audio-Engine läuft nicht.")
+        default:        return code
+        }
+    }
+    var loopRateMismatch:    String { e("Input and output run at different sample rates — set both devices to the same rate (Audio MIDI Setup).",
+                                        "Ein- und Ausgang laufen mit verschiedenen Abtastraten — beide Geräte auf dieselbe Rate stellen (Audio-MIDI-Setup).") }
+    var loopRecordMenuItem:  String { e("Audio Loop: Record / Stop", "Audio-Loop: Aufnahme / Ende") }
     func trackDuplName(_ name: String) -> String { name + " 2" }
 
     func muteMenuItem(_ n: Int, isMuted: Bool) -> String {
@@ -111,11 +294,11 @@ struct Str {
     var muteTooltip:         String { e("Mute this track",                   "Track stummschalten") }
     var soloActiveTooltip:   String { e("Solo active (all others muted)",    "Solo aktiv (alle anderen stumm)") }
     var soloTooltip:         String { e("Solo — mute all other tracks",      "Nur diesen Track Solo spielen") }
-    var duplicateTooltip:    String { e("Duplicate track",                   "Track duplizieren") }
     var deleteTooltip:       String { e("Delete track",                      "Track löschen") }
     var feelTooltip:         String { e("Set timing offset (feel)",          "Timing-Versatz (Feel) einstellen") }
     var scaleTooltip:        String { e("Set key and mode",                  "Tonart und Modus einstellen") }
-    var randomizeTooltip:    String { e("Randomize steps",                   "Steps zufällig belegen") }
+    var randomizeTooltip:    String { e("Randomize steps (single notes, chords or mixed, as chosen with ▾)",
+                                        "Steps zufällig belegen (Einzeltöne, Akkorde oder gemischt, wie mit ▾ gewählt)") }
     var clearTooltip:        String { e("Clear all steps in this track",     "Alle Steps dieses Tracks löschen") }
     var midiChannelTooltip:  String { e("MIDI channel · 10 ◆ = GM Drums",   "MIDI-Kanal · 10 ◆ = GM Drums") }
 
@@ -127,6 +310,14 @@ struct Str {
     // Context menu
     var insertTrackBelow:    String { e("Insert Track Below",  "Track darunter einfügen") }
     var duplicateTrack:      String { e("Duplicate Track",     "Track duplizieren") }
+    var moveTrackUp:         String { e("Move Up",             "Nach oben") }
+    var moveTrackDown:       String { e("Move Down",           "Nach unten") }
+    var collapseTrack:       String { e("Collapse Track",      "Spur einklappen") }
+    var expandTrack:         String { e("Expand Track",        "Spur aufklappen") }
+    var undoMoveTrack:       String { e("Move Track",          "Spur verschieben") }
+    var collapseTrackTip:    String { e("Collapse or expand this track (keeps playing)",
+                                        "Spur ein- oder aufklappen (spielt weiter)") }
+    var dragTrackTip:        String { e("Drag to move the track", "Ziehen verschiebt die Spur") }
     var deleteTrack:         String { e("Delete Track",        "Track löschen") }
 
     // Feel popover
@@ -187,6 +378,8 @@ struct Str {
     var undoAddTrack:        String { e("Add Track",       "Spur hinzufügen") }
     var undoDeleteTrack:     String { e("Delete Track",    "Spur löschen") }
     var undoInsertTrack:     String { e("Insert Track",    "Spur einfügen") }
+    var undoLoopPass:        String { e("Loop Pass", "Loop-Durchlauf") }
+    var undoLoopClear:       String { e("Erase Loop", "Loop löschen") }
     var undoDuplicateTrack:  String { e("Duplicate Track", "Spur duplizieren") }
     var undoChangeTrackColor: String { e("Change Track Color", "Spurfarbe ändern") }
     var trackColorMenu:       String { e("Track Color",        "Spurfarbe") }
@@ -198,18 +391,164 @@ struct Str {
     var undoCCLaneReset:     String { e("Reset CC Lane", "CC-Lane zurücksetzen") }
     var addStepTrack:        String { e("Add Step Track", "Step-Track hinzufügen") }
     var addCCTrack:          String { e("Add CC Track",   "CC-Track hinzufügen") }
-    var addPadTrack:         String { e("Add Pad Track (long steps)", "Pad-Track hinzufügen (lange Steps)") }
-    var padLengthHelp:       String { e("Step length of the pad track (4/4 bars).",
-                                        "Steplänge des Pad-Tracks (4/4-Takte).") }
+    var padLengthHelp:       String { e("Long step: beats and bars of the pattern's time signature. Every step sounds legato with RND.",
+                                        "Langer Step: Schläge und Takte der Taktart des Patterns. RND lässt jeden Step legato klingen.") }
+    var ratioLongHeader:     String { e("LONG STEPS", "LANGE STEPS") }
+    var stepWidthAuto:       String { e("Auto", "Auto") }
     var holdLabel:           String { e("HOLD", "HALTEN") }
-    var padWidthHeader:      String { e("PAD WIDTH", "PAD-BREITE") }
+    var padWidthHeader:      String { e("STEP WIDTH", "STEP-BREITE") }
     // Song (v1.14.0)
     var songHeader:          String { "SONG" }
     var songLoopLabel:       String { "LOOP" }
     var songEndLabel:        String { e("END", "ENDE") }
     var songPatternHeader:   String { "PATTERN" }
     var songBarsHeader:      String { e("BARS", "TAKTE") }
-    func songBars(_ n: Int) -> String { "\(n) T" }
+    func songBars(_ n: Int) -> String { barsShort(n) }
+    /// Kurze Taktangabe (Song, Loop-Länge, Pad-Länge).
+    func barsShort(_ n: Int) -> String { de ? "\(n) T" : (n == 1 ? "1 bar" : "\(n) bars") }
+    /// Anzeige einer Pad-Steplänge in Takten und Schlägen der Taktart (v1.18.12), sonst
+    /// „n/d" (Codex N2: Darstellung gehört nicht ins Modell).
+    func stepLength(num: Int, den: Int, meter: TimeSignature) -> String {
+        guard den == 1 else { return "\(num)/\(den)" }
+        let bar = meter.sixteenthsPerBar, beat = meter.sixteenthsPerBeat
+        guard num % beat == 0 else { return "\(num)/16" }
+        let bars = num / bar, beats = (num % bar) / beat
+        if beats == 0 { return barsShort(bars) }
+        let b = de ? "\(beats) Sl." : (beats == 1 ? "1 beat" : "\(beats) beats")
+        return bars == 0 ? b : barsShort(bars) + " " + b
+    }
+    // Positionsanzeige und Spurangaben (v1.18.21)
+    var positionBarsHelp:  String { e("Position: bar . beat . sixteenth . tick (240 per sixteenth) of what FoF is playing now — click: show time",
+                                      "Position: Takt . Schlag . Sechzehntel . Tick (240 je Sechzehntel) dessen, was FoF gerade ausgibt — Klick: Zeit anzeigen") }
+    var positionTimeHelp:  String { e("Time since play — click: show bars and beats",
+                                      "Zeit seit Start — Klick: Takte und Schläge anzeigen") }
+    var tempoFieldHelp:    String { e("Tempo — drag up/down (⇧: fine), double-click to type",
+                                      "Tempo — nach oben/unten ziehen (⇧: fein), Doppelklick zum Eintippen") }
+    var positionPatternLegend: String { e("PATTERN", "PATTERN") }
+    var positionPatternHelp:   String { e("Playing pattern · ▸ next pattern · bars until the change (none: at the end of track 1)",
+                                          "Laufendes Pattern · ▸ nächstes Pattern · Takte bis zum Wechsel (ohne Zahl: am Ende von Spur 1)") }
+    var positionBarsLegend: String { e("BAR BEAT DIV TICK", "TAKT SCHLAG TEIL TICK") }
+    var positionTimeLegend: String { e("H MIN SEC MS", "STD MIN SEK MS") }
+    func meterBeatUnit(_ m: TimeSignature) -> String {
+        let unit: String
+        switch m.denominator {
+        case 2:  unit = e("halves", "Halbe")
+        case 8:  unit = e("eighths", "Achtel")
+        case 16: unit = e("sixteenths", "Sechzehntel")
+        default: unit = e("quarters", "Viertel")
+        }
+        return "\(m.numerator) \(unit)"
+    }
+    var infoNoteValue:     String { e("Note value", "Notenwert") }
+    var infoTrackLength:   String { e("Track length", "Spurlänge") }
+    var infoAtTempo:       String { e("at the current tempo, without swing and offsets",
+                                      "beim aktuellen Tempo, ohne Swing und Versatz") }
+    func seconds(_ s: Double) -> String {
+        s < 1 ? String(format: "%.1f ms", s * 1000).replacingOccurrences(of: ".", with: de ? "," : ".")
+              : String(format: "%.3f s", s).replacingOccurrences(of: ".", with: de ? "," : ".")
+    }
+    func stepsCount(_ n: Int) -> String { n == 1 ? e("1 step", "1 Step") : e("\(n) steps", "\(n) Steps") }
+    /// „1 T 2 Sl. 1/16" bzw. „1 bar 2 beats 1/16"; gebrochen „10/3 /16".
+    func span(_ s: (num: Int, den: Int), meter m: TimeSignature) -> String {
+        guard let p = TimingInfo.split(sixteenths: s, meter: m) else { return "\(s.num)/\(s.den * 16)" }
+        var parts: [String] = []
+        if p.bars > 0 { parts.append(barsShort(p.bars)) }
+        if p.beats > 0 { parts.append(de ? "\(p.beats) Sl." : (p.beats == 1 ? "1 beat" : "\(p.beats) beats")) }
+        if p.sixteenths > 0 { parts.append("\(p.sixteenths)/16") }
+        return parts.isEmpty ? "0" : parts.joined(separator: " ")
+    }
+    // Taktart (v1.18.12)
+    var timeSignatureHelp:   String { e("Time signature of this pattern — bars of the song, audio loops, pad lengths, the grid and the plug-in transport follow it",
+                                        "Taktart dieses Patterns — Takte im Song, Audio-Loops, Pad-Längen, Raster und der Takt für Plug-ins folgen ihr") }
+    var timeSignatureLocked: String { e("Stop playback to change the time signature",
+                                        "Zum Ändern der Taktart die Wiedergabe anhalten") }
+    /// Länge einer Lane als Text: „Gruppe 3+4", ganze Takte „2 T", sonst Notenwert „1/16"
+    /// (v1.18.31).
+    func laneLength(_ lane: LaneData, meter: TimeSignature) -> String {
+        if lane.stepGroup { return stepGroupLabel + " " + TimeSignature.groupingText(lane.effectiveGroups(meter)) }
+        return noteValue(num: lane.stepLengthNumerator, den: lane.stepLengthDenominator, meter: meter)
+    }
+    /// Länge (in Sechzehnteln) als Notenwert: ganze Takte „2 T", sonst Bruch der ganzen Note.
+    func noteValue(num: Int, den: Int, meter: TimeSignature) -> String {
+        if den == 1, num % meter.sixteenthsPerBar == 0, num >= meter.sixteenthsPerBar {
+            return barsShort(num / meter.sixteenthsPerBar)
+        }
+        let f = TrackData.wholeFraction(num: num, den: den)
+        return "\(f.p)/\(f.q)"
+    }
+    /// Hilfetext eines Notenwerts: Name und wie viele Steps eine Viertel/Halbe/Ganze füllen.
+    func noteValueHelp(p: Int, q: Int) -> String {
+        let names: [String: (String, String)] = [
+            "1/32": ("thirty-second", "Zweiunddreißigstel"), "1/16": ("sixteenth", "Sechzehntel"),
+            "1/8": ("eighth", "Achtel"), "1/4": ("quarter", "Viertel"), "1/2": ("half note", "Halbe"),
+            "1/1": ("whole note", "Ganze"), "3/32": ("dotted 32nd", "punktierte Zweiunddreißigstel"),
+            "3/16": ("dotted sixteenth", "punktierte Sechzehntel"), "3/8": ("dotted eighth", "punktierte Achtel"),
+            "3/4": ("dotted quarter", "punktierte Viertel"), "1/24": ("sixteenth triplet", "Sechzehnteltriole"),
+            "1/12": ("eighth triplet", "Achteltriole"), "1/6": ("quarter triplet", "Vierteltriole"),
+            "1/3": ("half-note triplet", "Halbetriole"), "1/20": ("sixteenth quintuplet", "Sechzehntelquintole"),
+            "1/10": ("eighth quintuplet", "Achtelquintole"), "1/5": ("quarter quintuplet", "Viertelquintole"),
+            "1/28": ("sixteenth septuplet", "Sechzehntelseptole"), "1/14": ("eighth septuplet", "Achtelseptole"),
+            "1/7": ("quarter septuplet", "Viertelseptole"),
+        ]
+        let name = names["\(p)/\(q)"].map { e($0.0, $0.1) } ?? "\(p)/\(q)"
+        // Wie viele Steps füllen eine Viertel, Halbe oder Ganze genau?
+        for (x, en, deName) in [(4, "a quarter", "eine Viertel"), (2, "a half note", "eine Halbe"), (1, "a whole note", "eine Ganze")]
+        where q % (x * p) == 0 {
+            let n = q / (x * p)
+            return e("\(p)/\(q) = \(name): \(n) steps fill \(en)", "\(p)/\(q) = \(name): \(n) Steps füllen \(deName)")
+        }
+        return "\(p)/\(q) = \(name)"
+    }
+    func noteRowLabel(_ r: TrackData.NoteRow) -> String {
+        switch r {
+        case .straight:   return e("STRAIGHT", "GERADE")
+        case .dotted:     return e("DOTTED", "PUNKTIERT")
+        case .triplet:    return e("TRIPLET", "TRIOLE")
+        case .quintuplet: return e("QUINTUPLET", "QUINTOLE")
+        case .septuplet:  return e("SEPTUPLET", "SEPTOLE")
+        }
+    }
+    var barsRowLabel:        String { e("BARS", "TAKTE") }
+    var groupRowLabel:       String { e("GROUP", "GRUPPE") }
+    var customFractionLabel: String { e("OWN VALUE", "EIGENER BRUCH") }
+    var customFractionHelp:  String { e("Any note value as a fraction of a whole note, e.g. 5/16 or 1/9 (Return).",
+                                        "Jeder Notenwert als Bruch der ganzen Note, z. B. 5/16 oder 1/9 (Return).") }
+    var customFractionInvalid: String { e("Not valid (from 1/96 up to 8 bars).", "Ungültig (von 1/96 bis 8 Takte).") }
+    var groupsFieldHelp:     String { e("Groups of this track in eighths, separated by + (e.g. 3+4, 3+3+2), Return.",
+                                        "Gruppen dieser Spur in Achteln, mit + getrennt (z. B. 3+4, 3+3+2), Return.") }
+    var groupsInvalid:       String { e("Not valid: 1–8 groups of 1–64 eighths.", "Ungültig: 1–8 Gruppen zu 1–64 Achteln.") }
+    func groupsFit(_ g: [Int], meter: TimeSignature) -> String {
+        let sum16 = g.reduce(0, +) * 2, bar = meter.sixteenthsPerBar
+        if sum16 % bar == 0 {
+            let n = sum16 / bar
+            return e(n == 1 ? "fits one bar" : "fits \(n) bars", n == 1 ? "passt in einen Takt" : "passt in \(n) Takte")
+        }
+        return e("runs against the bar (\(g.reduce(0, +))/8 against \(meter.label))",
+                 "läuft gegen den Takt (\(g.reduce(0, +))/8 gegen \(meter.label))")
+    }
+    var groupingHeader:      String { e("GROUPING", "GRUPPIERUNG") }
+    var groupingNone:        String { e("None (even)", "Keine (gleichmäßig)") }
+    var groupingCustom:      String { e("Custom…", "Eigene …") }
+    func groupingHint(_ n: Int) -> String {
+        e("Groups in beats, separated by +; they must add up to \(n) (e.g. 5+2).",
+          "Gruppen in Schlägen, mit + getrennt; Summe muss \(n) ergeben (z. B. 5+2).")
+    }
+    func groupingInvalid(_ n: Int) -> String {
+        e("Not valid: 2–8 groups that add up to \(n).", "Ungültig: 2–8 Gruppen mit der Summe \(n).")
+    }
+    var stepGroupLabel:      String { e("Group", "Gruppe") }
+    var stepGroupHelp:       String { e("Each step lasts one group of the time signature's grouping, in turn (3+4: 3/8, 4/8, 3/8 …). Without grouping: one bar.",
+                                        "Jeder Step dauert reihum eine Gruppe der Gruppierung der Taktart (3+4: 3/8, 4/8, 3/8 …). Ohne Gruppierung: ein Takt.") }
+    func timeSignaturePending(_ now: TimeSignature, _ next: TimeSignature) -> String {
+        e("Playing in \(now.label) · \(next.label) applies when this pattern starts again (after a change or stop)",
+          "Läuft in \(now.label) · \(next.label) gilt beim nächsten Start dieses Patterns (nach Wechsel oder Stop)")
+    }
+    var patternSwitchMenu:   String { e("Pattern change without song", "Patternwechsel ohne Song") }
+    var patternSwitchOnBar:  String { e("At the next bar line", "Am nächsten Taktstrich") }
+    var patternSwitchTrack1: String { e("At the end of track 1", "Am Ende von Spur 1") }
+    var patternSwitchHelp:   String { e("Click: when a chosen pattern takes over without song mode",
+                                        "Klick: wann ein gewähltes Pattern ohne Song-Modus übernimmt") }
+    var undoTimeSignature:   String { e("Time Signature", "Taktart") }
     var songEmptyHint:       String { e("No scenes yet — + adds one. A scene plays a pattern for a number of bars.",
                                         "Noch keine Szenen — + fügt eine hinzu. Eine Szene spielt ein Pattern für eine Anzahl Takte.") }
     var songEnableTip:       String { e("Song mode: Play runs the scenes in order; patterns change exactly on the bar line",
@@ -234,18 +573,23 @@ struct Str {
         e("Switch to Pattern \(letter) · switches at end of Track 1",
           "Pattern \(letter) wechseln · Wechsel erfolgt am Ende von Track 1")
     }
-    var padWidthHelp:        String { e("Display width of this pad track's steps, in normal step widths. Only changes the view, not the sound.",
-                                        "Anzeigebreite der Steps dieses Pad-Tracks in normalen Stepbreiten. Ändert nur die Ansicht, nicht den Klang.") }
-    var fixedNoteLabel:      String { e("ONE NOTE", "EIN TON") }
-    var fixedNoteHelp:       String { e("One note for the whole track: every step plays this note (e.g. a kick). The steps keep their own notes and get them back when switched off.",
-                                        "Ein Ton für die ganze Spur: Jeder Step spielt diesen Ton (z. B. eine Kick). Die Steps behalten ihre eigenen Noten und bekommen sie beim Ausschalten zurück.") }
-    var padRandomizeTooltip: String { e("RND: roll chords for this pad track, from the source chosen with ▾.",
-                                        "RND: Akkorde für diesen Pad-Track würfeln, aus der mit ▾ gewählten Quelle.") }
-    var padChordSourceTooltip: String { e("Chord source for RND: progressions from Lizzio (Chord Progression Codex) and Callipari (Illustrierte Harmonie), a specific progression, or chords from the track's scale.",
-                                          "Akkordquelle für RND: Folgen aus Lizzio (Chord Progression Codex) und Callipari (Illustrierte Harmonie), eine bestimmte Folge oder Akkorde aus der Skala des Tracks.") }
+    var padWidthHelp:        String { e("Display width of this track's long steps, in normal step widths (Auto: by length). Only changes the view, not the sound.",
+                                        "Anzeigebreite der langen Steps dieser Spur in normalen Stepbreiten (Auto: nach Länge). Ändert nur die Ansicht, nicht den Klang.") }
+    var fixedNoteLabel:      String { e("FIXED", "FEST") }
+    var fixedNoteHelp:       String { e("Fixed note or chord for the whole track: every step plays it (e.g. a kick or a held chord). Switching on takes this step's notes; the keyboard then edits it. The steps keep their own notes and get them back when switched off.",
+                                        "Fester Ton oder Akkord für die ganze Spur: Jeder Step spielt ihn (z. B. eine Kick oder einen Akkord). Einschalten übernimmt die Töne dieses Steps; die Klaviatur bearbeitet ihn dann. Die Steps behalten ihre eigenen Noten und bekommen sie beim Ausschalten zurück.") }
+    var padRandomizeTooltip: String { e("RND: roll this track's long steps — every step sounds, legato (chords, single notes or mixed, as chosen with ▾).",
+                                        "RND: die langen Steps dieser Spur würfeln — jeder Step klingt, legato (Akkorde, Einzeltöne oder gemischt, wie mit ▾ gewählt).") }
+    var padChordSourceTooltip: String { e("RND settings: single notes, chords or mixed; chord source: progressions from Lizzio (Chord Progression Codex) and Callipari (Illustrierte Harmonie), a specific progression, or chords from the track's scale.",
+                                          "RND-Einstellung: Einzeltöne, Akkorde oder gemischt; Akkordquelle: Folgen aus Lizzio (Chord Progression Codex) und Callipari (Illustrierte Harmonie), eine bestimmte Folge oder Akkorde aus der Skala des Tracks.") }
     var padChordsBooksAny:   String { e("Progressions from the books (random)", "Folgen aus den Büchern (zufällig)") }
     var padChordsFree:       String { e("Chords from the track's scale", "Akkorde aus der Skala des Tracks") }
     var padChordsBooksHeader: String { e("Lizzio · Callipari", "Lizzio · Callipari") }
+    var rndNotesHeader:      String { e("RND rolls", "RND würfelt") }
+    var rndNotesSingle:      String { e("Single notes", "Einzeltöne") }
+    var rndNotesChords:      String { e("Chords", "Akkorde") }
+    var rndNotesMixed:       String { e("Mixed (single notes and chords)", "Gemischt (Einzeltöne und Akkorde)") }
+    var rndChordSourceHeader: String { e("Chord source", "Akkordquelle") }
     var holdHelp:            String { e("Hold: this step plays no new note but extends the previous step's sound by its length. Several hold steps in a row extend further.",
                                         "Halten: Dieser Step schlägt nichts an, sondern verlängert den Klang des vorherigen Steps um seine Länge. Mehrere Halte-Steps hintereinander verlängern weiter.") }
 
@@ -303,6 +647,25 @@ struct Str {
     var mixerSum:            String { e("SUM", "SUMME") }
     func mixerOpenEditorHelp(_ name: String) -> String { e("Open \(name)", "\(name) öffnen") }
     var mixerEmpty:          String { e("Empty", "Leer") }
+    // Apple-Sampler (v1.18.16)
+    var samplerLoad:         String { e("Apple Sampler: load instrument…", "Apple Sampler: Instrument laden …") }
+    var samplerChoose:       String { e("Choose a sampler instrument (EXS, SoundFont, DLS, aupreset)",
+                                        "Sampler-Instrument wählen (EXS, SoundFont, DLS, aupreset)") }
+    var samplerGrantFolders: String { e("Share sample folder…", "Sample-Ordner freigeben …") }
+    var samplerGrantMessage: String { e("Choose the folder that contains the instrument and its samples (for example Music). FIRSTofFIFTH only reads from shared folders.",
+                                        "Ordner wählen, der Instrument und Samples enthält (z. B. Musik). FIRSTofFIFTH liest nur aus freigegebenen Ordnern.") }
+    var samplerGrant:        String { e("Share", "Freigeben") }
+    var samplerErrorTitle:   String { e("Sampler instrument not loaded", "Sampler-Instrument nicht geladen") }
+    func samplerMissing(found: Int, missing: Int) -> String {
+        missing == 0 && found == 0
+            ? e("The samples could not be read. Share the folder that contains them.",
+                "Die Samples sind nicht lesbar. Bitte den Ordner freigeben, in dem sie liegen.")
+            : e("\(missing) of \(found + missing) samples could not be read. Share the folder that contains them.",
+                "\(missing) von \(found + missing) Samples sind nicht lesbar. Bitte den Ordner freigeben, in dem sie liegen.")
+    }
+    var samplerUnsupported:  String { e("This file type cannot be loaded by the Apple Sampler.", "Diesen Dateityp lädt der Apple Sampler nicht.") }
+    func samplerFailed(_ status: Int32) -> String { e("The Apple Sampler reported error \(status).", "Der Apple Sampler meldet Fehler \(status).") }
+    var samplerCancel:       String { e("Cancel", "Abbrechen") }
     func mixerUnavailable(_ name: String) -> String { e("Not installed: \(name)", "Nicht installiert: \(name)") }
     var mixerNoAudioUnits:   String { e("No Audio Units found", "Keine Audio Units gefunden") }
     var mixerSlotOnHelp:     String { e("Turn on", "Einschalten") }
@@ -325,7 +688,17 @@ struct Str {
     }
     var trackOutputMenu:     String { e("Output", "Ausgang") }
     var trackOutputMIDI:     String { e("External MIDI", "Externes MIDI") }
-    var ccTargetChooseHelp:  String { e("Target: MIDI CC — click to choose a parameter of the instrument", "Ziel: MIDI-CC — klicken, um einen Parameter des Instruments zu wählen") }
+    var ccTargetChooseHelp:  String { e("Target: MIDI CC — click to choose a parameter of the instrument or an effect", "Ziel: MIDI-CC — klicken, um einen Parameter des Instruments oder eines Effekts zu wählen") }
+    var ccTargetPlugin:      String { e("Plug-in", "Plug-in") }
+    var ccTargetSearch:      String { e("Search parameters", "Parameter suchen") }
+    var ccTargetNoMatch:     String { e("No matching parameter", "Kein passender Parameter") }
+    var ccTargetNotLoaded:   String { e("not loaded", "nicht geladen") }
+    var ccTargetNoPlugins:   String { e("No instrument or effect on this channel", "Kein Instrument und kein Effekt in diesem Kanal") }
+    func ccTargetInstrument(_ n: String) -> String { e("Instrument: \(n)", "Instrument: \(n)") }
+    func ccTargetEffect(_ i: Int, _ n: String) -> String { e("Effect \(i): \(n)", "Effekt \(i): \(n)") }
+    func ccTargetCount(_ shown: Int, _ all: Int) -> String {
+        shown == all ? e("\(all) parameters", "\(all) Parameter") : e("\(shown) of \(all) parameters", "\(shown) von \(all) Parametern")
+    }
     func ccTargetParameterHelp(_ p: String, _ ch: String) -> String { e("Controls “\(p)” of “\(ch)”", "Steuert „\(p)“ von „\(ch)“") }
     func ccTargetUnresolvedHelp(_ p: String) -> String { e("“\(p)” is not available (instrument loading, replaced, or parameter missing) — the lane sends nothing. Click to choose a target.", "„\(p)“ ist nicht verfügbar (Instrument lädt, wurde getauscht oder der Parameter fehlt) — die Spur sendet nichts. Klicken, um ein Ziel zu wählen.") }
     func ccTargetMIDI(_ n: Int) -> String { e("MIDI CC \(n)", "MIDI-CC \(n)") }
@@ -348,9 +721,9 @@ struct Str {
                                         "↑↓ ziehen zum Strecken · klicken für Eingabe") }
     var stepCountHelp:       String { e("Step count: ↑↓ drag · click for input",
                                         "Step-Anzahl: ↑↓ ziehen · klicken für Eingabe") }
-    var ratioHeader:         String { e("STEP LENGTH / RATIO", "STEP-LÄNGE / RATIO") }
+    var ratioHeader:         String { e("STEP LENGTH", "STEP-LÄNGE") }
     var ratioQuickSelect:    String { e("QUICK SELECT",         "SCHNELLWAHL") }
-    var ratioReset:          String { e("RESET 1:1",            "RESET 1:1") }
+    var ratioReset:          String { e("RESET 1/16",           "ZURÜCK 1/16") }
 
     // MARK: - Main View / Add Track
 
@@ -400,6 +773,7 @@ struct Str {
 
     var namePlaceholder:     String { e("Name", "Name") }
     func colorName(_ n: Int) -> String { e("Color \(n)", "Farbe \(n)") }
+    var trackColorWheel:     String { e("Color Wheel…", "Farbrad …") }
 
     // MARK: - Step length quick select (label, tooltip)
 
@@ -460,5 +834,9 @@ struct Str {
     func errPresetSave(_ reason: String) -> String { e("Preset could not be saved: \(reason)",
                                                        "Preset konnte nicht gespeichert werden: \(reason)") }
     var errPresetEncode:     String { e("Preset could not be encoded", "Preset konnte nicht kodiert werden") }
+    var errLoopEncode:       String { e("Audio loop material could not be encoded — the project was not saved.",
+                                        "Audio-Loop-Material konnte nicht kodiert werden — das Projekt wurde nicht gespeichert.") }
+    func errLoopRestore(_ n: Int) -> String { e("\(n) audio loop(s) could not be restored (damaged, too large or over the memory budget). The original data is kept and saved again unchanged.",
+                                                "\(n) Audio-Loop(s) konnten nicht wiederhergestellt werden (beschädigt, zu groß oder über dem Speicherbudget). Die Originaldaten bleiben erhalten und werden unverändert mitgespeichert.") }
     var errMIDIOutputGone:   String { e("MIDI output device disconnected.", "MIDI-Ausgabegerät wurde getrennt.") }
 }

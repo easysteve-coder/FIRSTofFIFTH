@@ -23,6 +23,19 @@ struct AUEventQueueTests {
 
     private func activeQueue() -> AUEventQueue { let q = AUEventQueue(); q.setActive(true); return q }
 
+    /// Routenlatenz (Codex T7): mit Ausgleich geht das Tick-Ereignis um die Latenz früher in
+    /// den Renderweg; Vorhören von Main („sofort") bleibt unberührt.
+    @Test func routeLatencyAdvancesTickEventsOnly() {
+        let q = activeQueue()
+        q.setLatencyAdvance(2_000)
+        q.pushFromTick(0x90, 60, 100, at: 12_000)          // → 10_000
+        #expect(render(q, start: 0).isEmpty)
+        #expect(render(q, start: 5_120) == [Out(offset: 488, b0: 0x90, b1: 60)], "(10000 − 5120) / 10")
+        q.setLatencyAdvance(50_000)
+        q.pushFromTick(0x90, 61, 100, at: 12_000)          // läge vor 0 → sofort fällig, nie 0
+        #expect(render(q, start: 15_360) == [Out(offset: 0, b0: 0x90, b1: 61)])
+    }
+
     /// Ein Ereignis erscheint in dem Block, in dessen Fenster seine Host-Zeit fällt, am
     /// passenden Sample-Offset — nicht früher.
     @Test func eventLandsInItsBlockAtTheRightSampleOffset() {
@@ -119,24 +132,39 @@ struct AUEventQueueTests {
         q._afterCountersLoaded = nil
     }
 
-    /// Gemessene Kosten eines Blocks bei voller Warteliste und vollen Ringen (Debug-Build,
-    /// dieser Rechner). Grenze großzügig; die Messwerte stehen im PROJECT_LOG.
+    /// Kosten eines Blocks bei voller Warteliste und vollen Ringen (v1.16.1, Codex V16-4).
+    /// Zwei getrennte Größen: Arbeitskosten als Thread-CPU-Zeit (ohne Preemption) und
+    /// Wandzeit (mit Scheduler-Störungen). Grenzen: CPU p95 < 500 µs und CPU-Maximum unter
+    /// der Blockzeit (64 Frames bei 48 kHz = 1333 µs) — eigene langsame Arbeit fällt damit
+    /// auch als einzelner Ausreißer auf. Wandzeit-Überschreitungen der Blockzeit werden
+    /// gezählt und mit p95/p99/max immer als Messdatei abgelegt (`fof-render-cost.txt`).
     @Test func renderCostAtFullLoad() {
         let q = activeQueue()
-        var worst: UInt64 = 0
+        var wall: [UInt64] = [], cpu: [UInt64] = []
         var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
         for round in 0..<200 {
             for i in 0..<AUEventRing.capacity {
                 _ = q.pushFromTick(0x90, UInt8(i % 128), 1, at: round % 2 == 0 ? 1 : 1_000_000_000)
                 _ = q.pushFromMain(0x80, UInt8(i % 128), 0, at: 1_000_000_000)
             }
+            let c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
             let t0 = mach_absolute_time()
             q.render(hostStart: 0, hostValid: true, frames: 64, ticksPerFrame: 10, emit: { _, _ in })
-            worst = max(worst, mach_absolute_time() - t0)
+            wall.append(mach_absolute_time() - t0)
+            cpu.append(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0)
         }
-        let worstMicros = Double(worst) * Double(tb.numer) / Double(tb.denom) / 1_000
-        // 64 Frames bei 48 kHz = 1333 µs Blockzeit.
-        #expect(worstMicros < 500, "schlechtester Block: \(worstMicros) µs")
+        let deadline = 1_333.0
+        let wallUs = wall.map { Double($0) * Double(tb.numer) / Double(tb.denom) / 1_000 }.sorted()
+        let cpuUs  = cpu.map { Double($0) / 1_000 }.sorted()
+        func pct(_ v: [Double], _ p: Int) -> Double { v[min(v.count - 1, v.count * p / 100)] }
+        let overruns = wallUs.filter { $0 > deadline }.count
+        let report = String(format: "blocks=%d cpu_p95=%.1f cpu_p99=%.1f cpu_max=%.1f wall_p95=%.1f wall_p99=%.1f wall_max=%.1f wall_overruns=%d deadline_us=%.0f\n",
+                            wall.count, pct(cpuUs, 95), pct(cpuUs, 99), cpuUs.last!,
+                            pct(wallUs, 95), pct(wallUs, 99), wallUs.last!, overruns, deadline)
+        try? report.write(to: FileManager.default.temporaryDirectory
+            .appendingPathComponent("fof-render-cost.txt"), atomically: true, encoding: .utf8)
+        #expect(pct(cpuUs, 95) < 500, "Arbeitskosten p95: \(report)")
+        #expect(cpuUs.last! < deadline, "Arbeitskosten einzelner Block über der Blockzeit: \(report)")
     }
 
     /// Leeren während eines laufenden Blocks (H2): Aufräumen, das nach `invalidate` eingereiht
@@ -448,17 +476,126 @@ struct AUEventQueueTests {
         #expect(old.ccParameter == nil)
     }
 
-    /// Menügliederung der Parameter: Gruppen des Plug-ins, sonst Blöcke zu 40.
-    @Test func parameterMenuSections() {
-        func p(_ i: Int, _ g: String = "") -> InstrumentRack.ParameterInfo {
-            .init(address: UInt64(i), name: "P\(i)", group: g, min: 0, max: 1)
+    /// Zielwahl (v1.17.1): alphabetisch mit natürlicher Zahlenfolge, gleicher Name nach
+    /// Gruppe; Suche mit mehreren Wörtern in Name oder Gruppe, ohne Groß-/Klein-/Akzent.
+    @Test func parameterPickerSortsAndFilters() {
+        func p(_ i: Int, _ n: String, _ g: String = "") -> InstrumentRack.ParameterInfo {
+            .init(address: UInt64(i), name: n, group: g, min: 0, max: 1)
         }
-        #expect(CCTargetButton.sections([]).isEmpty)
-        #expect(CCTargetButton.sections((0..<40).map { p($0) }).map(\.title) == [nil])
-        let chunks = CCTargetButton.sections((0..<95).map { p($0) })
-        #expect(chunks.map(\.title) == ["1–40", "41–80", "81–95"] && chunks[2].items.count == 15)
-        let grouped = CCTargetButton.sections([p(0, "Osc"), p(1, "Filter"), p(2, "Osc")])
-        #expect(grouped.map(\.title) == ["Osc", "Filter"] && grouped[0].items.count == 2)
+        let all = [p(0, "Osc 10 Level", "Osc"), p(1, "Cutoff", "Filter 2"), p(2, "Osc 2 Level", "Osc"),
+                   p(3, "Cutoff", "Filter 1"), p(4, "Résonance", "Filter 1"), p(5, "attack")]
+        #expect(CCTargetPicker.filtered(all, query: "").map(\.address) == [5, 3, 1, 2, 0, 4])
+        #expect(CCTargetPicker.filtered(all, query: "cut").map(\.address) == [3, 1])
+        #expect(CCTargetPicker.filtered(all, query: "filter 2").map(\.address) == [1])
+        #expect(CCTargetPicker.filtered(all, query: "reso").map(\.address) == [4])
+        #expect(CCTargetPicker.filtered(all, query: "xyz").isEmpty)
+    }
+
+    static let fakeEffect = PluginRef(description: AudioComponentDescription(
+        componentType: kAudioUnitType_Effect, componentSubType: 0x46584658,          // 'FXFX'
+        componentManufacturer: 0x54455354, componentFlags: 0, componentFlagsMask: 0), name: "FakeFX")
+
+    /// Effekt als CC-Ziel (v1.17.1): der Wert geht in die Warteschlange des Effekts mit
+    /// dessen Belegung, nicht an das Instrument; die laufende Nummer wählt unter gleichen
+    /// Effekten; Entfernen gibt den Platz frei, das Ziel löst danach nicht mehr auf.
+    @MainActor @Test func effectParameterTargetReachesTheEffectQueue() throws {
+        let engine = SequencerEngine()
+        let channelID = try #require(engine.rack.addChannel(name: "Test"))
+        let route = engine.rack.route(for: channelID)
+        engine.rack.queue(route).setActive(true)
+        engine.rack._markInstrumentReady(channelID, as: Self.fakeInstrument)
+        let free = engine.rack._freeEffectQueueCount
+        let params: [InstrumentRack.ParameterInfo] = [.init(address: 7, name: "Mix", group: "", min: 0, max: 100)]
+        let first  = try #require(engine.rack._addReadyEffect(Self.fakeEffect, parameters: params, to: channelID))
+        let second = try #require(engine.rack._addReadyEffect(Self.fakeEffect, parameters: params, to: channelID))
+        #expect(first != second && engine.rack._freeEffectQueueCount == free - 2)
+        #expect(engine.rack.parameterSources(for: channelID).map(\.ordinal) == [nil, 0, 1])
+
+        _ = engine.addTrack(kind: .cc)
+        let td = try #require(engine.currentPattern.tracks.last)
+        td.instrumentID = channelID
+        td.lane.ccNumber = 74
+        td.lane.ccValues[0] = 127
+        td.lane.ccParameter = ParameterRef(address: 7, name: "Mix", component: Self.fakeEffect.componentKey, effect: 1)
+
+        engine.setClockMode(.external)
+        engine.play()
+        let target = try #require(engine._rt1PublishedBundle()?.snapshot.tracks.last?.parameter)
+        #expect(target.queue == second && target.epoch == engine.rack.effectQueue(second).occupancyEpoch)
+        engine._rt3aDriveOneExternalTick(at: mach_absolute_time() + 1_000_000)
+        var fx: [(UInt64, Float)] = [], inst = 0, other = 0
+        engine.rack.effectQueue(second).render(hostStart: 0, hostValid: false, frames: 512, ticksPerFrame: 1,
+                                               emit: { _, _ in }, emitParameter: { _, a, v in fx.append((a, v)) })
+        engine.rack.effectQueue(first).render(hostStart: 0, hostValid: false, frames: 512, ticksPerFrame: 1,
+                                              emit: { _, _ in }, emitParameter: { _, _, _ in other += 1 })
+        engine.rack.queue(route).render(hostStart: 0, hostValid: false, frames: 512, ticksPerFrame: 1,
+                                        emit: { _, _ in }, emitParameter: { _, _, _ in inst += 1 })
+        #expect(fx.count == 1 && fx.first?.0 == 7 && fx.first?.1 == 100)
+        #expect(other == 0 && inst == 0)
+        engine.stop()
+
+        // Zweiten Effekt entfernen: Platz frei, Ziel nicht mehr auflösbar (kein Ersatz).
+        let oldEpoch = engine.rack.effectQueue(second).occupancyEpoch
+        engine.rack.removeEffect(at: 1, from: channelID)
+        #expect(engine.rack._freeEffectQueueCount == free - 1)
+        #expect(engine.rack.effectQueue(second).occupancyEpoch != oldEpoch)
+        #expect(engine.rack.resolveParameter(td.lane.ccParameter!, in: channelID) == nil)
+        engine.play()
+        #expect(engine._rt1PublishedBundle()?.snapshot.tracks.last?.ccUnresolved == true)
+        engine.stop()
+        // Ziel auf den verbliebenen (ersten) Effekt: löst auf dessen Platz auf.
+        td.lane.ccParameter = ParameterRef(address: 7, name: "Mix", component: Self.fakeEffect.componentKey, effect: 0)
+        #expect(engine.rack.resolveParameter(td.lane.ccParameter!, in: channelID)?.queue == first)
+        engine.rack.removeChannel(channelID)
+        #expect(engine.rack._freeEffectQueueCount == free, "Kanal entfernt: alle Effekt-Plätze frei")
+    }
+
+    /// Format: `effect` wird nur für Effekt-Ziele geschrieben und gelesen.
+    @Test func effectParameterRefRoundTrips() throws {
+        let fx = ParameterRef(address: 3, name: "Mix", component: "a-b-c", effect: 2)
+        #expect(try JSONDecoder().decode(ParameterRef.self, from: JSONEncoder().encode(fx)) == fx)
+        let inst = ParameterRef(address: 3, name: "Cut", component: "a-b-c")
+        #expect(!String(decoding: try JSONEncoder().encode(inst), as: UTF8.self).contains("effect"))
+    }
+
+    /// Ein Parameter-Ereignis erreicht einen echten Effekt (Apple AUDelay, ausgelagert) über
+    /// dessen Render-Observer und Schedule-Block (v1.17.1).
+    @MainActor @Test func parameterEventReachesTheRealEffect() async throws {
+        let rack = InstrumentRack()
+        let id = try #require(rack.addChannel(name: "FX")); rack.setMuted(id, true)
+        let dls = PluginRef(description: AudioComponentDescription(
+            componentType: kAudioUnitType_MusicDevice, componentSubType: kAudioUnitSubType_DLSSynth,
+            componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0),
+            name: "DLSMusicDevice")
+        let delay = PluginRef(description: AudioComponentDescription(
+            componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_Delay,
+            componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0),
+            name: "AUDelay")
+        rack.setInstrument(dls, for: id)
+        rack.addEffect(delay, to: id)
+        let deadline = Date().addingTimeInterval(60)
+        while (rack.instrumentStatus[id] == .loading || rack.effectStatus[id]?.first == .loading), Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        try #require(rack.instrumentStatus[id] == .ready && rack.effectStatus[id]?.first == .ready, "DLS/AUDelay nicht ladbar")
+        guard rack._engineIsRunning else { Issue.record("Audio-Engine läuft nicht"); return }
+        let src = try #require(rack.parameterSources(for: id).first { $0.effectIndex == 0 })
+        let info = try #require(rack.parameters(for: id, source: src).first, "AUDelay meldet keine Parameter")
+        let ref = InstrumentRack.parameterRef(info, of: src)
+        let target = try #require(rack.resolveParameter(ref, in: id))
+        #expect(target.queue >= 0)
+        let unit = try #require(rack._liveEffect(id, at: 0))
+        let param = try #require(unit.auAudioUnit.parameterTree?.parameter(withAddress: info.address))
+        let value = info.min + (info.max - info.min) * 0.25
+        try #require(abs(param.value - value) > 0.001)
+        rack.effectQueue(target.queue).pushParameterFromTick(address: info.address, value: value, at: 0,
+                                                             epoch: target.epoch)
+        var reached = false
+        for _ in 0..<60 where !reached {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            reached = abs(param.value - value) < 0.001
+        }
+        #expect(reached, "Parameter \(info.name) steht auf \(param.value), erwartet \(value)")
     }
 
     /// Wächter (v1.13.11): Entscheidungstabelle.

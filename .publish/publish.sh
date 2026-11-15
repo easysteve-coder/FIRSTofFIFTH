@@ -17,6 +17,7 @@ trap 'rm -rf "$STAGE"' EXIT
 # Paths of the private repo that are published. Everything else stays private.
 INCLUDE=(
   .gitignore
+  LICENSE
   FoF_icon_bold.svg
   Docs/USER_MANUAL.md
   Docs/GUI_DESIGN_SYSTEM.md

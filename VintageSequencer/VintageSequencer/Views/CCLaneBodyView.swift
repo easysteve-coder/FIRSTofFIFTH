@@ -80,7 +80,7 @@ struct CCLaneBodyView: View {
                     Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
 
                     // ── Beat-Linien (lane-neutral, identisch zur Step-Lane) ──
-                    StepBeatLinesView(stepWidthSize: stepWidthState.size)
+                    StepBeatLinesView(stepWidthSize: stepWidthState.size, meter: engine.timeSignature)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .laneScrollShift()
                         .allowsHitTesting(false)

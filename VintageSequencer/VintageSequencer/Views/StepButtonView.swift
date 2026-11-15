@@ -31,10 +31,10 @@ struct StepButtonView: View {
     private var step: Step { track.lane.steps[index] }
 
     private var noteLabel: String {
-        if let fixed = track.lane.fixedNote {          // fester Ton der Spur (v1.13.16)
-            if track.isDrum, let drumName = GMDrumMap.name(for: fixed) { return drumName }
-            var single = Step(); single.notes = [fixed]
-            return single.shortChordName
+        if let fixed = track.lane.fixedNotes {         // fester Ton/Akkord der Spur (v1.13.16/v1.16.2)
+            if track.isDrum, fixed.count == 1, let drumName = GMDrumMap.name(for: fixed[0]) { return drumName }
+            var shown = Step(); shown.notes = fixed
+            return shown.shortChordName
         }
         if track.isDrum,
            let drumName = GMDrumMap.name(for: step.note) { return drumName }
@@ -74,7 +74,7 @@ struct StepButtonView: View {
             // GUI-02: Step-Profil — gleichmäßig beleuchteter, matter Kunststoff statt Standard-Tasterverlauf.
             PlasticKeyBackground(tint: step.isActive ? accentColor : nil, tintStrength: 0.24, cornerRadius: 5,
                                  profile: .step)
-            if track.lane.isPad {
+            if track.lane.isLongStep {
                 // Pad-Steps (v1.13.19): weicher Farbverlauf nach rechts (der Klang hält an)
                 // und eine Kontur in Spurfarbe — auf einen Blick von Step-Spuren zu
                 // unterscheiden.
@@ -239,12 +239,14 @@ extension StepButtonView {
 /// **Bewusst ausgeschlossen:**
 /// - `track`, `index`, `trackIndex` — strukturell stabil innerhalb einer ForEach-Identität;
 ///   Änderungen an Track-Inhalten treiben `@ObservedObject`-Updates, nicht den Parent-Body-Pfad.
-/// - `accentColor`, `size` — ändern sich nicht während Playback oder Zoom.
+/// - `size` — ändert sich nicht während Playback oder Zoom. `accentColor` zählt seit v1.18.25 mit
+///   (Farbwahl muss sofort sichtbar sein; ändert sich nie pro Tick).
 /// - `onToggleSelect` — Closure, nicht Equatable; hat keinen Einfluss auf das Render-Ergebnis.
 extension StepButtonView: Equatable {
     static func == (lhs: StepButtonView, rhs: StepButtonView) -> Bool {
         lhs.isCurrentStep == rhs.isCurrentStep &&
         lhs.isSelected    == rhs.isSelected    &&
-        lhs.width         == rhs.width
+        lhs.width         == rhs.width         &&
+        lhs.accentColor   == rhs.accentColor     // Spurfarbe (v1.18.25): sonst erst beim nächsten Playhead
     }
 }

@@ -11,8 +11,9 @@ import SwiftUI
 /// **Beobachtung.** Das Dock beobachtet nur das `InstrumentRack`. Pegelanzeigen und
 /// Regler im Zug sind Blatt-Views mit eigenem Zustand — sie invalidieren weder Züge noch Lanes.
 struct MixerDock: View {
-    static let minHeight: CGFloat = 340
-    static let maxHeight: CGFloat = 420
+    // + Kanal-EQ-Bild (v1.18.11), damit der Fader nicht kürzer wird.
+    static let minHeight: CGFloat = 340 + 34
+    static let maxHeight: CGFloat = 420 + 34
     static let stripWidth: CGFloat = 72
 
     @EnvironmentObject private var engine: SequencerEngine
@@ -125,6 +126,7 @@ private enum StripRail {
     static let spacing: CGFloat = 4
     static let slotSpacing: CGFloat = 3
     static let slotAreaHeight = MixerSlotRow.height * 5 + slotSpacing * 4
+    static let eqHeight = ChannelEQThumbnail.height
     static let panHeight: CGFloat = 32
     static let levelHeight: CGFloat = 18
     static let faderMin: CGFloat = 80
@@ -155,7 +157,14 @@ private struct ChannelStrip: View {
         VStack(spacing: StripRail.spacing) {
             // ── Plätze: Instrument, vier Inserts in Signalfolge ────────────
             VStack(spacing: StripRail.slotSpacing) {
-                MixerSlotRow(title: Self.title(channel.instrument?.name, instrumentStatus),
+                if channel.audioLoop != nil {
+                    // Audio-Loop-Kanal (v1.15.0): Quelle ist der Loop, keine Instrumentwahl.
+                    MixerSlotRow(title: s.mixerAudioLoopSource, tint: .red, isOn: true,
+                                 canToggle: false, canOpen: false, toggle: {}, open: {},
+                                 choices: [], s: s)
+                } else {
+                MixerSlotRow(title: Self.title(channel.instrument?.name, instrumentStatus)
+                                    + (channel.renderRate.map { " · " + s.kHz($0) } ?? ""),
                              tint: MixerChrome.purple,
                              isOn: instrumentStatus == .ready && channel.instrument?.bypassed == false,
                              canToggle: instrumentStatus == .ready,
@@ -163,6 +172,7 @@ private struct ChannelStrip: View {
                              toggle: { rack.setInstrumentEnabled(channel.instrument?.bypassed ?? false, for: channel.id) },
                              open: { rack.openInstrumentEditor(channel.id) },
                              choices: instrumentChoices, s: s)
+                }
                 ForEach(0..<InstrumentRack.maxEffectsPerChannel, id: \.self) { i in
                     let fx = channel.effects.indices.contains(i) ? channel.effects[i] : nil
                     let status = effectStatus(i)
@@ -177,6 +187,10 @@ private struct ChannelStrip: View {
                 }
             }
             .frame(height: StripRail.slotAreaHeight, alignment: .top)
+
+            // ── Kanal-EQ (v1.18.11) ────────────────────────────────────────
+            ChannelEQThumbnail(rack: rack, channelID: channel.id, eq: channel.eq, s: s)
+                .frame(height: StripRail.eqHeight)
 
             // ── Panorama ───────────────────────────────────────────────────
             MixerPanKnob(pan: Double(channel.pan), setPan: { rack.setPan(channel.id, Float($0)) },
@@ -225,6 +239,21 @@ private struct ChannelStrip: View {
         .overlay(Rectangle().stroke(isHighlighted ? Color.orange : Color.black.opacity(0.35),
                                     lineWidth: isHighlighted ? 2 : 0.5))
         .contextMenu {
+            if channel.audioLoop == nil {
+                // Abtastrate des Instruments (v1.18.9): ein Sampler, der selbst grob umrechnet,
+                // rendert so auf der Rate seiner Samples; die Engine rechnet sauber um.
+                Menu(s.renderRateMenu) {
+                    Button((channel.renderRate == nil ? "✓ " : "   ")
+                           + s.renderRateDevice(rack.outputSampleRate)) { rack.setRenderRate(nil, for: channel.id) }
+                    ForEach(InstrumentChannelData.renderRates, id: \.self) { r in
+                        Button((channel.renderRate == r ? "✓ " : "   ") + s.kHz(r)) { rack.setRenderRate(r, for: channel.id) }
+                    }
+                }
+            }
+            if AppleSampler.isSampler(channel.instrument) {
+                Button(s.samplerLoad) { SamplerPanels.chooseAndLoad(channel: channel.id, rack: rack, s: s) }
+            }
+            Button(s.samplerGrantFolders) { SamplerPanels.grantFolder(suggesting: nil, s: s) }
             Button(s.mixerRename) { isRenaming = true }
             Button(s.mixerDuplicateChannel) { rack.duplicateChannel(channel.id, name: channel.name + " 2") }
                 .disabled(!rack.canAddChannel)
@@ -298,6 +327,10 @@ private struct ChannelStrip: View {
         out.append(.init(id: "empty", title: s.mixerEmpty, selected: current == nil) {
             rack.setInstrument(nil, for: channel.id)
         })
+        // Apple Sampler mit Instrumentdatei (v1.18.16).
+        out.append(.init(id: "apple-sampler-load", title: s.samplerLoad, selected: false) { [rack, channel, s] in
+            SamplerPanels.chooseAndLoad(channel: channel.id, rack: rack, s: s)
+        })
         out += instruments.map { info in
             .init(id: info.id, title: "\(info.manufacturer) · \(info.ref.name)",
                   selected: current.map { info.ref.isSameComponent(as: $0) } ?? false) {
@@ -347,8 +380,7 @@ private struct RoutedTrackColor: View {
     let channelID: UUID
     var body: some View {
         if track.instrumentID == channelID {
-            let palette = VintageTheme.trackColors
-            palette[((track.data.colorIndex % palette.count) + palette.count) % palette.count]
+            VintageTheme.color(for: track.data)
         }
     }
 }
@@ -380,6 +412,7 @@ private struct SumStrip: View {
             }
             .frame(height: StripRail.slotAreaHeight, alignment: .top)
 
+            Color.clear.frame(height: StripRail.eqHeight)     // Höhe des Kanal-EQ der Züge
             Color.clear.frame(height: StripRail.panHeight)
             LevelLabel(position: level.wrappedValue)
 

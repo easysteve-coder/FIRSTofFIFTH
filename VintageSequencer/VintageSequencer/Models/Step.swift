@@ -95,6 +95,25 @@ struct Step: Identifiable, Codable {
         GateStep(value: 16.00, label: "1/1"),    // Ganze        (= 16 Steps = 1 Takt)
     ]
 
+    /// Gate-Stufen für eine Spur, deren Step `stepSixteenths` Sechzehntel lang ist (v1.17.1).
+    /// `gate` bleibt in Steps gespeichert; die Stufen sind echte Notenlängen (1/64 … 8 Takte),
+    /// umgerechnet in Steps — die Beschriftung stimmt so auch bei Pad-Steps (Viertel bis
+    /// 8 Takte) und anderen Steplängen. Obergrenze: ein Takt oder ein Step, was länger ist.
+    /// Bei 1/16-Steps ergibt das genau `gateSteps`.
+    static func gateSteps(stepSixteenths: Double) -> [GateStep] {
+        let u = stepSixteenths > 0 ? stepSixteenths : 1
+        let longest = max(16, u)
+        return [GateStep(value: 0.05, label: "stac")]
+            + gateDurations.filter { $0.sixteenths <= longest + 1e-9 }
+                           .map { GateStep(value: $0.sixteenths / u, label: $0.label) }
+    }
+
+    private static let gateDurations: [(sixteenths: Double, label: String)] = [
+        (0.25, "1/64"), (0.5, "1/32"), (1, "1/16"), (1.5, "1/16."), (2, "1/8"), (3, "1/8."),
+        (4, "1/4"), (6, "1/4."), (8, "1/2"), (12, "1/2."), (16, "1/1"),
+        (32, "2/1"), (48, "3/1"), (64, "4/1"), (128, "8/1"),
+    ]
+
     /// Nächstgelegener Gate-Stufenwert für einen rohen Double-Wert.
     static func snapGate(_ raw: Double) -> Double {
         gateSteps.min(by: { abs($0.value - raw) < abs($1.value - raw) })?.value ?? raw

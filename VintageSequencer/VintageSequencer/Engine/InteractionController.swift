@@ -270,7 +270,9 @@ final class InteractionController: ObservableObject {
     /// Begin a ratio handle drag session.
     ///
     /// Captures `scrollOffsetAtStart` for scroll-compensated geometry (Arch-Slice-7).
-    func beginRatioDrag(track: TrackData, contentUnit: CGFloat, baseRatioIndex: Int) {
+    /// `ratios`: Auswahl der Lane in der Taktart des Projekts (nil = 4/4).
+    func beginRatioDrag(track: TrackData, contentUnit: CGFloat, baseRatioIndex: Int,
+                        ratios: [(num: Int, den: Int)]? = nil) {
         guard _session == nil else { return }
         _session = .ratioDrag(RatioDragSession(
             trackID:             track.id,
@@ -279,10 +281,8 @@ final class InteractionController: ObservableObject {
             baseRatioIndex:      baseRatioIndex,
             contentUnit:         contentUnit,
             scrollOffsetAtStart: viewportController.scrollState.hScrollOffset,
-            ratios:              track.lane.ratioOptions,
-            pxPerRatioStep:      track.lane.isPad
-                                    ? contentUnit / CGFloat(max(1, track.lane.stepCount))
-                                    : nil
+            ratios:              ratios ?? track.lane.ratioOptions(.common),
+            pxPerLongStep:       contentUnit / CGFloat(max(1, track.lane.stepCount))
         ))
         isSessionActive = true
         sessionCursorHint = .resizeHorizontal
@@ -596,9 +596,9 @@ final class InteractionController: ObservableObject {
     /// delta computation. No scroll compensation — vertical drag only.
     ///
     /// Guards modal invariant — silently no-ops if a session is already active.
-    func beginStretchRatioDrag(track: TrackData) {
+    func beginStretchRatioDrag(track: TrackData, ratios: [(num: Int, den: Int)]? = nil) {
         guard _session == nil else { return }
-        let options = track.lane.ratioOptions
+        let options = ratios ?? track.lane.ratioOptions(.common)
         let idx = options.firstIndex(where: {
             $0.num == track.lane.stepLengthNumerator && $0.den == track.lane.stepLengthDenominator
         }) ?? (options.count / 2)

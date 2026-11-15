@@ -42,23 +42,80 @@ final class LaneData: Identifiable {
     /// Step length as a ratio of a 16th note: numerator / denominator.
     var stepLengthNumerator:   Int = 1
     var stepLengthDenominator: Int = 1
-    /// Pad-Lane (v1.13.16): lange Steps (Viertel bis 8 Takte) für Flächen und Drones.
-    /// Steplänge kommt aus `TrackData.padRatios`; im Raster kompakt dargestellt (ein Step
-    /// = eine Standardbreite) statt zeitgetreu. Nur bei `kind == .step` sinnvoll.
-    var isPad: Bool = false
-    /// Fester Ton (v1.13.16): gesetzt spielen alle Steps diese Note statt ihrer eigenen
-    /// (z. B. eine Kick über die ganze Spur). Die Noten der Steps bleiben erhalten.
-    var fixedNote: Int? = nil
+    /// RND-Töne dieser Spur (v1.18.29, vorher je Spurart): nil = Einzeltöne. Optionaler
+    /// Schlüssel `rnd`. Frühere Pad-Spuren laden mit Akkorden.
+    var rndMode: RandomNoteMode? = nil
+    /// Fester Ton (v1.13.16) bzw. fester Akkord (v1.16.2): gesetzt spielen alle Steps diese
+    /// Noten statt ihrer eigenen (z. B. eine Kick oder ein Akkord über die ganze Spur). Die
+    /// Noten der Steps bleiben erhalten. `nil` = aus; sonst nicht leer, sortiert.
+    /// Format: ein Ton als `fixedNote` (Int, wie bisher), mehrere als `fixedNotes` ([Int]).
+    var fixedNotes: [Int]? = nil
 
-    /// Erlaubte Steplängen dieser Lane, aufsteigend.
-    var ratioOptions: [(num: Int, den: Int)] { isPad ? TrackData.padRatios : TrackData.sortedRatios }
-    /// Breite eines Pad-Steps in Normal-Stepbreiten (1…8), je Pad-Lane einstellbar (v1.13.19).
-    var padWidth: Int = 1
-    static let padWidthRange = 1...8
+    /// Länge eines Steps in Sechzehnteln (Gate-Anzeige, v1.17.1).
+    var stepSixteenths: Double {
+        Double(max(1, stepLengthNumerator)) / Double(max(1, stepLengthDenominator))
+    }
+    /// Erlaubte Steplängen jeder Lane, aufsteigend (v1.18.29): die Verhältnisse 1/2…2/1 einer
+    /// Sechzehntel und die musikalischen Längen in der Taktart des Patterns (Schläge, Takte).
+    func ratioOptions(_ meter: TimeSignature) -> [(num: Int, den: Int)] {
+        TrackData.stepRatios(meter)
+    }
+    /// Lange Steps (v1.18.29, vorher nur Pad-Spuren): länger als eine Achtel, ganze Sechzehntel.
+    /// Im Raster in eigener Breite (`stepWidth`) statt zeitgetreu; ein Taktartwechsel rechnet
+    /// sie um (ganze Takte/Schläge bleiben ganze).
+    var isLongStep: Bool { stepGroup || stepSixteenths > 2 }
+    /// Steplänge „Gruppe" (v1.18.30, Konzept §10 L5): Step k dauert Gruppe k mod n der
+    /// Gruppierung des Patterns (7/8 als 3+4: abwechselnd 3/8 und 4/8). Ohne Gruppierung ein
+    /// Takt. `stepLengthNumerator/Denominator` tragen dann die erste Gruppe — so spielen
+    /// ältere Versionen gleich lange Steps dieser Länge. Optionaler Schlüssel `stepGroup`.
+    var stepGroup: Bool = false
+    /// Gruppen dieser Spur in Achteln (v1.18.31, Stephan: „sollten die Gruppierungen nicht je
+    /// Track gelten?"): z. B. 3+4 in 7/8 oder 3+3+2 in 4/4. Die Summe muss keinen Takt ergeben
+    /// (dann läuft die Spur gegen den Takt). nil = Vorgabe aus der Taktart des Patterns.
+    /// Optionaler Schlüssel `groups` („3+4").
+    var groups: [Int]? = nil
+    static let groupRange = 1...64
+    static func isValidGroups(_ g: [Int]) -> Bool {
+        (1...TimeSignature.maxGroups).contains(g.count) && g.allSatisfy { groupRange.contains($0) }
+    }
+    /// Vorgabe aus der Taktart: ihre Gruppierung in Achteln, sonst ein Takt.
+    static func defaultGroups(_ meter: TimeSignature) -> [Int] {
+        if let g = meter.grouping, meter.denominator <= 8 { return g.map { $0 * (8 / meter.denominator) } }
+        return [max(1, meter.sixteenthsPerBar / 2)]
+    }
+    /// Gruppen in Achteln, wie sie gelten.
+    func effectiveGroups(_ meter: TimeSignature) -> [Int] { groups ?? Self.defaultGroups(meter) }
+    /// Gruppen in Sechzehnteln.
+    func groupSixteenths(_ meter: TimeSignature) -> [Int] { effectiveGroups(meter).map { $0 * 2 } }
+    /// Länge von Step `k` in Sechzehnteln in der Taktart `meter`.
+    func sixteenths(ofStep k: Int, meter: TimeSignature) -> Double {
+        guard stepGroup else { return stepSixteenths }
+        let g = groupSixteenths(meter)
+        return Double(g[((k % g.count) + g.count) % g.count])
+    }
 
-    /// Verhältnis für die Rasterbreite: Pad-Lanes in eigener Breite, sonst zeitgetreu.
-    var displayNumerator:   Int { isPad ? padWidth : stepLengthNumerator }
-    var displayDenominator: Int { isPad ? 1 : stepLengthDenominator }
+    /// Ganze Längenangabe einer Spur (Befehl `setLength`, v1.18.31).
+    struct LengthState: Equatable {
+        var num: Int, den: Int, group: Bool, groups: [Int]?
+    }
+    var lengthState: LengthState {
+        get { LengthState(num: stepLengthNumerator, den: stepLengthDenominator, group: stepGroup, groups: groups) }
+        set {
+            stepLengthNumerator = max(1, newValue.num); stepLengthDenominator = max(1, newValue.den)
+            stepGroup = newValue.group; groups = newValue.groups
+        }
+    }
+    /// Breite langer Steps in Normal-Stepbreiten (1…8), 0 = automatisch nach Länge
+    /// (`autoWidth`). Schlüssel `width` (bis v1.18.28 `padWidth`, nur bei Pads).
+    var stepWidth: Int = 0
+    static let stepWidthRange = 0...8
+    /// Automatische Breite: bis zwei Schläge 1, bis ein Takt 4/4 2, länger 3.
+    var autoWidth: Int { stepSixteenths <= 8 ? 1 : stepSixteenths <= 16 ? 2 : 3 }
+    var effectiveStepWidth: Int { stepWidth == 0 ? autoWidth : stepWidth }
+
+    /// Verhältnis für die Rasterbreite: lange Steps in eigener Breite, sonst zeitgetreu.
+    var displayNumerator:   Int { isLongStep ? effectiveStepWidth : stepLengthNumerator }
+    var displayDenominator: Int { isLongStep ? 1 : stepLengthDenominator }
 
     // MARK: - Step-Lane Payload (semantisch nur bei kind == .step)
 
@@ -105,9 +162,13 @@ extension LaneData: Codable {
     enum CodingKeys: String, CodingKey {
         case id, kind, stepCount, direction
         case stepLengthNumerator, stepLengthDenominator
-        case isPad = "pad"
-        case padWidth
-        case fixedNote
+        case legacyPad = "pad"          // bis v1.18.28, nur gelesen
+        case padWidth                   // bis v1.18.28, nur gelesen
+        case stepWidth = "width"
+        case stepGroup
+        case groups
+        case rndMode = "rnd"
+        case fixedNote, fixedNotes
         // step payload
         case steps
         // cc payload
@@ -122,12 +183,17 @@ extension LaneData: Codable {
         try c.encode(direction,                      forKey: .direction)
         try c.encode(stepLengthNumerator,            forKey: .stepLengthNumerator)
         try c.encode(stepLengthDenominator,          forKey: .stepLengthDenominator)
+        if stepWidth != 0 { try c.encode(stepWidth, forKey: .stepWidth) }
+        if stepGroup { try c.encode(true, forKey: .stepGroup) }
+        try c.encodeIfPresent(groups.map(TimeSignature.groupingText), forKey: .groups)
         switch kind {
         case .step:
             try c.encode(Array(steps.prefix(stepCount)), forKey: .steps)
-            if isPad { try c.encode(true, forKey: .isPad) }   // optional, nur wenn gesetzt
-            if isPad && padWidth != 1 { try c.encode(padWidth, forKey: .padWidth) }
-            try c.encodeIfPresent(fixedNote, forKey: .fixedNote)
+            try c.encodeIfPresent(rndMode?.rawValue, forKey: .rndMode)
+            if let f = fixedNotes, !f.isEmpty {
+                if f.count == 1 { try c.encode(f[0], forKey: .fixedNote) }   // lesbar für ältere Versionen
+                else { try c.encode(f, forKey: .fixedNotes) }
+            }
         case .cc:
             try c.encode(Array(ccValues.prefix(stepCount)), forKey: .ccValues)
             try c.encode(ccNumber,  forKey: .ccNumber)
@@ -147,14 +213,23 @@ extension LaneData: Codable {
         self.direction             = try c.decode(PlayDirection.self, forKey: .direction)
         self.stepLengthNumerator   = try c.decode(Int.self, forKey: .stepLengthNumerator)
         self.stepLengthDenominator = try c.decode(Int.self, forKey: .stepLengthDenominator)
+        self.stepGroup = ((try? c.decodeIfPresent(Bool.self, forKey: .stepGroup)) ?? nil) ?? false
+        self.groups = ((try? c.decodeIfPresent(String.self, forKey: .groups)) ?? nil)
+            .flatMap(TimeSignature.parseGrouping).flatMap { Self.isValidGroups($0) ? $0 : nil }
+        // Frühere Pad-Spur (bis v1.18.28): normale Spur mit langen Steps, Breite, Akkorde.
+        let wasPad = (try? c.decodeIfPresent(Bool.self, forKey: .legacyPad)) ?? false
+        self.stepWidth = ((try? c.decodeIfPresent(Int.self, forKey: .stepWidth)) ?? nil)
+            ?? (wasPad ? ((try? c.decodeIfPresent(Int.self, forKey: .padWidth)) ?? nil) ?? 1 : 0)
         switch kind {
         case .step:
             var decoded = try c.decode([Step].self, forKey: .steps)
             while decoded.count < 64 { decoded.append(Step()) }
             self.steps = decoded
-            self.isPad = (try? c.decodeIfPresent(Bool.self, forKey: .isPad)) ?? false
-            self.padWidth = (try? c.decodeIfPresent(Int.self, forKey: .padWidth)) ?? 1
-            self.fixedNote = (try? c.decodeIfPresent(Int.self, forKey: .fixedNote)) ?? nil
+            let rnd = ((try? c.decodeIfPresent(String.self, forKey: .rndMode)) ?? nil).flatMap(RandomNoteMode.init(rawValue:))
+            self.rndMode = rnd ?? (wasPad ? .chords : nil)
+            let chord  = (try? c.decodeIfPresent([Int].self, forKey: .fixedNotes)) ?? nil
+            let single = (try? c.decodeIfPresent(Int.self, forKey: .fixedNote)) ?? nil
+            self.fixedNotes = chord ?? single.map { [$0] }
         case .cc:
             var decoded = try c.decode([Int].self, forKey: .ccValues)
             while decoded.count < 64 { decoded.append(64) }
@@ -171,6 +246,12 @@ extension LaneData: Codable {
 
 extension LaneData {
 
+    /// Noten geklemmt, ohne Doppelte, aufsteigend; leer → nil.
+    static func normalizedNotes(_ notes: [Int]) -> [Int]? {
+        let n = Array(Set(notes.map { max(0, min(127, $0)) })).sorted()
+        return n.isEmpty ? nil : n
+    }
+
     /// Clamps sequence-field values to their valid ranges.
     /// Called after preset decode. Does NOT call `changed.send()` — load path
     /// ends with an explicit `hasUnsavedChanges = false`.
@@ -178,14 +259,12 @@ extension LaneData {
         stepCount             = max(1, min(64, stepCount))
         stepLengthNumerator   = max(1, stepLengthNumerator)
         stepLengthDenominator = max(1, stepLengthDenominator)
-        if kind != .step { isPad = false; fixedNote = nil }
-        fixedNote = fixedNote.map { max(0, min(127, $0)) }
-        padWidth  = max(Self.padWidthRange.lowerBound, min(Self.padWidthRange.upperBound, padWidth))
-        if isPad, !TrackData.padRatios.contains(where: {
-            $0.num == stepLengthNumerator && $0.den == stepLengthDenominator
-        }) {
-            stepLengthNumerator = 16; stepLengthDenominator = 1   // unbekannte Länge → 1 Takt
-        }
+        if kind != .step { rndMode = nil; fixedNotes = nil }
+        fixedNotes = fixedNotes.flatMap { Self.normalizedNotes($0) }
+        stepWidth = max(Self.stepWidthRange.lowerBound, min(Self.stepWidthRange.upperBound, stepWidth))
+        // Lange Steps: höchstens 8 Takte 16/16 (die Auswahl hängt von der Taktart ab,
+        // gespeicherte Längen bleiben gültig).
+        if stepLengthDenominator == 1 { stepLengthNumerator = min(TrackData.maxLongSixteenths, stepLengthNumerator) }
 
         switch kind {
         case .step:
@@ -216,4 +295,13 @@ struct ParameterRef: Codable, Equatable {
     /// Instrument auf dem Kanal löst das Ziel nicht auf — dieselbe Adresse kann dort etwas
     /// anderes bedeuten. nil (Dateien aus v1.13.9 … v1.13.12): an kein Plug-in gebunden.
     var component: String? = nil
+    /// Effekt statt Instrument (v1.17.1): laufende Nummer unter den Effekten mit derselben
+    /// Kennung `component` in der Kette des Kanals (0 = erster). nil = Instrument. Ältere
+    /// Versionen ignorieren den Schlüssel; das Ziel löst dort nicht auf (anderes Plug-in).
+    var effect: Int? = nil
+    /// Effekt-Instanz (v1.17.8, Codex A17-04): eindeutiges Ziel, unabhängig von Reihenfolge.
+    /// Gesetzt, wird nur diese Instanz aufgelöst — entfernt man sie, bleibt das Ziel offen
+    /// (kein Verrutschen auf einen gleichen Effekt). `effect` wird für ältere Versionen
+    /// weiter geschrieben; Ziele ohne Instanz ordnet das Laden einmal über `effect` zu.
+    var effectInstance: UUID? = nil
 }

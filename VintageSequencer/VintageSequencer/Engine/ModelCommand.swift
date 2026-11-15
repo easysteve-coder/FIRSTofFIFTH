@@ -20,6 +20,9 @@ enum ModelCommand {
 
     /// Change the step-length ratio (numerator/denominator) of a track.
     case setRatio(trackID: UUID, oldNum: Int, oldDen: Int, newNum: Int, newDen: Int)
+    /// Ganze Längenangabe (v1.18.31): Zähler/Nenner, „Gruppe" und Gruppen der Spur — für
+    /// „Gruppe" an/aus, Gruppen ändern und eigene Brüche. Ein Undo-Schritt.
+    case setLength(trackID: UUID, old: LaneData.LengthState, new: LaneData.LengthState)
 
     /// Change the notes of a single step (live pitch drag update).
     ///
@@ -78,6 +81,9 @@ enum ModelCommand {
     /// passiert ausschließlich im Theme-Resolver. Lanes haben keine eigene
     /// Farbe, daher gibt es auch kein Lane-Äquivalent zu diesem Kommando.
     case setTrackColorIndex(trackID: UUID, old: Int, new: Int)
+    /// Spurfarbe als Paar Palette/eigene Farbe (v1.18.25): Palettenwahl setzt `custom` nil,
+    /// Farbrad setzt "#RRGGBB". Ein Undo-Schritt.
+    case setTrackColor(trackID: UUID, oldIndex: Int, oldCustom: String?, newIndex: Int, newCustom: String?)
 
     // MARK: - CC-Lane Mutations (CC-Lane Slice 1)
     //
@@ -103,10 +109,13 @@ enum ModelCommand {
     case setCCLaneMuted(trackID: UUID, old: Bool, new: Bool)
 
     /// Fester Ton einer Step-Lane (v1.13.16): alle Steps spielen diese Note (nil = aus).
-    case setFixedNote(trackID: UUID, old: Int?, new: Int?)
+    case setFixedNotes(trackID: UUID, old: [Int]?, new: [Int]?)
 
-    /// Stepbreite einer Pad-Lane in Normalbreiten (v1.13.19).
-    case setPadWidth(trackID: UUID, old: Int, new: Int)
+    /// Breite langer Steps in Normalbreiten, 0 = automatisch (v1.13.19 für Pads, v1.18.29 alle).
+    case setStepWidth(trackID: UUID, old: Int, new: Int)
+
+    /// RND-Töne der Spur (v1.18.29): Einzeltöne/Akkorde/gemischt, nil = Einzeltöne.
+    case setRndMode(trackID: UUID, old: RandomNoteMode?, new: RandomNoteMode?)
 
     // MARK: - Metadata
 
@@ -115,6 +124,7 @@ enum ModelCommand {
         switch self {
         case .setStepCount:                  return "Step Count"
         case .setRatio:                      return "Step Ratio"
+        case .setLength:                     return "Step Ratio"
         case .setPitchNotes:                 return "Pitch Drag"
         case .setSteps(_, _, _, let n):     return n
         case .setName:                       return "Rename Track"
@@ -127,15 +137,16 @@ enum ModelCommand {
         case .setTimingOffset:               return "Feel"
         case .setScaleRoot:                  return "Scale Root"
         case .setScaleIndex:                 return "Scale Mode"
-        case .setTrackColorIndex:            return "Change Track Color"
+        case .setTrackColorIndex, .setTrackColor: return "Change Track Color"
         case .setCCLaneValue:                return "CC Value"
         case .setCCLaneValues(_, _, _, let n): return n
         case .setCCLaneNumber:               return "CC Number"
         case .setCCLaneParameter:            return "CC Target"
         case .setCCLaneLabel:                return "CC Label"
         case .setCCLaneMuted:                return "CC Mute"
-        case .setFixedNote:                  return "Fixed Note"
-        case .setPadWidth:                   return "Pad Width"
+        case .setFixedNotes:                 return "Fixed Notes"
+        case .setStepWidth:                  return "Step Width"
+        case .setRndMode:                    return "RND Notes"
         }
     }
 }

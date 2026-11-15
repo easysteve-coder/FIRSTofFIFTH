@@ -3,8 +3,8 @@ import Combine
 
 // MARK: - Song (v1.14.0)
 //
-// Eine Folge von Szenen über allen Patterns. Szene = Pattern + Länge in Takten (4/4,
-// 96 Pulse je Takt). Wertetyp; Änderungen laufen über `SequencerEngine.setSongUndoable`.
+// Eine Folge von Szenen über allen Patterns. Szene = Pattern + Länge in Takten (Taktart des
+// Projekts, v1.18.12; 4/4 = 96 Pulse je Takt). Wertetyp; Änderungen laufen über `SequencerEngine.setSongUndoable`.
 // Persistiert als optionaler Preset-Schlüssel `song`.
 
 struct SongScene: Codable, Equatable, Identifiable {
@@ -27,6 +27,8 @@ struct Song: Codable, Equatable {
     var loops:   Bool = true
 
     static let maxScenes = 64
+    /// Pulse je 4/4-Takt; die tatsächliche Länge kommt seit v1.18.12 aus der Taktart
+    /// (`TimeSignature.pulsesPerBar`).
     static let pulsesPerBar = 96
 
     /// Spielbar: eingeschaltet und mindestens eine Szene.

@@ -39,8 +39,9 @@ struct CornerDotHandle: NSViewRepresentable {
 // MARK: - HandleNSView
 
 final class HandleNSView: NSView {
-    var dotColor:     NSColor = .white
-    var dotAtTop:     Bool    = false
+    // Neu zeichnen bei Änderung (v1.18.25): sonst blieb nach einer Farbwahl die alte Farbe.
+    var dotColor:     NSColor = .white { didSet { if dotColor != oldValue { needsDisplay = true } } }
+    var dotAtTop:     Bool    = false  { didSet { if dotAtTop != oldValue { needsDisplay = true } } }
     var onStart:      (() -> Void)?
     var onDrag:       ((_ totalTranslationX: CGFloat) -> Void)?
     var onEnd:        (() -> Void)?

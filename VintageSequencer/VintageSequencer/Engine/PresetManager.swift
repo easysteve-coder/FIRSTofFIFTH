@@ -28,6 +28,15 @@ final class PresetManager {
         var masterVolume: Float?
         /// Song (v1.14.0). Optional; fehlt → leerer Song, Song-Modus aus.
         var song: Song?
+        /// Material der Audio-Loop-Kanäle (v1.15.0). Optional.
+        var audioLoops: [AudioLoopFile]?
+        /// Taktart (v1.18.12), z. B. "7/8". Optional; fehlt → 4/4 (nur geschrieben, wenn ≠ 4/4).
+        /// Seit v1.18.24 Vorgabe für Patterns ohne eigenen Schlüssel (ältere Dateien); geschrieben
+        /// wird die Taktart des aktuellen Patterns (für ältere FoF-Versionen).
+        var timeSignature: TimeSignature?
+        /// Patternwechsel ohne Song (v1.18.24, Entscheidung E3): "bar" = nächster Taktstrich,
+        /// "track1" = Ende von Spur 1. Optional; fehlt → "track1" (bisheriges Verhalten).
+        var patternSwitch: String?
     }
 
     // MARK: - Decode Result
@@ -46,11 +55,15 @@ final class PresetManager {
     /// Returns nil on encoding failure; caller is responsible for setting an error message.
     func encode(bpm: Double, swing: Double, patterns: [Pattern],
                 instruments: [InstrumentChannelData] = [], masterVolume: Float = 1,
-                song: Song = Song()) -> Data? {
+                song: Song = Song(), audioLoops: [AudioLoopFile] = [],
+                timeSignature: TimeSignature = .common, switchOnBar: Bool = false) -> Data? {
         try? JSONEncoder().encode(PresetFile(bpm: bpm, swing: swing, patterns: patterns,
                                              instruments: instruments.isEmpty ? nil : instruments,
                                              masterVolume: instruments.isEmpty ? nil : masterVolume,
-                                             song: song == Song() ? nil : song))
+                                             song: song == Song() ? nil : song,
+                                             audioLoops: audioLoops.isEmpty ? nil : audioLoops,
+                                             timeSignature: timeSignature == .common ? nil : timeSignature,
+                                             patternSwitch: switchOnBar ? "bar" : "track1"))
     }
 
     // MARK: - Decode
@@ -140,14 +153,24 @@ final class PresetManager {
 
     /// Shows NSSavePanel and writes data to the chosen location on confirmation.
     /// Returns the saved URL, or nil if the user cancelled. Throws on write failure.
-    func runSavePanel(data: Data, title: String, suggestedName: String) throws -> URL? {
+    func chooseSaveURL(title: String, suggestedName: String) -> URL? {
         let panel = NSSavePanel()
         panel.title                = title
         panel.allowedContentTypes  = [UTType.json]
         panel.nameFieldStringValue = suggestedName
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        try data.write(to: url, options: .atomic)
         return url
+    }
+
+    /// Setzt kodierte Loops in ein ohne Loops kodiertes Preset ein (Hintergrund, v1.16.1).
+    /// Gleicher Schlüssel und gleiche Kodierung wie `encode`; nil bei Fehler.
+    static func merge(_ base: Data, audioLoops: [AudioLoopFile]) -> Data? {
+        guard !audioLoops.isEmpty else { return base }
+        guard var obj = (try? JSONSerialization.jsonObject(with: base)) as? [String: Any],
+              let loops = try? JSONEncoder().encode(audioLoops),
+              let loopsObj = try? JSONSerialization.jsonObject(with: loops) else { return nil }
+        obj["audioLoops"] = loopsObj   // Schlüssel von `PresetFile.audioLoops`
+        return try? JSONSerialization.data(withJSONObject: obj)
     }
 
     /// Shows NSOpenPanel and reads the selected file.

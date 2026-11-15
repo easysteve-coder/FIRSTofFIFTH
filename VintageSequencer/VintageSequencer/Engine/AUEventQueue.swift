@@ -35,25 +35,32 @@ func counterIsNewer(_ a: UInt32, than b: UInt32) -> Bool { Int32(bitPattern: a &
 /// Lock-freier SPSC-Ring fester Größe. Genau ein Produzent, genau ein Konsument.
 /// Kein Heap nach `init`, kein Lock, kein Warten.
 final class AUEventRing {
-    static let capacity = 1024                       // Zweierpotenz
-    private static let mask = capacity - 1
+    /// Standardgröße (Instrument-Warteschlangen). Effekt-Warteschlangen sind kleiner.
+    static let capacity = 1024
+    let capacity: Int                                // Zweierpotenz
+    private let mask: Int
     private let buffer: UnsafeMutablePointer<AUEvent>
     private let head = ManagedAtomic<Int>(0)         // nächster Lese-Index (Konsument)
     private let tail = ManagedAtomic<Int>(0)         // nächster Schreib-Index (Produzent)
 
-    init() {
-        buffer = .allocate(capacity: Self.capacity)
-        buffer.initialize(repeating: .empty, count: Self.capacity)
+    init(capacity: Int = AUEventRing.capacity) {
+        precondition(capacity > 0 && capacity & (capacity - 1) == 0, "Zweierpotenz")
+        self.capacity = capacity
+        mask = capacity - 1
+        buffer = ZeroedMemory.allocate(capacity)        // Nullmuster = `.empty`; Seiten erst bei Nutzung
     }
-    deinit { buffer.deinitialize(count: Self.capacity); buffer.deallocate() }
+    deinit { ZeroedMemory.free(buffer, count: capacity) }
+
+    /// Main, vor der ersten Nutzung: Seiten belegen (siehe `ZeroedMemory`).
+    func prefault() { ZeroedMemory.prefault(buffer, count: capacity) }
 
     /// Produzent. false = Ring voll (Ereignis nicht übernommen).
     @inline(__always)
     func push(_ e: AUEvent) -> Bool {
         let t = tail.load(ordering: .relaxed)
         let h = head.load(ordering: .acquiring)
-        guard t &- h < Self.capacity else { return false }
-        buffer[t & Self.mask] = e
+        guard t &- h < capacity else { return false }
+        buffer[t & mask] = e
         tail.store(t &+ 1, ordering: .releasing)
         return true
     }
@@ -64,7 +71,7 @@ final class AUEventRing {
         let h = head.load(ordering: .relaxed)
         let t = tail.load(ordering: .acquiring)
         guard h != t else { return false }
-        e = buffer[h & Self.mask]
+        e = buffer[h & mask]
         head.store(h &+ 1, ordering: .releasing)
         return true
     }
@@ -113,14 +120,21 @@ final class AUEventRing {
 /// geplant hat; sie wird nicht beim Einreihen nachgestempelt.
 final class AUEventQueue {
 
+    /// Standardgröße der Warteliste (Instrument-Warteschlangen).
     static let pendingCapacity = 512
+    /// Größe dieser Warteliste; zugleich Entnahmegrenze je Block.
+    let pendingCapacity: Int
 
-    private let tickRing = AUEventRing()
-    private let mainRing = AUEventRing()
+    private let tickRing: AUEventRing
+    private let mainRing: AUEventRing
     private let generation = ManagedAtomic<UInt32>(1)
     private let occupancy  = ManagedAtomic<UInt32>(1)
     /// false: kein Instrument geladen — Produzenten verwerfen sofort (kein Ring-Überlauf).
     private let active = ManagedAtomic<Bool>(false)
+    /// Latenzausgleich der Route (v1.15.2, Codex T7): Tick-Ereignisse gehen um die
+    /// deklarierte Latenz von Instrument + Effektkette früher in den Renderweg, damit der
+    /// Kanalausgang auf dem geplanten Zeitpunkt liegt. Host-Ticks; Main schreibt.
+    private let advance = ManagedAtomic<UInt64>(0)
     /// Diagnose: vom vollen Ring abgewiesene Ereignisse; Blöcke, in denen die volle
     /// Warteliste das Leeren der Ringe begrenzt hat.
     let rejected = ManagedAtomic<Int>(0)
@@ -131,23 +145,71 @@ final class AUEventQueue {
     let renderErrors = ManagedAtomic<Int>(0)
     let backlog  = ManagedAtomic<Int>(0)
 
+    /// Drum-Gruppen (v1.18.28): 128 Tasten zu je 8 Bit (`DrumMap`), 8 Tasten je Wort. Main
+    /// schreibt, der Render-Durchlauf liest (relaxed: ein halb geschriebener Satz betrifft nur
+    /// den Block, in dem das Instrument ohnehin gewechselt wird). `drumOn` = Satz vorhanden.
+    private let drumWords: UnsafeMutablePointer<UInt64.AtomicRepresentation>
+    private let drumOn = ManagedAtomic<Bool>(false)
+
     // Nur Audio-Thread:
     private let pending: UnsafeMutablePointer<AUEvent>
     private var pendingCount = 0
 
-    init() {
-        pending = .allocate(capacity: Self.pendingCapacity)
-        pending.initialize(repeating: .empty, count: Self.pendingCapacity)
+    /// Instrumente: Standardgrößen (Noten, Akkorde, Ratchets). Effekte bekommen nur
+    /// Parameterwerte und kleinere Ringe (v1.17.3, Speicher bei 64 Kanälen).
+    init(ringCapacity: Int = AUEventRing.capacity, pendingCapacity: Int = AUEventQueue.pendingCapacity) {
+        tickRing = AUEventRing(capacity: ringCapacity)
+        mainRing = AUEventRing(capacity: ringCapacity)
+        self.pendingCapacity = pendingCapacity
+        pending = ZeroedMemory.allocate(pendingCapacity)
+        drumWords = .allocate(capacity: 16)
+        drumWords.initialize(repeating: .init(0), count: 16)
     }
-    deinit { pending.deinitialize(count: Self.pendingCapacity); pending.deallocate() }
+    deinit {
+        ZeroedMemory.free(pending, count: pendingCapacity)
+        drumWords.deinitialize(count: 16); drumWords.deallocate()
+    }
+
+    private var prefaulted = false
+    /// Main, bevor die Warteschlange aktiv wird (Kanal angelegt, Effekt belegt): Ringe und
+    /// Warteliste real belegen, damit Tick und Render-Observer keine erste Seitenberührung
+    /// treffen. Einmal je Warteschlange.
+    func prefault() {
+        guard !prefaulted else { return }
+        prefaulted = true
+        tickRing.prefault(); mainRing.prefault()
+        ZeroedMemory.prefault(pending, count: pendingCapacity)
+    }
 
     // MARK: Main
 
     var isActive: Bool { active.load(ordering: .acquiring) }
     func setActive(_ on: Bool) { active.store(on, ordering: .releasing) }
 
+    /// Drum-Gruppen des geladenen Instruments setzen oder entfernen (Main, beim Laden/Entfernen).
+    func setDrumMap(_ map: DrumMap?) {
+        drumOn.store(false, ordering: .releasing)
+        guard let map else { return }
+        for w in 0..<16 {
+            var v: UInt64 = 0
+            for j in 0..<8 { v |= UInt64(map.keys[w * 8 + j]) << (8 * UInt64(j)) }
+            UInt64.AtomicRepresentation.atomicStore(v, at: drumWords + w, ordering: .relaxed)
+        }
+        drumOn.store(true, ordering: .releasing)
+    }
+
+    @inline(__always)
+    private func drumEntry(_ key: Int) -> UInt8 {
+        let v = UInt64.AtomicRepresentation.atomicLoad(at: drumWords + (key >> 3), ordering: .relaxed)
+        return UInt8(truncatingIfNeeded: v >> (8 * UInt64(key & 7)))
+    }
+
     /// Verwirft alles bisher Eingereihte (Stop, Panik, Ausschalten).
     func invalidate() { generation.wrappingIncrement(ordering: .acquiringAndReleasing) }
+
+    /// Latenzausgleich der Route in Host-Ticks (Main).
+    func setLatencyAdvance(_ host: UInt64) { advance.store(host, ordering: .relaxed) }
+    var latencyAdvance: UInt64 { advance.load(ordering: .relaxed) }
 
     /// Neue Belegung des Slots (Instrument geladen, getauscht, entfernt). Liefert die
     /// Epoche, die Produzenten für die neue Belegung übergeben.
@@ -166,14 +228,21 @@ final class AUEventQueue {
     @inline(__always) @discardableResult
     func pushFromTick(_ b0: UInt8, _ b1: UInt8, _ b2: UInt8, at hostTime: UInt64,
                       epoch: UInt32? = nil) -> Bool {
-        push(tickRing, AUEvent.pack(b0, b1, b2), hostTime, epoch, address: 0, isParameter: false)
+        push(tickRing, AUEvent.pack(b0, b1, b2), compensated(hostTime), epoch, address: 0, isParameter: false)
+    }
+
+    /// Geplanter Zeitpunkt minus Routenlatenz (nie 0 — 0 heißt „sofort").
+    @inline(__always)
+    private func compensated(_ hostTime: UInt64) -> UInt64 {
+        let a = advance.load(ordering: .relaxed)
+        return hostTime > a ? hostTime - a : 1
     }
 
     /// Parameterwert (bereits im Wertebereich des Parameters) für das Instrument.
     @inline(__always) @discardableResult
     func pushParameterFromTick(address: UInt64, value: Float, at hostTime: UInt64,
                                epoch: UInt32? = nil) -> Bool {
-        push(tickRing, value.bitPattern, hostTime, epoch, address: address, isParameter: true)
+        push(tickRing, value.bitPattern, compensated(hostTime), epoch, address: address, isParameter: true)
     }
 
     @discardableResult
@@ -239,6 +308,7 @@ final class AUEventQueue {
         if counterIsNewer(o2, than: occ) { occ = o2 }
 
         // 2. Fälliges in Ankunftsreihenfolge ausgeben, Rest stabil nach vorn schieben.
+        let drums   = drumOn.load(ordering: .acquiring)
         let span    = Double(max(frames, 1)) * ticksPerFrame
         let hostEnd = hostStart &+ UInt64(span)
         var keep = 0
@@ -251,6 +321,7 @@ final class AUEventQueue {
                     offset = min(max(frames, 1) - 1, Int(Double(p.hostTime - hostStart) / ticksPerFrame))
                 }
                 if p.isParameter { emitParameter(offset, p.address, Float(bitPattern: p.packed)) }
+                else if drums { emitDrum(offset, p.packed, emit) }
                 else { emit(offset, p.packed) }
             } else {
                 pending[keep] = p
@@ -258,6 +329,25 @@ final class AUEventQueue {
             }
         }
         pendingCount = keep
+    }
+
+    /// Drum-Gruppen (v1.18.28): Note-Off an One-Shot-Tasten entfällt; ein Note-On in einer
+    /// Sperrgruppe beendet vorher alle Tasten der Gruppe (auch die eigene) im selben Offset.
+    /// Höchstens 128 Lesezugriffe, keine Allokation.
+    @inline(__always)
+    private func emitDrum(_ offset: Int, _ packed: UInt32, _ emit: (Int, UInt32) -> Void) {
+        let status = UInt8(truncatingIfNeeded: packed), kind = status & 0xF0
+        let key = Int((packed >> 8) & 0x7F), vel = UInt8(truncatingIfNeeded: packed >> 16)
+        let entry = drumEntry(key)
+        if kind == 0x80 || (kind == 0x90 && vel == 0) {
+            if entry & DrumMap.oneShotBit != 0 { return }
+        } else if kind == 0x90, entry & 0x7F != 0 {
+            let group = entry & 0x7F, off = 0x80 | (status & 0x0F)
+            for k in 0..<128 where drumEntry(k) & 0x7F == group {
+                emit(offset, AUEvent.pack(off, UInt8(k), 0))
+            }
+        }
+        emit(offset, packed)
     }
 
     /// Entnimmt einem Ring, solange die Warteliste Platz hat. true = durch volle
@@ -268,7 +358,7 @@ final class AUEventQueue {
         var e = AUEvent.empty
         // Zwei Grenzen: Platz in der Warteliste und Gesamtzahl der Entnahmen je Block —
         // auch verworfene (veraltete) Ereignisse zählen, sonst wäre die Arbeit unbegrenzt.
-        while pendingCount < Self.pendingCapacity, drained < Self.pendingCapacity {
+        while pendingCount < pendingCapacity, drained < pendingCapacity {
             guard ring.pop(into: &e) else { return false }
             drained += 1
             if counterIsNewer(e.generation, than: gen) { gen = e.generation }

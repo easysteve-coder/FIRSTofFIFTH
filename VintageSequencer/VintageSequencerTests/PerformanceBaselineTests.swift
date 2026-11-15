@@ -1,4 +1,5 @@
 import XCTest
+import Atomics
 import Foundation
 import CoreMIDI
 import Darwin
@@ -228,7 +229,7 @@ final class PerformanceBaselineTests: XCTestCase {
     ///
     /// Ergebnis erscheint in Assertion-Message (sichtbar bei Grenzwert-Überschreitung
     /// und als Info auch bei Erfolg via Assertion-Label-Konvention).
-    func testEngineTickJitter_60Seconds() throws {
+    func testEngineTickJitter_60Seconds() async throws {
         let bpm          = 120.0
         let measurementS = 60.0
         let ticksPerSec  = bpm / 60.0 * 24.0   // 48 ticks/s
@@ -240,7 +241,12 @@ final class PerformanceBaselineTests: XCTestCase {
         clock.bpm = bpm
         clock.onTick = { _ in callTimes.append(mach_absolute_time()) }
         clock.start()
-        Thread.sleep(forTimeInterval: measurementS)
+        // Warten durch Suspendieren statt Thread.sleep (v1.16.1, Codex V16-5): ein synchroner
+        // XCTest läuft in einem Main-Queue-Block; 60 s Schlaf (und auch ein verschachtelter
+        // RunLoop, der die Main-Queue dort nicht abarbeitet) blockierten alle parallelen
+        // Tests, die Main brauchen (RT3b-stop(), S01-Publikationen) — Ursache der drei
+        // Volllauf-Fehler. Als async-Test läuft er nicht auf Main.
+        try await Task.sleep(nanoseconds: UInt64(measurementS * 1_000_000_000))
         clock.stop()
 
         guard callTimes.count > 100 else {
@@ -295,7 +301,8 @@ final class PerformanceBaselineTests: XCTestCase {
 
     // MARK: - 4. Playback-Stabilität 30s (8 Tracks, 32 Steps, 120 BPM)
 
-    func testPlaybackStability_30Seconds() throws {
+    @MainActor
+    func testPlaybackStability_30Seconds() async throws {
         let engine = SequencerEngine()
         engine.bpm = 120.0
         while engine.currentPattern.tracks.count < 8 {
@@ -306,11 +313,30 @@ final class PerformanceBaselineTests: XCTestCase {
             for i in stride(from: 0, to: 32, by: 2) { track.lane.steps[i].isActive = true }
         }
 
+        // Unabhängiger Fortschrittszähler (Codex M10): Note-Ons am MIDI-Ausgang, gezählt auf
+        // dem Tick-Thread. Die Anzeige wird separat geprüft; dafür läuft der Main-RunLoop
+        // (früher blockierte Thread.sleep den Main-Thread, die Anzeige konnte nie folgen).
+        let noteOns = ManagedAtomic<Int>(0)
+        engine.midi._testSendObserver = { b0, _, b2, _, _ in
+            if b0 & 0xF0 == 0x90, b2 > 0 { noteOns.wrappingIncrement(ordering: .relaxed) }
+        }
         let memBefore = residentMemoryBytes()
         engine.play()
-        Thread.sleep(forTimeInterval: 30.0)
-        let displayActive = engine.playbackDisplay.steps.contains { $0 > 0 }
+        var displayActive = false
+        let end = Date().addingTimeInterval(30.0)
+        while Date() < end {
+            // Suspendieren gibt Main frei (Display-Drain und parallele Tests), v1.16.1.
+            try await Task.sleep(nanoseconds: 50_000_000)
+            if engine.playbackDisplay.steps.contains(where: { $0 > 0 }) { displayActive = true }
+        }
         engine.stop()
+        engine.midi._testSendObserver = nil
+        // 8 Spuren × 16 aktive von 32 Steps, 1/16 bei 120 BPM = 4 Anschläge/s je Spur.
+        let expected = 8 * 4 * 30
+        let played = noteOns.load(ordering: .relaxed)
+        XCTAssertGreaterThan(played, expected * 9 / 10, "BASELINE_PLAY: Tick-Pfad hat zu wenig gespielt (\(played))")
+        XCTAssertLessThan(played, expected * 11 / 10, "BASELINE_PLAY: zu viele Anschläge (\(played))")
+        XCTAssertTrue(displayActive, "BASELINE_PLAY: Anzeige ist dem Tick-Pfad nicht gefolgt")
         let memAfter = residentMemoryBytes()
         let memDeltaMB = Double(memAfter - memBefore) / 1_048_576.0
 
@@ -323,7 +349,8 @@ final class PerformanceBaselineTests: XCTestCase {
           Tracks:          \(engine.patterns[0].tracks.count)
           Steps/Track:     32
           Laufzeit:        30 s
-          displaySteps:    \(displayActive ? "aktiv (Tick-Pfad bestätigt)" : "INAKTIV – Fehler")
+          Note-Ons:        \(played) (erwartet ≈ \(expected))
+          displaySteps:    \(displayActive ? "aktiv" : "INAKTIV – Fehler")
           RSS-Delta:       +\(String(format: "%.1f", memDeltaMB)) MB  (während Playback)
           isPlaying:       \(engine.isPlaying)  (muss false sein nach stop)
         ╚════════════════════════════════════════════════════════════════╝

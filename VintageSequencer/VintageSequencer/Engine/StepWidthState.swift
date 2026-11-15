@@ -23,14 +23,14 @@ final class StepWidthState: ObservableObject {
     /// Pinch, gespeicherter Wert) einen Wert liefert.
     static let range: ClosedRange<Double> = 30...120
 
-    @Published var size: Double = {
-        let v = UserDefaults.standard.double(forKey: "stepWidthSize")
-        return v >= 30 ? min(v, StepWidthState.range.upperBound) : 57
-    }() {
+    /// Startwert: Mitte des Bereichs (50 % des Schiebers). Seit v1.16.2 wird der zuletzt
+    /// benutzte Wert nicht mehr übernommen — jeder Start beginnt hier.
+    static let startSize: Double = (range.lowerBound + range.upperBound) / 2
+
+    @Published var size: Double = StepWidthState.startSize {
         didSet {
             let clamped = min(max(size, Self.range.lowerBound), Self.range.upperBound)
-            if clamped != size { size = clamped; return }   // didSet läuft für den geklemmten Wert erneut
-            UserDefaults.standard.set(size, forKey: "stepWidthSize")
+            if clamped != size { size = clamped }   // didSet läuft für den geklemmten Wert erneut
         }
     }
 }

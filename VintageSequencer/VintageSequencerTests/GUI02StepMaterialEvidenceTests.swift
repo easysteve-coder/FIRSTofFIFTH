@@ -54,9 +54,9 @@ struct GUI02StepMaterialEvidenceTests {
 
     private func settle(_ host: NSView) async {
         host.layoutSubtreeIfNeeded()
-        try? await Task.sleep(for: .milliseconds(400))
+        try? await Task.sleep(nanoseconds: UInt64(400) * 1_000_000)
         host.layoutSubtreeIfNeeded()
-        try? await Task.sleep(for: .milliseconds(80))
+        try? await Task.sleep(nanoseconds: UInt64(80) * 1_000_000)
         host.layoutSubtreeIfNeeded()
     }
 

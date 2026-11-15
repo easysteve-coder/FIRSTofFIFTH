@@ -109,7 +109,7 @@ struct StepSelectionToolbar: View {
                 .disabled(selectedSteps.isEmpty)
         }
         // Wird die Spur kürzer, fallen nicht mehr vorhandene Steps aus der Auswahl.
-        .onChange(of: track.lane.stepCount) { _, count in
+        .onValueChange(of: track.lane.stepCount) { count in
             let valid = selectedSteps.filter { $0 < count }
             if valid.count != selectedSteps.count { selectedSteps = valid }
         }

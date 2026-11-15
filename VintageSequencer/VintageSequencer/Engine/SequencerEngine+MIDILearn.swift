@@ -71,15 +71,25 @@ extension SequencerEngine {
 
     /// Würfelt die sichtbaren Steps neu. Läuft über ModelWriter; das Undo hält Vor- und
     /// Nachzustand fest (Redo würfelt nicht neu).
+    ///
+    /// Töne nach `RandomNoteMode` (v1.16.2): Einzeltöne zufällig im Bereich C2–C6; Akkorde
+    /// aus derselben Quelle wie Pad-Spuren (Bücher-Folge oder leitereigen, mit Stimmführung);
+    /// gemischt je Step Akkord oder einer seiner Töne. Drum-Spuren würfeln nur Einzeltöne.
     func randomize(track td: TrackData, lockNotes: Bool = false) {
-        if td.lane.isPad { randomizePadChords(track: td); return }
+        let mode = td.isDrum ? .single : (td.lane.rndMode ?? .single)
+        // Lange Steps (v1.18.29, vorher Pad-Spuren): jeder Step klingt, legato, Folge.
+        if td.lane.isLongStep, !td.isDrum { randomizePadChords(track: td, mode: mode); return }
         let lane = td.lane
         let old  = lane.steps
         var steps = old
-        for i in 0..<min(lane.stepCount, steps.count) {
+        let count = min(lane.stepCount, steps.count)
+        let chords = (lockNotes || mode == .single) ? [] : rolledChords(for: td, count: count)
+        let pool = Self.singleNotePool(td)
+        for i in 0..<count {
             steps[i].isActive    = Bool.random()
             if !lockNotes {
-                steps[i].note    = Int.random(in: 36...84)
+                steps[i].notes   = Self.notes(mode: mode, chord: chords.indices.contains(i) ? chords[i] : nil,
+                                              pool: pool)
             }
             steps[i].velocity    = Int.random(in: 60...120)
             steps[i].gate        = Double.random(in: 0.2...0.9)
@@ -92,6 +102,26 @@ extension SequencerEngine {
                                       actionName: s.undoRandomize),
                             to: td, undoManager: undoManager)
     }
+
+    /// Töne eines Steps nach Modus; `chord` ist der gewürfelte Akkord dieses Steps, `pool`
+    /// die erlaubten Einzeltöne.
+    static func notes(mode: RandomNoteMode, chord: [Int]?, pool: [Int] = Array(36...84)) -> [Int] {
+        switch (mode, chord) {
+        case (.chords, let c?) where !c.isEmpty: return c
+        case (.mixed, let c?) where !c.isEmpty:  return Bool.random() ? c : [c.randomElement()!]
+        default:                                 return [pool.randomElement() ?? 60]
+        }
+    }
+
+    /// Einzeltöne für RND: C2–C6, bei eingestellter Skala nur leitereigene Töne (Grundton der
+    /// Spur). Gleich verteilt über die Töne der Leiter — nicht nachträglich quantisiert, das
+    /// würde einzelne Stufen bevorzugen.
+    static func singleNotePool(_ td: TrackData) -> [Int] {
+        let all = Array(36...84)
+        guard td.scaleIndex > 0 else { return all }
+        let inScale = all.filter(td.noteInScale)
+        return inScale.isEmpty ? all : inScale
+    }
 }
 
 // MARK: - Pad-Akkorde
@@ -103,39 +133,67 @@ extension SequencerEngine {
     static let padChordSourceKey = "padChordSource"
     static let padChordFamilyKey = "padChordFamily"
 
-    /// Würfelt Akkorde für eine Pad-Spur: eine Folge aus Lizzio/Callipari oder leitereigen
-    /// (Einstellung im RND-Menü), transponiert auf den Grundton der Spur, mit Stimmführung.
-    /// Ein Undo-Schritt über ModelWriter; Redo würfelt nicht neu.
-    func randomizePadChords(track td: TrackData) {
+    /// Akkordfolge für `count` Steps aus der im RND-Menü gewählten Quelle, transponiert auf
+    /// den Grundton der Spur, mit Stimmführung.
+    func rolledChords(for td: TrackData, count: Int) -> [[Int]] {
         let defaults = UserDefaults.standard
         let source = PadChordSource(rawValue: defaults.string(forKey: Self.padChordSourceKey) ?? "")
             ?? .books
+        var rng = SystemRandomNumberGenerator()
+        return Self.rolledChords(scaleIndex: td.scaleIndex, scaleRoot: td.scaleRoot, count: count,
+                                 source: source,
+                                 fixedFamily: PadChords.family(id: defaults.string(forKey: Self.padChordFamilyKey) ?? ""),
+                                 using: &rng)
+    }
+
+    /// Kern von `rolledChords` (testbar). Bei eingestellter Skala (v1.18.14) liegt jeder Akkord
+    /// ganz in ihr: aus den Büchern nur Folgen, die vollständig passen (die fest gewählte, sonst
+    /// eine passende); passt keine, leitereigen.
+    static func rolledChords<R: RandomNumberGenerator>(scaleIndex: Int, scaleRoot: Int, count: Int,
+                                                       source: PadChordSource,
+                                                       fixedFamily: ChordProgressionFamily?,
+                                                       using rng: inout R) -> [[Int]] {
+        let restrict = scaleIndex > 0 && TrackData.scales.indices.contains(scaleIndex)
+        let scale = restrict ? Set(TrackData.scales[scaleIndex].intervals) : nil
+        var chords: [ChordSymbol] = []
+        if source == .books {
+            var pool = fixedFamily.map { [$0] } ?? PadChords.families
+            if let scale {
+                pool = pool.filter { PadChords.fits($0, scale: scale) }
+                if pool.isEmpty { pool = PadChords.families.filter { PadChords.fits($0, scale: scale) } }
+            }
+            if let family = pool.randomElement(using: &rng) {
+                chords = PadChords.progression(family, count: count, using: &rng)
+            }
+        }
+        if chords.isEmpty {
+            chords = PadChords.freeProgression(scaleIndex: scaleIndex, count: count, restrict: restrict, using: &rng)
+        }
+        return PadChords.voice(chords, tonic: scaleRoot)
+    }
+
+    /// Würfelt Akkorde für eine Pad-Spur: eine Folge aus Lizzio/Callipari oder leitereigen
+    /// (Einstellung im RND-Menü), transponiert auf den Grundton der Spur, mit Stimmführung.
+    /// Ein Undo-Schritt über ModelWriter; Redo würfelt nicht neu.
+    func randomizePadChords(track td: TrackData, mode: RandomNoteMode = .chords) {
         let lane = td.lane
         let count = min(lane.stepCount, lane.steps.count)
-        var rng = SystemRandomNumberGenerator()
-        let chords: [ChordSymbol]
-        switch source {
-        case .books:
-            let fixed = PadChords.family(id: defaults.string(forKey: Self.padChordFamilyKey) ?? "")
-            let family = fixed ?? PadChords.families.randomElement(using: &rng)!
-            chords = PadChords.progression(family, count: count, using: &rng)
-        case .free:
-            chords = PadChords.freeProgression(scaleIndex: td.scaleIndex, count: count, using: &rng)
-        }
-        let voiced = PadChords.voice(chords, tonic: td.scaleRoot)
+        let voiced = rolledChords(for: td, count: count)
         let old = lane.steps
         var steps = old
         for i in 0..<count {
             steps[i].isActive    = true
             steps[i].isHold      = false
             steps[i].isDrone     = false
-            steps[i].notes       = voiced[i]
+            // Einzelton auf Pad-Spuren: ein Ton des Akkords dieses Steps (bleibt in der Folge).
+            steps[i].notes       = mode == .single ? [voiced[i].randomElement() ?? 60]
+                                 : Self.notes(mode: mode, chord: voiced[i])
             steps[i].velocity    = Int.random(in: 80...100)
             steps[i].gate        = 1.0
             steps[i].probability = 1.0
             steps[i].ratchet     = .x1
         }
-        let s = Str(defaults.string(forKey: "appLanguage") ?? "en")
+        let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
         ModelWriter().apply(.setSteps(trackID: td.id, oldSteps: old, newSteps: steps,
                                       actionName: s.undoRandomize),
                             to: td, undoManager: undoManager)

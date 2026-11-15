@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import Atomics
 import AppKit
 @testable import VintageSequencer
 
@@ -475,9 +476,14 @@ struct RT1aModeSwitchTests {
         // RT-3b-Fund (siehe liveSwingRepublishDuringPlayback): stop() muss auf
         // Main laufen, sonst kann es mit Main-seitiger Publish-Aktivität aus dem
         // clockMode-Sink kollidieren — activeTick deckt nur den RT-/MIDI-Reader ab.
+        // Dauer von stop() selbst, gemessen im Main-Block: die Wartezeit, bis Main frei ist,
+        // hängt an parallelen Tests und gehört nicht zur Invariante (v1.16.1, Codex V16-5).
         let stopDone = DispatchSemaphore(value: 0)
+        let stopMs = ManagedAtomic<Int>(-1)
         DispatchQueue.main.async {
+            let s = DispatchTime.now().uptimeNanoseconds
             engine.stop()
+            stopMs.store(Int((DispatchTime.now().uptimeNanoseconds - s) / 1_000_000), ordering: .releasing)
             stopDone.signal()
         }
         stopDone.wait()
@@ -718,6 +724,7 @@ struct RT3aStopQuiescenceTests {
             engine.setClockMode(.external)   // kein interner ClockSource-Thread —
             engine.play()                    // sonst zweiter, konkurrierender Reader.
         }
+        let oldSession = DispatchQueue.main.sync { engine._publishedSession }
 
         let insideSem = DispatchSemaphore(value: 0)
         let resumeSem = DispatchSemaphore(value: 0)
@@ -738,9 +745,14 @@ struct RT3aStopQuiescenceTests {
         #expect(DispatchQueue.main.sync { engine._rt2RuntimeCount() } > 0,
                 "trackRuntimes bleibt populated, während der Tick läuft")
 
+        // Dauer von stop() selbst, gemessen im Main-Block: die Wartezeit, bis Main frei ist,
+        // hängt an parallelen Tests und gehört nicht zur Invariante (v1.16.1, Codex V16-5).
         let stopDone = DispatchSemaphore(value: 0)
+        let stopMs = ManagedAtomic<Int>(-1)
         DispatchQueue.main.async {
+            let s = DispatchTime.now().uptimeNanoseconds
             engine.stop()
+            stopMs.store(Int((DispatchTime.now().uptimeNanoseconds - s) / 1_000_000), ordering: .releasing)
             stopDone.signal()
         }
 
@@ -756,7 +768,7 @@ struct RT3aStopQuiescenceTests {
         resumeSem.signal()          // geparkten Tick freigeben
         tickDone.wait()
 
-        #expect(stopDone.wait(timeout: .now() + 10.0) == .success,
+        #expect(stopDone.wait(timeout: .now() + 120.0) == .success,
                 "stop() muss (spätestens über den Fail-Safe-Pfad) zurückkehren")
 
         // Deferred Cleanup abwarten (Main-seitiger Async-Retry, ~20-ms-Takt).
@@ -767,9 +779,8 @@ struct RT3aStopQuiescenceTests {
         }
         #expect(!DispatchQueue.main.sync(execute: { engine._rt3bCleanupPending }),
                 "Deferred Cleanup muss abschließen")
-        #expect(engine._rt3AtomicRaw == 0)
         #expect(engine._rt3HazardRaw == 0)
-        #expect(DispatchQueue.main.sync { engine._rt2RuntimeCount() } == 0)
+        expectStoppedSessionReleased(engine, oldSession: oldSession)
     }
 
     /// Ohne aktiven Tick darf der Spin-Wait keine spürbaren Fixkosten einführen
@@ -778,12 +789,13 @@ struct RT3aStopQuiescenceTests {
         let engine = SequencerEngine()
         engine.setClockMode(.external)
         engine.play()
+        let oldSession = engine._publishedSession
 
         let start = DispatchTime.now()
         engine.stop()
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
         #expect(elapsedMs < 50, "stop() ohne aktiven Tick sollte praktisch sofort zurückkehren, war \(elapsedMs) ms")
-        #expect(engine._rt3AtomicRaw == 0)
+        expectStoppedSessionReleased(engine, oldSession: oldSession)
     }
 }
 
@@ -815,6 +827,7 @@ struct RT3bDeferredCleanupTests {
             engine.setClockMode(.external)
             engine.play()
         }
+        let oldSession = DispatchQueue.main.sync { engine._publishedSession }
 
         let insideSem = DispatchSemaphore(value: 0)
         let resumeSem = DispatchSemaphore(value: 0)
@@ -830,24 +843,20 @@ struct RT3bDeferredCleanupTests {
         }
         insideSem.wait()   // Tick geparkt — bleibt es, bis resumeSem signalisiert.
 
-        let stopStart = DispatchTime.now()
+        // Dauer von stop() selbst, gemessen im Main-Block: die Wartezeit, bis Main frei ist,
+        // hängt an parallelen Tests und gehört nicht zur Invariante (v1.16.1, Codex V16-5).
         let stopDone  = DispatchSemaphore(value: 0)
+        let stopMs = ManagedAtomic<Int>(-1)
         DispatchQueue.main.async {
+            let s = DispatchTime.now().uptimeNanoseconds
             engine.stop()
+            stopMs.store(Int((DispatchTime.now().uptimeNanoseconds - s) / 1_000_000), ordering: .releasing)
             stopDone.signal()
         }
-
-        // stop() muss zurückkehren, statt unbegrenzt zu blocken — bewiesen über
-        // einen großzügigen, aber endlichen Timeout (10 s). Kein enges Zeitfenster
-        // um die 150-ms-Backstop-Marke: unter vollem Suite-Lauf (viele parallele
-        // Testbundles) verzögert Scheduler-/Main-Queue-Kontention das Timing
-        // erheblich, ohne dass die eigentliche Invariante (kein unbegrenztes
-        // Blocken) verletzt wird — dieselbe Toleranz-Philosophie wie
-        // liveSwingRepublishDuringPlayback.
-        #expect(stopDone.wait(timeout: .now() + 10.0) == .success,
+        #expect(stopDone.wait(timeout: .now() + 120.0) == .success,
                 "stop() muss über den Sync-Spin-Backstop hinaus zurückkehren, nicht unbegrenzt blocken")
-        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - stopStart.uptimeNanoseconds) / 1_000_000
-        #expect(elapsedMs < 10_000, "stop() darf nicht unbegrenzt blocken, war \(elapsedMs) ms")
+        let elapsedMs = stopMs.load(ordering: .acquiring)
+        #expect(elapsedMs >= 0 && elapsedMs < 2_000, "stop() selbst begrenzt (Sync-Spin 150 ms), war \(elapsedMs) ms")
 
         // RT-3b-Kerninvariante: State bleibt intakt, obwohl stop() schon zurück ist.
         #expect(DispatchQueue.main.sync { engine._rt3bCleanupPending }, "Cleanup muss als ausstehend markiert sein")
@@ -866,9 +875,8 @@ struct RT3bDeferredCleanupTests {
         }
         #expect(!DispatchQueue.main.sync(execute: { engine._rt3bCleanupPending }),
                 "Deferred Cleanup muss abschließen, sobald der Tick fertig ist")
-        #expect(engine._rt3AtomicRaw == 0)
         #expect(engine._rt3HazardRaw == 0)
-        #expect(DispatchQueue.main.sync { engine._rt2RuntimeCount() } == 0)
+        expectStoppedSessionReleased(engine, oldSession: oldSession)
     }
 
     /// play() darf keine neue Session starten, solange ein Deferred Cleanup aus
@@ -895,12 +903,19 @@ struct RT3bDeferredCleanupTests {
         }
         insideSem.wait()
 
+        // Dauer von stop() selbst, gemessen im Main-Block: die Wartezeit, bis Main frei ist,
+        // hängt an parallelen Tests und gehört nicht zur Invariante (v1.16.1, Codex V16-5).
         let stopDone = DispatchSemaphore(value: 0)
+        let stopMs = ManagedAtomic<Int>(-1)
         DispatchQueue.main.async {
+            let s = DispatchTime.now().uptimeNanoseconds
             engine.stop()
+            stopMs.store(Int((DispatchTime.now().uptimeNanoseconds - s) / 1_000_000), ordering: .releasing)
             stopDone.signal()
         }
-        #expect(stopDone.wait(timeout: .now() + 10.0) == .success)
+        #expect(stopDone.wait(timeout: .now() + 120.0) == .success)
+        let stopTook = stopMs.load(ordering: .acquiring)
+        #expect(stopTook < 2_000, "stop() selbst begrenzt")
         #expect(DispatchQueue.main.sync { engine._rt3bCleanupPending },
                 "Cleanup muss ausstehen, während der Tick noch geparkt ist")
 
@@ -934,10 +949,10 @@ struct RT3bDeferredCleanupTests {
 // Timestamps in der Vergangenheit liegen, dann
 //   1. schreitet advanceSteps() für JEDEN dieser Ticks fort — die interne
 //      Step-/Note-Fortschreibung driftet nie, unabhängig von clampToFuture.
-//   2. wird der zugehörige ausgehende 0xF8-Puls verworfen statt gebursted
-//      (clampCountClock++, kein midi.sendClock) — ein kurzer Aussetzer beim
-//      Empfängergerät ist unauffälliger als ein hörbares Burst-"Einhaken"
-//      seines Arp-/LFO-/Delay-Takts.
+//   2. wird der zugehörige ausgehende 0xF8-Puls seit v1.15.2 (Codex T2) um
+//      dieselbe Verschiebung wie Noten/Taktanker später gesendet, nicht mehr
+//      verworfen (clampCountClock++ zählt ihn) — ein pulszählender Empfänger
+//      verlöre sonst seine Taktposition.
 // Getestet ohne ClockSource (deterministisch, clockTick(at:) direkt
 // getrieben) — identisches Setup-Muster wie RT1aModeSwitchTests.
 struct RT4ResyncStrategyTests {
@@ -973,17 +988,19 @@ struct RT4ResyncStrategyTests {
                 "Geclampter Catch-up-Burst muss denselben internen Step-Fortschritt liefern wie ein Future-Tick-Burst — kein Drift")
     }
 
-    /// Jeder geclampte Tick wird als verworfener 0xF8-Puls gezählt (nicht
-    /// gesendet, nicht nachgeholt); normale, nicht geclampte Ticks dürfen den
-    /// Zähler nicht erhöhen.
-    @Test func catchUpBurstDropsClampedOutgoingClockPulses() {
+    /// v1.15.2 (Codex T2): ein verspäteter Tick sendet sein 0xF8 verschoben (dieselbe
+    /// Verschiebung wie Noten und Taktanker), statt es zu verwerfen — die Pulszahl beim
+    /// Empfänger bleibt richtig. Gezählt wird jeder verschobene Puls; normale Ticks nicht.
+    @Test func catchUpBurstShiftsClampedOutgoingClockPulses() {
         let engine = SequencerEngine()
         engine._rt1SetupRuntimesForTest()
 
         let before = engine._rt4ClampCountClock
+        let sentBefore = engine._s01ClockSendCount
         for _ in 0..<24 { engine.clockTick(at: pastTick) }
         #expect(engine._rt4ClampCountClock - before == 24,
-                "Jeder geclampte Catch-up-Tick muss als verworfener 0xF8-Puls gezählt werden")
+                "Jeder verspätete Tick muss als verschobener 0xF8-Puls gezählt werden")
+        #expect(engine._s01ClockSendCount - sentBefore == 24, "kein Puls verworfen")
 
         let afterBurst = engine._rt4ClampCountClock
         for _ in 0..<24 { engine.clockTick(at: futureTick) }
@@ -1220,5 +1237,20 @@ struct DispatchSourceTimerRegressionTests {
             _ = engine.isPlaying   // ARC-Anker
         }
         // Alle 3 Engines korrekt freigegeben = kein Crash.
+    }
+}
+
+/// Nach abgeschlossenem Stop-Aufräumen (RT-3): die Box der beendeten Sitzung ist weg. Im
+/// EXT-Modus ist danach die nächste Sitzung vorbereitet (v1.15.2, Start auf dem MIDI-Thread)
+/// — dann liegt eine neue Box einer anderen Sitzung aus, nie die alte.
+func expectStoppedSessionReleased(_ engine: SequencerEngine, oldSession: UInt32?) {
+    let armed = DispatchQueue.main.sync { engine._extArmed }
+    let session = DispatchQueue.main.sync { engine._publishedSession }
+    if armed {
+        #expect(engine._rt3AtomicRaw != 0, "vorbereitete Sitzung publiziert")
+        #expect(session != nil && session != oldSession, "neue Sitzung, nicht die gestoppte")
+    } else {
+        #expect(engine._rt3AtomicRaw == 0)
+        #expect(DispatchQueue.main.sync { engine._rt2RuntimeCount() } == 0)
     }
 }

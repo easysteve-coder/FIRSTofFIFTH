@@ -271,34 +271,42 @@ struct S01SnapshotAcquireTests {
     /// Main publiziert einen Burst. Die gehaltene Box lebt; ihr deinit läuft erst nach
     /// Schutzende und auf dem Publisher-Thread (Main) — nie auf dem Reader/RT-Thread.
     @Test func deinitRunsOnPublisherNotOnReader() {
-        let engine = onMain { () -> SequencerEngine in
-            let e = makeEngine()
-            e._rt3SetWeakProbeToCurrent()
-            return e
-        }
+        let engine = onMain { makeEngine() }
         let t = Tally()
         let deinitOnMain = ManagedAtomic<Int>(0)
         let deinitOffMain = ManagedAtomic<Int>(0)
+        let inside = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        let done = DispatchSemaphore(value: 0)
+        // Begrenzt, aber länger als jede Main-Wartezeit im parallelen Volllauf: gibt der Reader
+        // vorher von selbst frei, wäre die Freigabe korrekt und der Test sinnlos (v1.16.1).
+        let parked = ManagedAtomic<Bool>(true)
+        engine._rt3aPausePoint = {
+            inside.signal()
+            if resume.wait(timeout: .now() + 120) == .timedOut { parked.store(false, ordering: .releasing) }
+        }
+        defer { resume.signal(); engine._rt3aPausePoint = nil; engine._s01AcquireHook = nil }   // Reader in jedem Fall freigeben
+
+        // Eigener Thread statt globaler Queue (v1.16.2): im parallelen Volllauf können wartende
+        // Tests den GCD-Pool belegen; der Reader startete dann nicht innerhalb der Frist.
+        Thread {                                    // Reader/„RT“-Thread
+            engine._rt3DriveOneTick(at: machFuture())
+            done.signal()
+        }.start()
+        guard inside.wait(timeout: .now() + 10) == .success else {
+            Issue.record("Reader erreichte den Pausenpunkt nicht"); resume.signal(); _ = done.wait(timeout: .now() + 10); return
+        }                                          // Reader hält die Box (Hazard validiert)
+        // Sonde auf genau die Box, die der Reader hält — nicht auf die beim Aufbau aktuelle:
+        // ein nachgereichtes Publish von Main kann jene vor dem Erwerb ablösen (v1.16.1).
         onMain {
-            engine._s01SetDeinitProbeOnCurrent {
+            engine._s01ProbeHeldBox {
                 if Thread.isMainThread { deinitOnMain.wrappingIncrement(ordering: .relaxed) }
                 else { deinitOffMain.wrappingIncrement(ordering: .relaxed) }
                 t.bump("deinit")
             }
         }
-        let inside = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
-        let done = DispatchSemaphore(value: 0)
-        engine._rt3aPausePoint = { inside.signal(); _ = resume.wait(timeout: .now() + 20) }   // begrenzt: nie ewig geparkt
-        defer { resume.signal(); engine._rt3aPausePoint = nil; engine._s01AcquireHook = nil }   // Reader in jedem Fall freigeben
-
-        DispatchQueue.global().async {            // Reader/„RT“-Thread
-            engine._rt3DriveOneTick(at: machFuture())
-            done.signal()
-        }
-        guard inside.wait(timeout: .now() + 10) == .success else {
-            Issue.record("Reader erreichte den Pausenpunkt nicht"); resume.signal(); _ = done.wait(timeout: .now() + 10); return
-        }                                          // Reader hält die Box (Hazard validiert)
         onMain { for _ in 0..<40 { engine.publishSnapshot() } }
+        let stillParked = parked.load(ordering: .acquiring)
+        #expect(stillParked, "Reader war während der Publikationen geparkt")
         #expect(t.get("deinit") == 0, "benutzte Box nicht freigegeben, solange der Reader sie hält")
         #expect(onMain { engine._rt3WeakProbeAlive })
 
@@ -320,6 +328,7 @@ struct S01SnapshotAcquireTests {
             e.play()
             return e
         }
+        let oldSession = onMain { engine._publishedSession }
         let stop = ManagedAtomic<Bool>(false)
         let readerDone = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
@@ -337,7 +346,7 @@ struct S01SnapshotAcquireTests {
         #expect(readerDone.wait(timeout: .now() + 20) == .success, "Reader beendet")
         #expect(engine._rt3HazardRaw == 0, "Reader hat den Hazard am Ende geräumt")
         onMain { engine.stop() }
-        #expect(engine._rt3AtomicRaw == 0)
+        expectStoppedSessionReleased(engine, oldSession: oldSession)
     }
 }
 

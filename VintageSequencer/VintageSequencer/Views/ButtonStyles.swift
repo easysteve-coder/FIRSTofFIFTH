@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - Small vintage button (used throughout)
 
@@ -91,4 +92,47 @@ struct FullAreaButtonStyle: ButtonStyle {
 extension ButtonStyle where Self == FullAreaButtonStyle {
     /// Schlichte Taste, deren ganze Fläche klickbar ist.
     static var fullArea: FullAreaButtonStyle { FullAreaButtonStyle() }
+}
+
+// MARK: - Menütaste mit voller Klickfläche
+
+/// Taste, die beim Klick ein AppKit-Menü öffnet (v1.16.2). Ersetzt SwiftUI-`Menu` mit
+/// `.borderlessButton`: das nimmt Klicks nur auf der Fläche seines Titels an, auch mit
+/// größerem Label. Das Menü wird erst beim Klick gebaut und ist damit immer aktuell.
+struct MenuKey<Label: View>: View {
+    let menu: () -> NSMenu
+    @ViewBuilder let label: () -> Label
+
+    var body: some View {
+        Button { menu().popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) } label: {
+            label().contentShape(Rectangle())
+        }
+        .buttonStyle(.fullArea)
+    }
+}
+
+extension NSMenu {
+    /// Menü aus fertigen Einträgen; Einträge schalten sich nicht selbst aus.
+    static func of(_ items: [NSMenuItem]) -> NSMenu {
+        let m = NSMenu()
+        m.autoenablesItems = false
+        items.forEach(m.addItem)
+        return m
+    }
+}
+
+extension NSMenuItem {
+    /// Nicht wählbarer Eintrag (Überschrift oder Hinweis).
+    static func note(_ title: String) -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        i.isEnabled = false
+        return i
+    }
+
+    func with(image symbol: String? = nil, enabled: Bool = true, toolTip: String? = nil) -> NSMenuItem {
+        if let symbol { image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+        isEnabled = enabled
+        if let toolTip { self.toolTip = toolTip }
+        return self
+    }
 }

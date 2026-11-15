@@ -42,9 +42,13 @@ struct StretchHandleView: View {
     @State private var showCountPopover: Bool = false
 
     private var currentRatioIndex: Int {
-        track.lane.ratioOptions.firstIndex(where: {
-            $0.num == track.lane.stepLengthNumerator && $0.den == track.lane.stepLengthDenominator
-        }) ?? (track.lane.ratioOptions.count / 2)
+        // Nächstliegender Wert (v1.18.31: eigene Brüche stehen nicht in der Liste).
+        let options = track.lane.ratioOptions(engine.timeSignature)
+        let v = track.lane.stepSixteenths
+        return options.indices.min(by: {
+            abs(Double(options[$0].num) / Double(options[$0].den) - v)
+                < abs(Double(options[$1].num) / Double(options[$1].den) - v)
+        }) ?? 0
     }
 
     private func gcd(_ a: Int, _ b: Int) -> Int { b == 0 ? a : gcd(b, a % b) }
@@ -117,13 +121,11 @@ struct StretchHandleView: View {
             Button(action: { showRatioPopover = true }) {
                 // Immer als Zahl (1/1 gedämpft) — ein namenloser Griff verriet nicht,
                 // was hier einstellbar ist.
-                Text(track.lane.isPad
-                     ? TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
-                                            den: track.lane.stepLengthDenominator)
-                     : "\(reducedRatio.num)/\(reducedRatio.den)")
+                // Notenwert als Bruch der ganzen Note (v1.18.31; vorher Verhältnis zur 16tel).
+                Text(s.laneLength(track.lane, meter: engine.timeSignature))
                     .font(.system(size: isRatioDragging ? 11 : 10, weight: .medium, design: .monospaced))
                     .foregroundColor(accentColor)
-                    .opacity(isRatioDragging || isStretched || track.lane.isPad ? 1.0 : 0.45)
+                    .opacity(isRatioDragging || isStretched || track.lane.isLongStep ? 1.0 : 0.6)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -139,7 +141,8 @@ struct StretchHandleView: View {
                     .onChanged { value in
                         if !isRatioDragging {
                             isRatioDragging = true
-                            interactionController.beginStretchRatioDrag(track: track.data)
+                            interactionController.beginStretchRatioDrag(track: track.data,
+                                                                        ratios: track.lane.ratioOptions(engine.timeSignature))
                         }
                         interactionController.updateStretchRatioDrag(
                             totalY: value.translation.height,
@@ -218,7 +221,7 @@ private struct StepCountPopover: View {
         .background(VintageTheme.panelDark)
         .preferredColorScheme(.dark)
         .onAppear { text = "\(track.lane.stepCount)"; fieldFocused = true }
-        .onChange(of: track.lane.stepCount) { _, n in text = "\(n)" }
+        .onValueChange(of: track.lane.stepCount) { n in text = "\(n)" }
     }
 }
 
@@ -241,90 +244,175 @@ private struct StepLengthPopover: View {
         return (n / g, d / g)
     }
 
-    // Schnellwahl-Verhältnisse; Namen und Erklärungen kommen aus Str (EN/DE).
-    private static let ratioPairs: [(num: Int, den: Int)] = [
-        (1, 2), (4, 7), (2, 3), (3, 4), (4, 5), (8, 9), (1, 1),
-        (9, 8), (5, 4), (4, 3), (3, 2), (7, 4), (2, 1),
-    ]
-    private var ratioOptions: [(label: String, num: Int, den: Int, tooltip: String)] {
-        if track.lane.isPad {
-            return TrackData.padRatios.map { p in
-                (TrackData.ratioLabel(num: p.num, den: p.den), p.num, p.den, s.padLengthHelp)
+    @State private var groupsText = ""
+    @State private var groupsInvalid = false
+    @State private var fractionText = ""
+    @State private var fractionInvalid = false
+
+    private var meter: TimeSignature { engine.timeSignature }
+
+    private func setLength(_ new: LaneData.LengthState) {
+        writer.apply(.setLength(trackID: track.id, old: track.lane.lengthState, new: new),
+                     to: track.data, undoManager: engine.undoManager)
+    }
+    private func setRatio(_ r: (num: Int, den: Int)) {
+        setLength(.init(num: r.num, den: r.den, group: false, groups: track.lane.groups))
+    }
+    private func isCurrent(_ r: (num: Int, den: Int)) -> Bool {
+        !track.lane.stepGroup
+            && track.lane.stepLengthNumerator * r.den == r.num * track.lane.stepLengthDenominator
+    }
+
+    /// Eine Zeile Notenwerte (v1.18.31): Bezeichnung links, Brüche als Tasten.
+    private func row(_ label: String, _ items: [(title: String, r: (num: Int, den: Int), help: String)]) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(label)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundColor(VintageTheme.textSecondary)
+                .frame(width: 66, alignment: .leading)
+            ForEach(items.indices, id: \.self) { k in
+                let it = items[k]
+                Button(it.title) { setRatio(it.r) }
+                    .buttonStyle(VintageSmallButtonStyle(isActive: isCurrent(it.r), accent: accentColor))
+                    .help(it.help)
             }
-        }
-        return Self.ratioPairs.map { p in
-            let o = s.ratioOption(num: p.num, den: p.den)
-            return (o.label, p.num, p.den, o.tooltip)
+            Spacer(minLength: 0)
         }
     }
 
+    private func commitGroups() {
+        guard let g = TimeSignature.parseGrouping(groupsText), LaneData.isValidGroups(g) else { groupsInvalid = true; return }
+        groupsInvalid = false
+        setLength(.init(num: g[0] * 2, den: 1, group: true, groups: g))
+    }
+    private func commitFraction() {
+        guard let r = TrackData.parseFraction(fractionText) else { fractionInvalid = true; return }
+        fractionInvalid = false
+        setRatio(r)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             Text(s.ratioHeader)
                 .font(VintageTheme.monoBold)
                 .foregroundColor(VintageTheme.textAmber)
 
-            // Fraction display (Pad-Lane: Länge in Takten/Notenwerten)
-            let r = reducedRatio
-            if track.lane.isPad {
-                Text(TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
-                                          den: track.lane.stepLengthDenominator))
-                    .font(.system(size: 30, weight: .bold, design: .monospaced))
-                    .foregroundColor(accentColor)
-                    .frame(maxWidth: .infinity)
-            } else {
-            VStack(spacing: 3) {
-                Text("\(r.num)")
-                    .font(.system(size: 22, weight: .semibold, design: .monospaced))
-                    .foregroundColor(accentColor)
-                Rectangle()
-                    .fill(accentColor)
-                    .frame(height: 2)
-                    .padding(.horizontal, 20)
-                Text("\(r.den)")
-                    .font(.system(size: 30, weight: .bold, design: .monospaced))
-                    .foregroundColor(accentColor)
-            }
-            .frame(maxWidth: .infinity)
-            }
+            // Länge als Notenwert (v1.18.31: Bruch der ganzen Note, Takte, „Gruppe 3+4").
+            Text(s.laneLength(track.lane, meter: meter))
+                .font(.system(size: track.lane.stepGroup ? 22 : 30, weight: .bold, design: .monospaced))
+                .foregroundColor(accentColor)
+                .frame(maxWidth: .infinity)
 
-            Text(s.ratioQuickSelect)
-                .font(VintageTheme.monoSmall)
-                .foregroundColor(VintageTheme.textSecondary)
+            // Was der Wert bedeutet (v1.18.21): Notenwert, Dauer, Spurlänge beim aktuellen Tempo.
+            TrackTimingInfo(track: track, accentColor: accentColor)
 
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())],
-                      alignment: .leading, spacing: 4) {
-                ForEach(ratioOptions, id: \.label) { opt in
-                    let isCurrent = track.lane.stepLengthNumerator == opt.num
-                                 && track.lane.stepLengthDenominator == opt.den
-                    Button(opt.label) {
-                        writer.apply(.setRatio(trackID: track.id,
-                                               oldNum: track.lane.stepLengthNumerator,
-                                               oldDen: track.lane.stepLengthDenominator,
-                                               newNum: opt.num,
-                                               newDen: opt.den),
-                                     to: track.data, undoManager: engine.undoManager)
-                    }
-                    .buttonStyle(VintageSmallButtonStyle(isActive: isCurrent, accent: accentColor))
-                    .help(opt.tooltip)
+            ForEach(TrackData.noteRows.indices, id: \.self) { k in
+                let r = TrackData.noteRows[k]
+                row(s.noteRowLabel(r.row), r.values.map { v in
+                    ("\(v.p)/\(v.q)", TrackData.ratio(whole: v.p, v.q), s.noteValueHelp(p: v.p, q: v.q))
+                })
+            }
+            // Takte als Zahl — die Zeile sagt schon „TAKTE".
+            row(s.barsRowLabel, TrackData.barRatios(meter).map { r in
+                ("\(r.num / max(1, meter.sixteenthsPerBar))", r, s.padLengthHelp)
+            })
+
+            // Gruppe je Spur (v1.18.31): Steps reihum so lang wie die Gruppen (in Achteln).
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(s.groupRowLabel)
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundColor(VintageTheme.textSecondary)
+                    .frame(width: 66, alignment: .leading)
+                Button(s.stepGroupLabel) {
+                    let g = track.lane.effectiveGroups(meter)
+                    setLength(.init(num: g[0] * 2, den: 1, group: true, groups: track.lane.groups ?? g))
                 }
+                .buttonStyle(VintageSmallButtonStyle(isActive: track.lane.stepGroup, accent: accentColor))
+                .help(s.stepGroupHelp)
+                TextField("3+4", text: $groupsText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(width: 80)
+                    .onSubmit(commitGroups)
+                    .help(s.groupsFieldHelp)
+                Spacer(minLength: 0)
+            }
+            Text(groupsInvalid ? s.groupsInvalid :
+                 s.groupsFit(track.lane.effectiveGroups(meter), meter: meter))
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundColor(groupsInvalid ? .red : VintageTheme.textSecondary)
+                .padding(.leading, 70)
+
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(s.customFractionLabel)
+                    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                    .foregroundColor(VintageTheme.textSecondary)
+                    .frame(width: 66, alignment: .leading)
+                TextField("5/16", text: $fractionText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(width: 80)
+                    .onSubmit(commitFraction)
+                    .help(s.customFractionHelp)
+                if fractionInvalid {
+                    Text(s.customFractionInvalid).font(.system(size: 8, design: .monospaced)).foregroundColor(.red)
+                }
+                Spacer(minLength: 0)
             }
 
-            Button(s.ratioReset) {
-                let base = track.lane.isPad ? (num: 16, den: 1) : (num: 1, den: 1)
-                writer.apply(.setRatio(trackID: track.id,
-                                       oldNum: track.lane.stepLengthNumerator,
-                                       oldDen: track.lane.stepLengthDenominator,
-                                       newNum: base.num,
-                                       newDen: base.den),
-                             to: track.data, undoManager: engine.undoManager)
-            }
-            .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: .gray))
-            .frame(maxWidth: .infinity, alignment: .trailing)
+            Button(s.ratioReset) { setRatio((1, 1)) }
+                .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: .gray))
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(14)
-        .frame(width: 260)
+        .frame(width: 330)
         .background(VintageTheme.panelDark)
         .preferredColorScheme(.dark)
+        .onAppear {
+            groupsText = TimeSignature.groupingText(track.lane.effectiveGroups(meter))
+            let f = TrackData.wholeFraction(num: track.lane.stepLengthNumerator, den: track.lane.stepLengthDenominator)
+            fractionText = "\(f.p)/\(f.q)"
+        }
+    }
+}
+
+/// Notenwert, Step-Dauer und Spurlänge beim aktuellen Tempo (v1.18.21). Beobachtet das Tempo
+/// selbst — nur im Popover sichtbar, nicht in der Lane.
+private struct TrackTimingInfo: View {
+    @ObservedObject var track: TrackViewModel
+    var accentColor: Color
+    @EnvironmentObject private var engine: SequencerEngine
+    @EnvironmentObject private var ts: TransportState
+    @AppStorage("appLanguage") private var lang: String = "en"
+    private var s: Str { Str(lang) }
+
+    var body: some View {
+        let n = track.lane.stepLengthNumerator, d = track.lane.stepLengthDenominator
+        let meter = ts.timeSignature
+        let step = TimingInfo.stepSeconds(num: n, den: d, bpm: ts.bpm)
+        let v = TimingInfo.noteValue(num: n, den: d)
+        let named = s.laneLength(track.lane, meter: meter)
+        let span = TimingInfo.spanSixteenths(steps: track.lane.stepCount, num: n, den: d)
+        VStack(alignment: .leading, spacing: 3) {
+            row(s.infoNoteValue, (named == "\(v.num)/\(v.den)" ? named : "\(named) · \(v.num)/\(v.den)")
+                + " · \(s.seconds(step))")
+            row(s.infoTrackLength, "\(s.stepsCount(track.lane.stepCount)) = \(s.span(span, meter: meter)) · "
+                + s.seconds(step * Double(track.lane.stepCount)))
+            Text(s.infoAtTempo + String(format: " (%.1f BPM, %@)", ts.bpm, meter.label))
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundColor(VintageTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 4).fill(Color.black.opacity(0.25)))
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(label).font(.system(size: 8, design: .monospaced)).foregroundColor(VintageTheme.textSecondary)
+            Text(value).font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundColor(accentColor)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }

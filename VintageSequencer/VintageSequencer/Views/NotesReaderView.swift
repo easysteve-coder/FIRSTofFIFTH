@@ -138,10 +138,10 @@ struct NotesReaderView: View {
                 TextEditor(text: $editText)
                     .font(VintageTheme.monoMedium)
                     .foregroundColor(VintageTheme.textPrimary)
-                    .scrollContentBackground(.hidden)
+                    .hiddenScrollBackground()
                     .background(VintageTheme.background)
                     .padding(10)
-                    .onChange(of: editText) { _, _ in isDirty = true }
+                    .onValueChange(of: editText) { _ in isDirty = true }
 
                 Rectangle().fill(VintageTheme.panelBorder).frame(height: 1)
 

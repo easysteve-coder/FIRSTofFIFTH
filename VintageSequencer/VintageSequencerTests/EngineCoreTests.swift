@@ -67,6 +67,7 @@ private let tickGap: UInt64 = 20_000_000
     /// dass Step 1 des alten Patterns noch einmal erklingt.
     @Test func queuedPatternStartsExactlyOnBoundaryWithoutMainHop() {
         let engine = SequencerEngine()
+        engine.replaceSwitchOnBar(false)   // prüft den Wechsel am Ende von Spur 1 (seit v1.18.24 wählbar)
         engine.patterns[0].tracks[0].lane.stepCount = 2
         arm(engine, pattern: 0, note: 60)
         arm(engine, pattern: 1, note: 72)
@@ -217,7 +218,7 @@ private let tickGap: UInt64 = 20_000_000
         engine.setClockMode(.external)
         engine.hasUnsavedChanges = false
         for _ in 0..<60 {                                   // > 2 Beats à 24 Pulse
-            engine.midi.onClockPulse?()
+            engine.midi.onClockPulse?(mach_absolute_time())
             try? await Task.sleep(nanoseconds: 4_000_000)
         }
         try? await Task.sleep(nanoseconds: 100_000_000)     // main.async der Schätzung abwarten

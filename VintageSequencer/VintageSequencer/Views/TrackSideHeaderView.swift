@@ -22,7 +22,6 @@ struct TrackSideHeaderView: View {
     var onRandomize:  (() -> Void)?
     var onClear:      (() -> Void)?
     var onDelete:     (() -> Void)?
-    var onDuplicate:  (() -> Void)?
     var headerContextMenu: () -> AnyView
 
     var body: some View {
@@ -35,8 +34,7 @@ struct TrackSideHeaderView: View {
                             accentColor: accentColor,
                             onRandomize: onRandomize,
                             onClear:     onClear,
-                            onDelete:    onDelete,
-                            onDuplicate: onDuplicate)
+                            onDelete:    onDelete)
                 .frame(height: stepRowHeight)
                 // Ganze Kopffläche trifft — auch zwischen den Tasten öffnet der
                 // Rechtsklick das Spurmenü (v1.13.17).
@@ -48,8 +46,7 @@ struct TrackSideHeaderView: View {
                 track:       track,
                 accentColor: accentColor,
                 drawMode:    $ccLaneDrawMode,
-                onDelete:    onDelete,
-                onDuplicate: onDuplicate
+                onDelete:    onDelete
             )
             .contentShape(Rectangle())
             .contextMenu { headerContextMenu() }

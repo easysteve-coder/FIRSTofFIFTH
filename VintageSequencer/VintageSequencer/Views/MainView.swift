@@ -19,9 +19,12 @@ struct MainView: View {
     private let writer = ModelWriter()
     @State private var scrollMonitor: Any?
     @State private var titlebarOverlap: CGFloat = 0
+    /// Ziehen von Spuren (v1.17.10). Als @State gehalten, NICHT beobachtet: nur die Blätter
+    /// (`TrackDragOffset`, Ziehgriff) lesen es — MainView baut beim Ziehen nicht neu.
+    @State private var trackDrag = TrackDragState()
 
-    private func addTrack(kind: LaneKind, pad: Bool = false) {
-        engine.addTrackUndoable(kind: kind, pad: pad, actionName: s.undoAddTrack)
+    private func addTrack(kind: LaneKind) {
+        engine.addTrackUndoable(kind: kind, actionName: s.undoAddTrack)
     }
 
     var body: some View {
@@ -44,7 +47,6 @@ struct MainView: View {
                         ) { idx, td in
                             TrackRowView(
                                 track:       engine.viewModel(for: td),
-                                accentColor: VintageTheme.color(forTrack: td.colorIndex),
                                 trackIndex:  idx,
                                 onRandomize: { engine.randomize(track: td) },
                                 onClear: {
@@ -61,25 +63,24 @@ struct MainView: View {
                                 },
                                 onDelete: engine.currentPattern.tracks.count > 1
                                     ? { engine.removeTrackUndoable(at: idx, actionName: s.undoDeleteTrack) }
-                                    : nil,
-                                onDuplicate: {
-                                    engine.duplicateTrackUndoable(at: idx, actionName: s.undoDuplicateTrack)
-                                }
+                                    : nil
                             )
+                            .trackDragOffset(td.id)
                         }
 
                         // Add track menu — Step oder CC, kein hartes Limit.
-                        Menu {
-                            Button { addTrack(kind: .step) } label: {
-                                Label(s.addStepTrack, systemImage: "square.grid.3x2")
-                            }
-                            Button { addTrack(kind: .cc) } label: {
-                                Label(s.addCCTrack, systemImage: "dial.min")
-                            }
-                            Button { addTrack(kind: .step, pad: true) } label: {
-                                Label(s.addPadTrack, systemImage: "rectangle.split.3x1")
-                            }
-                        } label: {
+                        MenuKey(menu: {
+                            .of([
+                                ClosureMenuItem(title: s.addStepTrack, checked: false) { addTrack(kind: .step) }
+                                    .with(image: "square.grid.3x2"),
+                                ClosureMenuItem(title: s.addCCTrack, checked: false) { addTrack(kind: .cc) }
+                                    .with(image: "dial.min"),
+                                ClosureMenuItem(title: s.addAudioLoopTrack, checked: false) {
+                                    engine.addAudioLoopTrackUndoable(actionName: s.undoAddTrack)
+                                }
+                                .with(image: "waveform.circle", enabled: engine.rack.canAddChannel),
+                            ])
+                        }) {
                             HStack(spacing: 6) {
                                 Image(systemName: "plus.circle")
                                 AddTrackLabel()
@@ -93,11 +94,12 @@ struct MainView: View {
                             .overlay(RoundedRectangle(cornerRadius: 7)
                                 .stroke(VintageTheme.panelBorder.opacity(0.6), lineWidth: 1))
                         }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden)
                         .fixedSize()
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .coordinateSpace(name: TrackDragState.space)
+                    .onPreferenceChange(TrackRowFramesKey.self) { trackDrag.frames = $0 }
+                    .environmentObject(trackDrag)
                     .padding(12)
                 }
                 .background(VintageTheme.background)
@@ -124,7 +126,7 @@ struct MainView: View {
         .onPreferenceChange(LaneViewportKey.self) { viewportController.reportLaneViewport($0) }
         .onPreferenceChange(LaneShapesKey.self)   { viewportController.reportLaneShapes($0) }
         // Wirksame WIDTH des Controllers == committeter Zustand (außer innerhalb des Pinch-Handlers, der sie vorab setzt).
-        .onChange(of: stepWidthState.size, initial: true) { _, w in viewportController.setStepWidth(w) }
+        .onValueChange(of: stepWidthState.size, initial: true) { w in viewportController.setStepWidth(w) }
         // Liegt der Inhalt unter der Titelleiste des Fensters, rückt er um das gemessene Maß
         // nach unten (v1.13.10). Gemessen, nicht angenommen: je nach System legt das Fenster
         // den Inhalt unter die Titelleiste oder darunter.
@@ -149,7 +151,7 @@ struct MainView: View {
 #endif
         // Die Engine registriert Struktur-, Paste- und Learn-Undo selbst und leert den
         // Stack bei Load/New — dafür braucht sie den Undo-Manager des Fensters.
-        .onChange(of: undoManager, initial: true) { _, um in engine.undoManager = um }
+        .onValueChange(of: undoManager, initial: true) { um in engine.undoManager = um }
         .onAppear {
             // NSEvent-Monitor: zwei-Finger-Trackpad-Wischen → viewportController
             // Arch-Slice-6: replaces direct scrollState.hScrollOffset write.

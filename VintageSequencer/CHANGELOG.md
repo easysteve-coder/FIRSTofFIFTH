@@ -5,6 +5,998 @@ Format: [Semantische Versionierung](https://semver.org/lang/de/)
 
 ---
 
+## [1.18.32] — 2026-11-15
+
+- **Wiederanlauf nach Absturz eines Plug-in-Prozesses** (Stephan: „ja mach", nach dem
+  Shortcircuit-XT-Test).
+  - Alle Plug-ins, die FoF außerhalb des eigenen Prozesses lädt, laufen in einem gemeinsamen
+    AU-Host-Prozess. Stürzt einer ab, waren bisher alle übrigen Kanäle dieses Prozesses still
+    (Fehler in jedem Block), bis man das Preset neu lud.
+  - Gemessen mit Shortcircuit XT 0.9.316: Entfernen des Instruments nach geöffnetem Editor bringt
+    den Host-Prozess zum Absturz (Fehler in SCXT/clap-wrapper, ohne FoF reproduziert). Ein
+    unbeteiligter DLSMusicDevice-Kanal blieb danach still.
+  - Jetzt lädt FoF jeden betroffenen Platz (Instrument oder Effekt) neu, sobald macOS die
+    Instanz als beendet meldet. Er bekommt den zuletzt geladenen bzw. gespeicherten Klangzustand.
+    Den Zustand der toten Instanz kann niemand mehr lesen; vorher ging er beim Speichern ebenso
+    verloren. Gemessen: Absturz 14:07:07,9, Meldung 14:07:10,4, Kanal klingt um 14:07:10,8 wieder.
+  - Stürzt derselbe Platz innerhalb von 10 s nach einem Neustart erneut ab, gibt FoF auf (Anzeige
+    „Name !"), damit ein Plug-in, das beim Laden abstürzt, keine Schleife erzeugt.
+  - Diagnose: `invalidated` nennt den Platz, neues Ereignis `pluginRecovery`.
+- Tests `PluginRecoveryTests` (Instrument neu und Aufgeben, Effekt am selben Platz, alle Kanäle
+  eines Prozesses).
+- Presetformat unverändert.
+
+## [1.18.31] — 2026-11-15
+
+- **Gruppen je Spur** (Stephan: „sollten die Gruppierungen nicht je Track gelten?"; Vorschlag
+  mit „ja" angenommen).
+  - Längen-Popover, Zeile **Gruppe**: eigene Aufteilung der Spur in Achteln, z. B. 3+4 in 7/8
+    oder 3+3+2 (Tresillo) in 4/4. Leer = Gruppierung der Taktart des Patterns (ohne Gruppierung
+    ein Takt). Die Summe ist frei; FoF zeigt „passt in einen Takt", „passt in n Takte" oder
+    „läuft gegen den Takt". 1–8 Gruppen, je 1–64 Achtel.
+  - Die Gruppierung der Taktart (v1.18.30) bleibt Vorgabe und Raster; Spuren mit eigenen
+    Gruppen behalten sie beim Taktartwechsel.
+- **Steplängen als Notenwerte** (Stephan: „Die Step-Längen in Quick-Select sind für Normalos
+  nicht intuitiv, da müssen wir mit brüchen arbeiten").
+  - Popover in Zeilen: **gerade** 1/32…1/1, **punktiert** 3/32…3/4, **Triole** 1/24…1/3,
+    **Quintole** 1/20…1/5, **Septole** 1/28…1/7, **Takte** 1/2/3/4/8, **Gruppe**, **eigener
+    Wert** als Bruch einer ganzen Note (z. B. 5/16, 2/3; mindestens ein Puls, höchstens 8 Takte).
+  - Anfasser, Spurangabe und Step-Beschriftung zeigen den Notenwert (1/16, 1/8., 1/12) statt
+    des Verhältnisses zur Sechzehntel. Die Infozeile nennt Notenwert und Dauer in ms.
+  - Taste „Zurück 1/16". Längenwahl, Gruppe und Gruppen sind ein Undo-Schritt
+    (`ModelCommand.setLength`).
+- **Presetformat (additiv):** je Spur optional `groups` („3+3+2"). Ungültig → Vorgabe der
+  Taktart. Ältere FoF-Versionen spielen eigene Gruppen als gleich lange Steps der ersten Gruppe.
+  Die Steplänge bleibt als Zähler/Nenner einer Sechzehntel gespeichert.
+- Tests: `GroupingTests.groupsPerTrack`, Taktartwechsel mit eigenen Gruppen, Notenwerte in
+  `PadLaneTests`.
+
+## [1.18.30] — 2026-11-15
+
+- **Gruppierung ungerader Takte** (Stephan: „bei 7/8 müsste man das aufteilen können 3+4 oder
+  4+3 etc..." und „dann muss man halt noch 5+2 4+3 etc wählen können"; Konzept §10 L5/L6).
+  - Taktart-Menü in der Positionsanzeige: unter den Taktarten **Gruppierung** mit „Keine",
+    den gängigen Aufteilungen (7/8: 2+5, 3+4, 4+3, 5+2, 2+2+3, 2+3+2, 3+2+2 …) und
+    „Eigene …" zum Eintippen (z. B. 5+2; 2–8 Gruppen, Summe = Zähler). Anzeige „7/8 (3+4)".
+    Gilt je Pattern wie die Taktart; während der Wiedergabe vorgemerkt (E2).
+  - Raster: Linien an den Gruppengrenzen statt je Schlag.
+  - Neue Steplänge **Gruppe** (Popover, unter den langen Steps): Step 1 dauert die erste Gruppe,
+    Step 2 die zweite … reihum (3+4: 3/8, 4/8, 3/8 …), zwei Steps füllen einen Takt. Jeder Step
+    zeigt seine Länge. Ohne Gruppierung dauert ein Step einen Takt.
+  - Tick: Länge je Step für Weiterschalten, Überschusskorrektur, Gate, Swing, Ratchets; Halten
+    verlängert um die Länge der gehaltenen Steps, Drone um den ganzen Durchlauf. Alle anderen
+    Längen unverändert (ein Wert je Spur).
+  - **Presetformat (additiv):** je Pattern `grouping` („3+4"), je Spur `stepGroup`.
+    `timeSignature` bleibt „7/8". Ältere FoF-Versionen spielen „Gruppe" als gleich lange Steps
+    der ersten Gruppe.
+- Tests `GroupingTests` (Modell, Format, Undo, Anschläge 0/36/84/120 bei 3+4, Halten).
+
+## [1.18.29] — 2026-11-15
+
+- **Lange Steps für jede Spur, keine eigenen Pad-Spuren mehr** (Stephan: „die steps einer
+  normalen spur müssen länger eingestellt werden können, dann brauchts auch keine pad-spuren";
+  Konzept §10 L1–L4, „ja, umsetzen").
+  - Längen-Popover jeder Spur: die Verhältnisse wie bisher und darunter **Lange Steps** in der
+    Taktart des Patterns (1–3 Schläge, 1/2/3/4/8 Takte). Der untere Anfasser zieht kurze Längen
+    zeitgetreu wie bisher und geht danach in Stufen (eine Stepbreite je Stufe) bis 8 Takte.
+  - Lange Steps stehen in eigener Breite: automatisch nach Länge (bis zwei Schläge 1, ein Takt 2,
+    länger 3) oder fest 1–8 über die Taste ↔ im Spurkopf.
+  - RND auf langen Steps würfelt wie früher die Pads (jeder Step klingt, legato, Akkordfolge);
+    Einzeltöne/Akkorde/gemischt jetzt je Spur (▾ neben RND, mit Undo) statt je Spurart.
+  - Taktartwechsel rechnet die langen Steps jeder Spur um (bisher nur Pads).
+  - „Pad-Spur hinzufügen" entfällt in beiden Menüs. Vorhandene Pad-Spuren laden als normale
+    Spuren mit ihrer Länge, Breite und Akkord-RND und klingen gleich.
+  - **Presetformat (additiv):** optionale Spurschlüssel `width` (Breite, fehlt = automatisch) und
+    `rnd` (`chords`/`mixed`, fehlt = Einzeltöne). `pad`/`padWidth` werden gelesen, nicht mehr
+    geschrieben — ältere FoF-Versionen zeigen frühere Pads dann als normale Spuren mit langen,
+    zeitgetreu breiten Steps (Klang gleich).
+- Tests `PadLaneTests` neu gefasst (Lesen alter Pads, Längen, Breite, Ziehen, RND).
+
+## [1.18.28] — 2026-11-15
+
+- **Drum-Gruppen für EXS-Kits im Apple Sampler** (Stephan: „bei den exs- Dateien fehlt die
+  "Interaktion" zwischen HH closed/ped und open"). Ursache: der Import des AUSampler verwirft
+  die Exclusive-Gruppe der EXS-Gruppen und One-Shot der Zonen; das offene Becken klang mit dem
+  Ausklang seiner Hüllkurve weiter (Jazz Brush Kit: 0,89 s), auch nach Closed/Pedal.
+  - FoF liest beides beim Laden selbst aus der EXS-Datei. Eine Note in einer Sperrgruppe beendet
+    alle klingenden Noten der Gruppe (Closed/Pedal schneiden Open ab, wiederholtes Open
+    schneidet sich selbst), samplegenau im selben Renderblock.
+  - One-Shot-Tasten spielen ihr Sample aus; Note-Offs vom Gate erreichen sie nicht mehr (wie im
+    EXS). „Alle Noten aus" wirkt weiter.
+  - Layer in Sperrgruppen bekommen 10 ms Ausklang, damit das Abschneiden hörbar ist.
+  - Wirkt für neu geladene EXS-Kits. Bereits geladene Kits einmal neu laden.
+  - Mehrere EXS-Kits kurz nacheinander laden stürzt nicht mehr ab: die Umwandlungen laufen
+    nacheinander (zwei gleichzeitige brachen in CoreAudio ab).
+  - **Presetformat (additiv):** optionaler Instrumentschlüssel `drumMap` (128 Werte). Ältere
+    FoF-Versionen ignorieren ihn.
+- Tests `DrumMapTests` (EXS lesen, Hüllkurve, Warteschlange, Format, echtes Kit, Hörtest im Rack).
+
+## [1.18.27] — 2026-11-15
+
+- **Audio-Loop-Spur: Wellenform überhöht, Eingangspegel sichtbar** (Stephan: „die
+  Wellenform-Anzeige der Audiospur sollte überhöht dargestellt werden und der eingangspegel
+  sollte angezeigt werden").
+  - Wellenform auf die lauteste Stelle normiert (höchstens +36 dB) und mit Quadratwurzel
+    gezeichnet: leise Aufnahmen füllen die Höhe, leise Anteile werden sichtbar. Nur Anzeige,
+    das Material bleibt unverändert.
+  - Eingangspegel als Balken oben rechts in der Loop-Fläche: −60…0 dBFS, grün/gelb ab −12/rot ab
+    −1 dB, Abfall 24 dB/s, Spitzenhalter 1,5 s mit Zahlenwert. Ersetzt die kleine LED im Kopf
+    (dort ist jetzt wieder Platz für Eingang/MON/GATE). Aktiv, solange der Kanal den Eingang
+    braucht (Mithören, scharf, Aufnahme), sonst gedimmt.
+- Tests `AudioLoopDisplayScaleTests`.
+
+## [1.18.26] — 2026-11-15
+
+- **Pad-Spur in ungeraden Taktarten** (Stephan: „Die Pad Spur zählt hier immer 8/8, beim ersten
+  Durchgang hatte ich allerdings den Eindruck, dass es passt"). Ursache: eine neu angelegte
+  Pad-Spur bekam fest 16 Sechzehntel (einen 4/4-Takt), ebenso „Zurücksetzen" im
+  Längen-Popover. Bestehende Pads wurden beim Taktartwechsel richtig umgerechnet — daher passte
+  es beim ersten Durchgang. Jetzt ist ein neuer Pad (und das Zurücksetzen) einen Takt in der
+  Taktart seines Patterns lang (7/8 → 7 Achtel).
+- Test `TimeSignatureTests.newPadTrackIsOneBarOfItsPattern`.
+
+## [1.18.25] — 2026-11-15
+
+- **Spurfarbe repariert, 16 Farben und Farbrad** (Stephan: „Track: Farbe auswählen geht nicht. da
+  wollte ich auch mehr farben + Farbrad haben.").
+  - Ursache 1: die Farbe wurde gesetzt, aber `MainView` löste sie auf und reichte sie als festen
+    Parameter weiter — bei einer reinen Spuränderung zeichnet `MainView` nicht neu. Jetzt löst
+    `TrackRowView` (beobachtet das TrackViewModel) sie selbst auf; ebenso der Mixer.
+  - Ursache 2: macOS färbt Menüsymbole als Vorlage ein — alle Farbkreise sahen gleich aus.
+    Jetzt farbige Nicht-Vorlagen-Bilder mit Markierung der gewählten Farbe.
+  - Palette von 8 auf 16 Farben (die ersten acht unverändert, alte Presets behalten ihre Farbe).
+  - „Farbrad …" öffnet das System-Farbfenster (Rad); jede abgeschlossene Wahl ein Undo-Schritt.
+  - Befehl `ModelCommand.setTrackColor` (Palette/eigene Farbe als Paar, ein Undo-Schritt).
+  - **Presetformat (additiv):** optionaler Spurschlüssel `color` ("#RRGGBB"); fehlt oder
+    unlesbar → Palette. Ältere FoF-Versionen ignorieren ihn (zeigen die Palettenfarbe).
+- **Anfasser an der Lane getauscht** (Stephan: „Die anfasser sind falsch rum: der obere muss die
+  Step-Anzahl, der untere die Step-Length beeinflussen, das entspricht dann auch der angabe am
+  rechten rand der lane"). Oben weißer Punkt = Step-Anzahl (neben „16"), unten Spurfarbe =
+  Step-Länge (neben „1/1").
+- **Farbwechsel sofort an aktiven Steps und am Anfasser:** `StepButtonView` vergleicht im
+  `Equatable` jetzt auch die Spurfarbe (vorher wurde ein aktiver Step erst beim nächsten Aufleuchten
+  neu gezeichnet); `CornerDotHandle` setzt bei Farb-/Lagewechsel `needsDisplay`.
+- Tests `TrackColorTests`.
+
+## [1.18.24] — 2026-11-15
+
+- **Taktart je Pattern** (Stephan: „Ich möchte die Taktart pro Pattern auswählen können."; Konzept
+  Taktart und Zeit, Paket 3, Entscheidungen E1–E3 „wie empfohlen").
+  - Jedes Pattern hat seine Taktart (`Pattern.timeSignature`). Die Taste in der Positionsanzeige
+    stellt die des aktuellen Patterns; Raster, Pad-Längen und Anzeige folgen dem aktuellen
+    Pattern. Pad-Längen werden nur im betroffenen Pattern umgerechnet (mit Undo).
+  - **Während der Wiedergabe** wird eine Änderung am laufenden Pattern vorgemerkt („4/4 ▸ 7/8")
+    und gilt, sobald dieses Pattern nicht mehr läuft — beim Wechsel oder beim Stop (E2). So
+    passen Taktraster und Pad-Längen eines laufenden Abschnitts immer zusammen (Codex KT-02).
+  - **Song:** eine Szene zählt ihre Takte in der Taktart ihres Patterns (`SongPlanner` je Pattern).
+  - **Tick:** jeder Patternwechsel öffnet einen Abschnitt in der Taktart des neuen Patterns; ein
+    Wechsel mitten im Takt (Ende Spur 1) beginnt einen neuen Takt, der alte ist verkürzt.
+    Plug-ins, Taktanker und Loops folgen ab dort (Grundlage v1.18.23).
+  - **Patternwechsel ohne Song** (E3): Menü an „PATTERN" — am nächsten Taktstrich (▸|, Vorgabe
+    neuer Projekte) oder am Ende von Spur 1 (▸1, bisheriges Verhalten; Dateien ohne Schlüssel).
+  - **Presetformat (additiv):** je Pattern `timeSignature` (immer geschrieben), oben
+    `patternSwitch` ("bar"/"track1"). Ältere Dateien: Patterns ohne Schlüssel übernehmen einmalig
+    die Projekttaktart der Datei (E1), ohne `patternSwitch` gilt „Ende Spur 1" — sie spielen wie
+    bisher. Der Projektschlüssel `timeSignature` trägt die Taktart des aktuellen Patterns (für
+    ältere FoF-Versionen). Ältere FoF-Versionen ignorieren die neuen Schlüssel.
+  - Noch offen (Paket 4): Vorberechnung der Loop-Dehnung je Taktart (bis dahin dehnt der
+    Echtzeitweg in Patterns anderer Taktart), Abschnittsgrenze innerhalb eines Audio-Blocks
+    samplegenau, laufende Aufnahme über einen Taktartwechsel.
+- Tests: Wechsel auf Puls 30 nach 7/8 → nächster Takt auf Puls 114 (Codex-Prüffall), Wechsel am
+  nächsten Taktstrich, Song 4/4 → 7/8 (2 Takte) mit Szenenlängen je Taktart, Vormerkung während
+  der Wiedergabe mit Übernahme beim Stop und Undo, Preset neu/alt.
+
+## [1.18.23] — 2026-11-15
+
+- **Abschnittsschema für Taktart je Pattern** (Konzept Taktart und Zeit, Paket 2; Codex KT-01,
+  KT-03, KT-04). Ohne Verhaltensänderung, alle Timing-Tests unverändert grün.
+  - **Tick:** führt einen musikalischen Abschnitt (Taktart, Ursprungspuls, absoluter Takt am
+    Ursprung, Aktivierung, Pattern). Taktgrenzen liegen bei Ursprung + k · Taktlänge, nicht mehr
+    `pulse % ppb` ab Sitzungsbeginn. Ein Patternwechsel auf einer Taktgrenze öffnet einen neuen
+    Abschnitt (Takt zählt einmal weiter); ein Wechsel mitten im Takt (Ende Spur 1) behält bis
+    Paket 3 das Raster.
+  - **Reihenfolge des Grenzticks umgekehrt:** erst Songende bzw. Wechsel entscheiden, dann
+    Taktanker, Host-Takt, Loop-Fenster und Noten mit demselben `outTime` veröffentlichen.
+  - **HostSync:** jeder Anker trägt den Abschnitt; `state(at:)` liefert Taktart, Takt, Taktbeginn,
+    Aktivierung, laufendes/nächstes Pattern und Wechselpuls aus demselben Anker wie Position und
+    Tempo. Die Host-Blöcke lesen Taktart und Downbeat daraus, nicht mehr aus einer globalen
+    Taktart. Im Stillstand gilt die Projekttaktart.
+  - **Loops:** Taktlänge der Dehnung aus dem Abschnitt; Materialposition = absoluter Takt plus
+    Phase im Takt (statt globale Viertel / jetzige Taktlänge).
+  - `PatternSnapshot` trägt Taktart (bis Paket 3 = Projekttaktart) und Pattern-Platz.
+- **Anzeige:** laufendes Pattern neben der Position, bei geplantem Wechsel „▸ B · 2" (nächstes
+  Pattern, Takte bis zum Wechsel; ohne Zahl am Ende von Spur 1) — aus demselben Anker.
+- Tests `SectionTests`: 4/4 → 7/8 → 5/4 aus Ankern (Startpulse 0, 96, 180; Downbeats 0, 4,
+  7,5), Host-Blöcke im 7/8-Abschnitt, Song A→B→C in 3/4 im echten Tick (Takte, Aktivierungen,
+  nächster Wechsel, Taktanker), Wechsel mitten im Takt, Countdown.
+
+## [1.18.22] — 2026-11-15
+
+- **Tempo und Taktart in der Positionsanzeige** (Stephan: „der analoge drehregler für bpm wirkt
+  jetzt ästhetisch deplatziert"). Die BPM-Platte mit Drehregler entfällt. Tempo wie in Logic:
+  senkrecht ziehen (1 BPM je 4 Punkte, ⇧ fein 0,1), Doppelklick zum Eintippen, ▲▼ um ganze BPM,
+  TAP daneben. Taktart als Taste in der Anzeige (Auswahl im Stillstand, Tooltip nennt die
+  Zähleinheit). Bedienweg unverändert `engine.setBPM` bzw. `setTimeSignatureUndoable`.
+
+## [1.18.21] — 2026-11-15
+
+- **Positionsanzeige wie in Logic** (Stephan: „Eine Anzeige wie bei Logic bezüglich Taktart und
+  Position (in Sekunden oder in Beats) brauchen wir noch."): neben Play/Stop. Takt . Schlag .
+  Teil . Tick (240 Ticks je Sechzehntel), Klick schaltet auf Laufzeit h:mm:ss.mmm (gemerkt).
+  Darunter Taktart und Tempo der klingenden Stelle. Quelle ist `HostSync.state(at: jetzt)`,
+  dieselbe Position, die Plug-ins bekommen; die Anker liegen schon auf den Ausgabezeiten, kein
+  zweiter Vorlaufabzug (Codex KT-04). Schlag in Nennereinheiten (6/8 = sechs Achtel, E5). Nach
+  Stop bleibt die Endposition stehen. Blatt-View `PositionDisplayView`, 30 Hz nur bei laufendem
+  Transport, liest nur Atomics.
+- **Spurangaben im Step-Längen-Popover:** Notenwert mit Namen, Bruch und Dauer
+  („16t·Triole · 1/24 · 83,3 ms"), Spurlänge in Steps, Takten/Schlägen und Sekunden — beim
+  aktuellen Tempo, ohne Swing und Versatz. Keine Wiederkehranzeige (E6).
+- **Konzept:** Entscheidungen E1–E6 wie empfohlen festgehalten.
+- Rechnung in `Models/TimingInfo.swift`, Tests `TimingInfoTests` (4/4, 7/8, 6/8, 15/16,
+  Notenwerte, Spurlängen, Position gegen HostSync-Anker samt Stop).
+
+## [1.18.20] — 2026-11-15
+
+- **Hänger beim Instrumentwechsel behoben** (Stephan: „wieder ein sat1 rad hänger beim imac unter
+  1.18.17"). Stichprobe auf dem iMac: Main stand in `detach` beim Ersetzen eines Instruments, in
+  einem synchronen XPC-Aufruf an den Plug-in-Prozess. Das Plug-in (FSVR, CLAP als AUv2) stürzte
+  dabei im Abbau seines Editors ab (SIGILL im `AUHostingServiceXPC`). Die XPC-Warteschlange meldete
+  die Invalidierung und wartete auf Main, weil FoF den Beobachter mit `queue: .main` angemeldet
+  hatte — Main wartete auf dieselbe Warteschlange. Jetzt kehrt der Beobachter sofort zurück und
+  reicht die Meldung asynchron an Main. Ebenso die beiden Beobachter für Konfigurationswechsel der
+  Audio-Engines. Test `PluginInvalidationTests` (scheitert mit dem alten Beobachter nach 2 s).
+- **Konzept Taktart je Pattern, Fassung 2** nach Codex-Review (KT-01…08):
+  `Docs/KONZEPT_TAKT_UND_ZEIT.md` — Abschnitt mit Ursprung und Aktivierung, Revisionen,
+  Loop-Phase, Anzeigezeit, sechs offene Entscheidungen. Noch kein Code.
+
+## [1.18.19] — 2026-11-15
+
+- **Restpunkte aus Codex' Bericht** (`latest_codex_review_v1.18.15.md`): Spitzenbedarf der
+  Vorberechnung gemessen (120-s-Loop: 432 MiB; Reserve der Bibliothek von 8 auf 16 MB, weil die
+  Messung genau am alten Wert lag); Fensterschluss (Stumm/Songende) mitten in der Überblendung
+  geprüft — danach still; Test, dass jede Skala einen eigenen Dreiklang hat (sonst bräche der
+  Akkord-Rückfall die Skala).
+- **Steplängen gemessen** (Stephan: „Wenn ich 16el Noten wähle, bekomme ich tatsächlich was?“):
+  echte INT-Clock bei 120 BPM — 16tel 125,0 ms, 32tel 62,5 ms, Achtel 250,0 ms, 16tel-Triole
+  83,3 ms, ohne Streuung. Dauerhafter Test `StepTimingTests`.
+
+## [1.18.18] — 2026-11-15
+
+- **SoundFont und DLS im Apple Sampler laden:** der Sampler nennt deren Bänke als `file://`-URL
+  (EXS-Samples als Pfad); FoF prüfte sie als Pfad und lehnte sie als „Samples fehlen“ ab. Jetzt
+  werden beide Schreibweisen gelesen und beim Umbiegen erhalten. Für SoundFont/DLS fragt FoF keinen
+  Sample-Ordner mehr ab (die Samples stecken in der Datei). Nachweis: Apples `gs_instruments.dls`
+  über das Rack geladen und hörbar (auf jedem Mac vorhanden).
+
+## [1.18.17] — 2026-11-15
+
+- **Codex-Nachprüfung eingearbeitet** (Nachtrag in `.agent_handoff/latest_codex_review_v1.18.15.md`):
+  - R15-02 (Rest): Jeder Loop-Speicher wird im Initialisierer atomar gegen das Projektbudget
+    zugelassen, bevor er allokiert (vorher Prüfung und Zählung getrennt: Main und Vorberechnung
+    konnten gemeinsam überziehen). Die C++-Puffer der Vorberechnung entstehen ohne temporäre
+    Kopiervorlage; der Spitzenbedarf ist damit vollständig im reservierten Arbeitsspeicher.
+    Nachweis: acht parallele Anleger knapp am Budget, genau einer zugelassen.
+  - R15-05 (Rest): jeder Samplepfad durchläuft die Eindeutigkeitsregel einzeln; die Abkürzung
+    über ein schon gefundenes Präfix entfällt (konnte einen Gleichstand übergehen).
+  - R15-04 (EXT): die Aufnahme meldet atomar, bevor sie schreibt (`writeGeneration`); eine
+    Vorberechnung gilt nur, wenn seit ihrem Beginn keine Aufnahme schreiben durfte — auch wenn der
+    Transport auf dem MIDI-Thread startete und Main davon noch nichts weiß.
+
+## [1.18.16] — 2026-11-15
+
+- **Apple Sampler als Instrument** (Stephan: „Battery ist gestorben, das muss mit anderen
+  samplern gehen. also wird zukünftig apple sampler genommen."): Im Instrumentmenü des
+  Kanalzugs „Apple Sampler: Instrument laden …" wählt eine EXS-, SoundFont-, DLS- oder
+  aupreset-Datei; Rechtsklick auf einen Kanalzug mit Apple Sampler lädt ein anderes. FoF wandelt
+  das Instrument im App-Prozess mit einer kurzlebigen Sampler-Instanz um (Systembestandteil) und
+  übergibt den Zustand an den Sampler außerhalb des Prozesses — dort lädt er Instrumente nicht
+  selbst (gemessen: −10879). Der Zustand reist mit dem Projekt (`PluginRef.state`, kein neuer
+  Presetschlüssel).
+- **Sample-Ordner freigeben** (Kanalzug-Rechtsklick bzw. automatisch beim ersten Laden): die
+  Sandbox lässt FoF nur in freigegebene Ordner sehen; die Freigabe bleibt als Lesezeichen je
+  Rechner. Beim Laden eines Projekts biegt FoF Samplepfade eines anderen Rechners auf die
+  freigegebenen Ordner um (gemeinsames Pfadende, z. B. iMac `/Volumes/DATEN/Music/…` ↔
+  `~/Music/…`).
+- Der Apple Sampler hat einen Stereo-Ausgang (kein Multi-Out); getrennte Kanäle für Kick/Snare
+  … entstehen über mehrere Kanäle mit demselben Kit.
+- **Korrekturen nach Codex-Zweitmeinung** (`.agent_handoff/latest_codex_review_v1.18.15.md`):
+  - R15-01: Überblendung Echtzeit → Vorberechnung läuft über Blockgrenzen bis zum Ende beider
+    128-Frame-Rampen (vorher brach der ausblendende Teil am Blockende ab: Pegelloch bei kleinen
+    Blöcken). Nachweis mit Blockgrößen 32–1000 und Gegenprobe.
+  - R15-03: Taktgrenze auf Frame 0 eines Blocks wird übernommen (vorher nie bei blockbündigen
+    Takten). Nachweis mit Gegenprobe.
+  - R15-02: Vorberechnung reserviert ihren Arbeitsspeicher (≈ 32 B je Quell- und Zielframe +
+    8 MB) atomar im Projektbudget; Speichermangel in der Bibliothek ergibt sauber „keine
+    Vorberechnung".
+  - R15-04: ein Ergebnis gilt nur, wenn der Transport während der Berechnung nie lief (nur dann
+    kann keine Aufnahme Material geschrieben haben).
+  - R15-05: Samplepfade werden nur eindeutig zugeordnet (längstes Pfadende über alle Ordner,
+    Gleichstand = keine Zuordnung, Präfixe an Pfadkomponenten, nur lesbare Dateien); beim Import
+    werden gelistete, nicht lesbare Verweise ebenfalls umgebogen.
+  - R15-06: Freigaben zählen nur, wenn der Ordner danach lesbar ist; übergeordnete ersetzen
+    innere, Zugriffe werden ausgeglichen geschlossen.
+
+## [1.18.15] — 2026-11-14
+
+- **Vorberechnete Zeitdehnung der Audio-Loops:** Im Stillstand wird jeder Loop, dessen Taktlänge
+  nicht zu Tempo und Taktart des Projekts passt, im Hintergrund hochwertig gedehnt (feineres
+  Analyseraster als in Echtzeit, drei Umläufe, mittlerer mit Überblendung an der Naht) und neben
+  dem Material gebunden. Passt die Taktlänge beim Abspielen, spielt er samplegenau aus dieser
+  Vorberechnung — ohne Stretcher im Audio-Thread. Ändert sich das Tempo im Lauf, übernimmt die
+  Echtzeitdehnung; zurück im passenden Tempo wird auf der nächsten Taktgrenze getauscht (128 Frames
+  Überblendung). Neue Aufnahme, Undo, Laden oder Umrechnung lösen die Vorberechnung; sie gilt nur
+  für dasselbe Material im selben Stand (`prerenderSource`/`prerenderVersion`).
+  Nachweise: Tonhöhe, Loop-Naht, Taktlage ohne Drift, Echtzeit gegen Offline (Hüllkurven-
+  Korrelation > 0,95, Pegel ±1 dB bei 90 und 150 BPM), Tausch auf einem Taktanker, Steuerung
+  (nur im Stillstand, folgt Tempo/Taktart, löst sich im Aufnahmetempo).
+- **Clock-Vorlauf vom tatsächlichen Gerät:** Der Puffer für den Vorlauf kommt bei laufender
+  Engine vom Gerät, an dem ihre Ausgabe hängt (`InstrumentRack.outputBufferSeconds`), nicht mehr
+  vom Systemstandard; neu gesetzt bei jedem Start und Stopp der Engine.
+- **Erste Note nach dem Laden (Decent Sampler) geklärt:** dieselbe Verspätung von 4,48 ms tritt
+  an einer nackten AVAudioEngine ohne FoF auf (`DecentSamplerProbeTests.bareFirstNote`); sie
+  liegt im Plug-in, FoF plant richtig.
+- **Lizenz:** GPL-3.0-or-later (Hinweise, Copyright-Zeile); keine Kopfzeilen je Datei.
+
+## [1.18.14] — 2026-11-14
+
+- **Gewürfelte Akkorde bleiben in der Skala**, wenn eine eingestellt ist (Stephan: „gewürfelte
+  akkorde auch auf Skala begrenzen wenn ausgewählt"). Quelle „Bücher": nur Folgen, deren Akkorde
+  vollständig in der Skala liegen — die fest gewählte Familie, wenn sie passt, sonst eine
+  passende; passt keine (Terzkette, Pentatonik, Blues, Ganzton), leitereigen. Quelle „frei":
+  Septakkord-/add9-Farben nur, wenn ihre Töne in der Skala liegen; Skalen ohne sieben Stufen
+  bekommen Akkorde aus ihren eigenen Tönen (`PadChords.scaleChordWalk`) statt aus Dur/Moll.
+  Chromatisch bleibt alles wie bisher. Kern testbar als `SequencerEngine.rolledChords(scaleIndex:…)`.
+- **Lizenzangaben vervollständigt:** `LICENSE` (GPLv3, identisch mit dem öffentlichen Stand) jetzt
+  auch im Entwicklungsrepo. Neuer Ordner `Licenses/` im App-Bundle: GPL-Text,
+  `LICENSE-swift-atomics.txt` (Apache 2.0 mit Runtime Library Exception, unverändert aus 1.3.0)
+  und `THIRD_PARTY_NOTICES.md` (FoF, swift-atomics 1.3.0, Signalsmith Stretch/Linear MIT,
+  Abgrenzung: Plug-ins und Sample-Inhalte sind nicht Teil von FoF). Copyright-Zeile im
+  Info.plist (`NSHumanReadableCopyright`). Keine Rechtsberatung, keine pauschale Freigabe.
+
+## [1.18.13] — 2026-11-14
+
+- **Audio-Loops folgen dem Tempo ohne Tonhöhenänderung** (Time-Stretching): spielt der
+  Sequencer schneller oder langsamer als bei der Aufnahme — oder in einer anderen Taktart —,
+  wird der Loop gedehnt bzw. gestaucht, die Tonhöhe bleibt. Bisher blieb bei langsamerem Tempo
+  der Rest des Takts still, bei schnellerem fehlte das Taktende.
+- **Timing:** Die Leseposition wird in jedem Audioblock aus der Musikposition (pulsgenau)
+  berechnet, nie aufsummiert — keine Drift, auch nicht über Tempo-Rampen. Gemessen: Taktbeginn
+  im Loop höchstens 0,9 ms neben dem Taktanker über 12 Takte, auch bei 100 → 150 BPM während der
+  Wiedergabe. Tonhöhe gemessen gleich (480 Hz bleibt 480 Hz bei 100 und 140 statt 120 BPM).
+- Im Aufnahmetempo bleibt die Wiedergabe samplegenau wie bisher (ohne Stretcher); der
+  Übergang zwischen beiden Wegen blendet über 128 Samples.
+- Verhältnis 1:4 bis 4:1. Stretcher: Signalsmith Stretch 1.4.0 (MIT), mitgeliefert unter
+  `ThirdParty/`; Speicher wird beim Anlegen des Loop-Kanals belegt, im Audio-Thread nichts
+  (gemessen: keine Allokation in Verarbeitung und Neuaufsetzen).
+- **Overdub nur im Tempo und in der Taktart des Loops:** während er gedehnt wird, weist die
+  Aufnahmetaste mit Hinweis ab (das Eingespielte würde sonst zeitversetzt landen).
+- Noch nicht enthalten: hochwertige Vorberechnung im Stillstand mit Tausch auf der Taktgrenze.
+
+---
+
+## [1.18.12] — 2026-11-14
+
+- **Taktart des Projekts** (Transportleiste, Taste unter TAP): 2/4 bis 7/4, 3/8 bis 13/8, 15/16.
+  Änderbar im Stillstand, mit Undo.
+- Was ihr folgt:
+  - **Song:** Szenenlängen in Takten der Taktart; Wechsel genau auf dem Taktstrich (7/8: alle
+    84 Pulse statt 96).
+  - **Audio-Loops:** Taktanker und Loop-Länge (ein Takt 7/8 bei 120 BPM = 1,75 s). Schon
+    aufgenommenes Material behält seine Länge.
+  - **Plug-ins:** bekommen Zähler, Nenner und den Taktbeginn (Arpeggiatoren, Sync-Delays,
+    taktbezogene LFOs).
+  - **Pad-Spuren:** Längen in Schlägen und Takten der Taktart; beim Wechsel bleiben ganze Takte
+    ganze Takte (2 Takte 4/4 → 2 Takte 3/4), ganze Schläge bleiben Schläge.
+  - **Raster:** Linie je Schlag, kräftiger auf dem Taktstrich.
+- **Pad-Längen beschriftet in Schlägen und Takten** („1 Sl.", „2 T", „1 T 1 Sl.") statt
+  Notenwerten — „3/4" stand bisher für eine punktierte Halbe und las sich wie eine Taktart.
+- **Presetformat (additiv):** optionaler Schlüssel `timeSignature` (z. B. "7/8"), nur bei ≠ 4/4
+  geschrieben; ungültige Angabe → 4/4. Ältere Projekte laden in 4/4; ältere FoF-Versionen
+  ignorieren den Schlüssel (und spielen in 4/4). Pad-Längen, die keine 4/4-Auswahl sind
+  (z. B. 14 Sechzehntel aus 7/8), lädt FoF jetzt unverändert statt auf 1 Takt zu setzen.
+- Unverändert: MIDI-Clock und Song Position Pointer (in Sechzehnteln, ohne Takt), Steplängen
+  der normalen Spuren.
+
+---
+
+## [1.18.11] — 2026-11-14
+
+- **Kanal-EQ in jedem Kanalzug** (nach Logic Channel EQ): acht Bänder — Low Cut, Low Shelf,
+  vier Glocken, High Shelf, High Cut. Im Kanalzug zeigt ein kleines Kurvenbild über dem
+  Panorama den EQ; ein Klick öffnet den Editor mit großer Kurve.
+- Bedienung im Editor: Punkt ziehen = Frequenz (waagerecht) und Pegel (senkrecht), ⌘-Ziehen =
+  Güte, ⌥ = fein, Doppelklick = Band ein/aus, ⌥-Klick = Band zurücksetzen; Ziehen an einem
+  ausgeschalteten Band schaltet es ein. Unter der Kurve je Band: Ein/Aus, Frequenz, Pegel bzw.
+  Flanke (12/24/36/48 dB/Okt.), Güte — ziehen, Scrollrad, Doppelklick = Grundwert. Ein/Aus des
+  ganzen EQ und Zurücksetzen oben.
+- Bereiche: 20 Hz – 20 kHz, ±24 dB, Güte 0,1 – 12. Die angezeigte Kurve ist gemessen gleich dem,
+  was der Kanal hört (Abweichung unter 0,5 dB). Low/High Cut liegen bei jeder Flanke genau mit
+  −3 dB auf der eingestellten Frequenz.
+- Kein zusätzlicher Audioknoten: der EQ sitzt in der Pegelstufe des Kanals, die schon den
+  Fader trägt. Ausgeschaltete Bänder kosten nichts.
+- Der Mixer ist 34 Punkte höher, damit der Fader seine Länge behält.
+- **Presetformat (additiv):** optionaler Schlüssel `eq` je Kanal, nur geschrieben, wenn er von
+  der Grundeinstellung abweicht. Ältere Projekte laden mit neutralem EQ; ältere FoF-Versionen
+  ignorieren ihn.
+- Nicht enthalten: Analyzer, MIDI-Learn/CC-Ziel auf EQ-Parameter, Undo (Mixer hat keins).
+
+---
+
+## [1.18.10] — 2026-11-14
+
+- **Kein Stocken mehr beim Laden während der Wiedergabe:** Instrument laden, Effekt einfügen oder
+  tauschen, neuen Kanal oder Audio-Loop-Spur anlegen startete bisher die Audio-Engine kurz neu —
+  alle Kanäle setzten hörbar aus. Jetzt wird nur der betroffene Kanal umgebaut; alle übrigen
+  laufen lückenlos weiter (gemessen: kein Neustart, kein fehlender Block im Strom eines
+  unbeteiligten Kanals).
+- Technisch: AVAudioEngine nimmt einen Kanal bei laufender Engine nur auf, wenn er beim
+  Anhängen an die Summe schon eine Quelle hat. Ein leerer Kanal hängt deshalb erst an der
+  Summe, sobald Instrument oder Loop-Quelle da sind (`InstrumentRack.hook`); der Neustart
+  (`AudioGraph.adopt`) bleibt nur Rückfall. Unverändert mit kurzem Neustart: Abtastrate eines
+  Plug-ins umstellen.
+
+---
+
+## [1.18.9] — 2026-11-14
+
+- **Absturz beim Wechseln von Effekten während der Wiedergabe behoben** (iMac, macOS 12; drehendes
+  Rad): FoF setzte die Takt-/Transport-Anbindung eines Instruments neu, während es im
+  Plug-in-Prozess renderte; Plug-ins wie Odin2 brachten den Prozess dabei zum Absturz. Die
+  Anbindung wird jetzt nur noch gesetzt, wenn niemand sie gleichzeitig benutzt.
+- **Abtastrate des Plug-ins je Kanal** (Rechtsklick auf den Kanalzug): ein Instrument kann mit
+  44,1, 48, 88,2 oder 96 kHz rendern, FoF rechnet sauber auf das Ausgabegerät um. Für Decent
+  Sampler mit 44,1-kHz-Samples an einem 48-kHz-Gerät: auf 44,1 kHz stellen — DS rechnet selbst nur
+  grob um (gemessen), das waren die Artefakte. Das Timing bleibt samplegenau (gemessen).
+- **Presetformat (additiv):** optionaler Schlüssel `renderRate` je Kanal; ältere Projekte laden
+  unverändert, ältere FoF-Versionen ignorieren ihn.
+
+## [1.18.8] — 2026-11-14
+
+- **RND mit Skala:** Würfeln auf einer Einzelton-Spur nimmt bei eingestellter Skala nur
+  leitereigene Töne (Grundton der Spur), gleich verteilt über alle Stufen. Vorher kam der Ton
+  chromatisch aus C2–C6 — die Skala wirkt nur beim Eingeben, nicht beim Abspielen, deshalb
+  blieben falsche Töne stehen. Akkorde folgen weiter der im RND-Menü gewählten Quelle.
+
+## [1.18.7] — 2026-11-14
+
+### Audio-Loop-Spur: Ein- und Ausgabegerät sichtbar
+
+- **Spurkopf:** neben dem Eingangspegel steht das Gerät, von dem gerade aufgenommen wird —
+  oder „Eingang aus", solange der Eingang nicht läuft. Orange, wenn der Systemstandard
+  inzwischen ein anderes Gerät ist. Die Hilfe nennt Eingang und Ausgang.
+- **Eingangs-Popover:** getrennte Blöcke „Aufnahme von (Eingang)" und „Wiedergabe über
+  (Ausgang)" mit Gerätename, Zustand, Kanalzahl und Abtastrate sowie der gewählten Spur
+  („Kanal 1 · Mono", „Kanäle 1–2 · Stereo"). Ist der Eingang aus, steht dort, wann er startet
+  und welchen Systemstandard er dann nimmt. Fehler (kein Zugriff, kein Eingang) mit Text.
+  Warnung, wenn der gewählte Kanal am Gerät nicht existiert. Die Kanalknöpfe richten sich nach
+  dem tatsächlichen Gerät.
+- Gezeigt wird immer das Gerät der laufenden Engine, nicht bloß der Systemstandard; bei
+  Gerätewechsel aktualisiert sich die Anzeige.
+- **Latenzausgleich:** nutzt jetzt die Latenz der tatsächlich benutzten Geräte statt der
+  Standardgeräte.
+
+## [1.18.6] — 2026-11-14
+
+### Spuren haben über alle Patterns eine feste Zeile (Codex A17-12)
+
+Verschieben, Einklappen, Löschen, Duplizieren und „Spur danach einfügen" treffen in jedem
+Pattern dieselbe Spur — auch wenn ein Pattern seine Spuren anders angeordnet oder weniger
+Spuren hat. Bisher galt „gleiche Zeilennummer"; bei unterschiedlich aufgebauten Patterns
+konnte so in einem anderen Pattern eine falsche Spur verschoben oder gelöscht werden.
+
+- **Presetformat (additiv):** neuer Schlüssel `row` je Spur. Ältere Projekte laden
+  unverändert; ihre Spuren bekommen die Zeile beim Laden nach Zeilennummer, also mit der
+  bisherigen Bedeutung. Ältere FoF-Versionen ignorieren den Schlüssel.
+
+## [1.18.5] — 2026-11-14
+
+### Zerlegung des Racks, Schritt 5: Plug-in-Lebenszyklus
+
+Laden, Klangzustand, Host-Takt-Bindung, Render-Observer und Editorfenster gehören
+`PluginLifecycle` (Engine/Rack/). Er kennt weder Kanäle noch Engine; das Rack übergibt je
+Aufruf Einheit, Warteschlange und Bindung. Damit ist die Zerlegung des Racks abgeschlossen.
+
+- **Editorfenster:** Wird ein Kanal oder Effekt entfernt, während sein Editor noch geöffnet
+  wird, erscheint das Fenster nicht mehr verwaist. Ein schneller Doppelklick öffnet nur ein
+  Fenster.
+
+## [1.18.4] — 2026-11-14
+
+### Zerlegung des Racks, Schritt 4: Loop-Steuerung
+
+Keine sichtbare Änderung. Loop-Kerne, Taktanker, Material, Eingang, Anzeigen und
+Latenzmessung gehören `AudioLoopController` (Engine/Rack/). Er liest das Rack nur über
+`AudioLoopHost` (Loop-Kanäle, Abtastrate, Lauf) und meldet zurück, wenn ein Kanal neu
+eingestellt ist (das Rack setzt Gates und Routenlatenz) oder eine Messung neue Einstellungen
+ergibt. Die Audioknoten der Kanäle bleiben beim Rack.
+
+- **Abbau-Reihenfolge:** Beim Freigeben des Racks halten Audio-Engine und Eingang jetzt an,
+  bevor Warteschlangen und Loop-Kerne freigegeben werden. In 1.18.3 stoppte die Engine erst
+  danach (nur beim Beenden bzw. in Tests relevant).
+
+## [1.18.3] — 2026-11-14
+
+### Zerlegung des Racks, Schritt 3: Audiograph
+
+Keine sichtbare Änderung. Die Audio-Engine gehört jetzt `AudioGraph` (Engine/Rack/): Anlegen,
+Start, Stop, Neustart beim Aufnehmen neuer Plug-in-Knoten, Rücksetzen durch den Wächter, die
+Summe (Gain-Stufe, Lautstärke, Summen-Tap), das Mischformat und die Beobachtung von Geräte- und
+Formatwechseln. Das Rack reicht nur noch Ketten und Knoten weiter. Jeder Start meldet sich über
+einen einzigen Rückruf, an dem das Rack Fehler und Laufzustand veröffentlicht und die
+Host-Blöcke der Plug-ins bestätigt (A17-09) — vorher an drei Stellen von Hand.
+
+## [1.18.2] — 2026-11-14
+
+- **Spur loslassen:** Die gezogene Spur gleitet direkt in die offene Lücke und bleibt dort.
+  Vorher sprangen beim Loslassen alle Spuren kurz in die alte Ordnung zurück und tauschten dann
+  animiert die Plätze (wirkte wie ein Drehen mit der ersetzten Spur). Jetzt wird das Modell erst
+  umgestellt, wenn die Spur liegt — ohne Animation, weil alles schon am neuen Platz steht.
+
+## [1.18.1] — 2026-11-14
+
+### Zerlegung des Racks, Schritt 2: Diagnose
+
+Keine sichtbare Änderung. Kopf und Messproben der Audio-Diagnose sowie die Beobachtung der
+Instrumente gehören `RackDiagnostics` (Engine/Rack/). Er bekommt je Probe eine schreibgeschützte
+Momentaufnahme (`Probe`/`ChannelProbe`) und schreibt nur in den Rekorder `AudioDiagnostics`;
+die Vergleichsstände der Proben und die KVO-Beobachtungen sind aus dem Rack bzw. `Live` entfernt.
+
+## [1.18.0] — 2026-11-14
+
+### Zerlegung des Racks, Schritt 1: Parameterkatalog (Codex A17-10)
+
+Keine sichtbare Änderung. Parameterlisten, Baumbeobachtung, Quellen und Auflösung der CC-Ziele
+gehören jetzt einem eigenen Besitzer `ParameterCatalog` (Engine/Rack/). Er liest das Rack nur
+über die schmale Schnittstelle `ParameterCatalogHost` (Kanaldaten, geladene Einheiten, Status,
+Effekt-Warteschlange) und verändert keinen Rack-Zustand; Baumwechsel meldet er über `onChange`.
+Das Rack ruft ihn an festen Lebenszykluspunkten (Instrument/Effekt geladen/entfernt) und
+reicht die bisherige Schnittstelle durch. Caches und Baumbeobachtungen sind aus `Live` entfernt.
+
+## [1.17.10] — 2026-11-14
+
+### Spuren ziehen auf allen Systemen, animiert; Plug-in-Fenster im Vollbild
+
+- **Verschieben unter macOS 12:** Das Ziehen am Griff (≡) nutzt jetzt eine eigene Geste statt
+  System-Drag-and-drop (lief unter macOS 12 nicht, unter Tahoe schon).
+- **Animiert:** Die gezogene Spur folgt dem Zeiger (mit Schatten), die anderen rücken weich zur
+  Seite und öffnen die Lücke, in die sie kommt; beim Loslassen gleitet alles an seinen Platz.
+- **Plug-in-Fenster im Vollbild:** Unter macOS 12 öffnete ein Plug-in-Editor bei FoF im
+  Vollbild einen eigenen Schreibtisch. Er erscheint jetzt als Fenster über FoF.
+- **Host-Takt (A17-09) belegt behoben:** Die Ursache des gelegentlich ausbleibenden Host-Takts
+  beim ausgelagerten Instrument ist gefunden — die Audio-Engine startet beim Laden eines
+  weiteren Plug-ins neu, dabei verlor das Instrument seine Blöcke (Getter leer, rendert, 0
+  Aufrufe). Nach jedem Engine-Start, Neustart, Neuverdrahten und jeder Wiederherstellung
+  werden fehlende Blöcke derselben Bindung neu gesetzt (Diagnose `hostBlocksReaffirmed`).
+  Im Testbericht: 1 Neusetzen, danach 2850 Aufrufe; 4 Volläufe grün.
+
+**Technisch:** `TrackDragState` (gehört der MainView als `@State`, nicht beobachtet; nur die
+Blätter `TrackDragOffset` und der Griff lesen es), Zeilenlage per `TrackRowFramesKey` im Raum
+`fofTrackList`. `onDrag`/`onDrop`, `TrackDropTarget`, `TrackDragSession` entfernt. Editorfenster:
+`collectionBehavior` `.fullScreenAuxiliary`/`.moveToActiveSpace`, im Vollbild Kindfenster des
+Hauptfensters. `reaffirmHostBindings()` an allen Engine-Lebenszykluspunkten.
+
+## [1.17.9] — 2026-11-14
+
+### Bereinigung 4: aktuelle Verträge statt überholter Erklärungen (Codex A17-11, A17-13)
+
+- ENGINEERING: neuer Abschnitt „Schreibwege und Undo-Vertrag" — je Aktion Weg, Undo, Dirty,
+  Snapshot. CLAUDE.md-Regel 3 beschreibt jetzt die tatsächlichen Schreibwege statt „einziger
+  ModelWriter".
+- AGENTS.md: Produktbeschreibung aktualisiert (AU-Hosting, Clock-Thread, Host-Blöcke).
+- Kommentar zum Songende in der Engine beschreibt den Abschluss im Tick.
+- Test des echten Plug-ins schreibt mehr Zustand in seinen Bericht (Renderdurchläufe, Getter,
+  Prozess, Renderressourcen). **Offener Befund:** Das ausgelagerte DLS-Instrument rief die
+  Host-Blöcke in 1 von 5 Volläufen seit v1.17.6 nicht auf (Effekt daneben versorgt); der
+  zweite Installationspunkt nach dem Verdrahten verhindert das nicht sicher. Ursache offen.
+
+## [1.17.8] — 2026-11-14
+
+### Bereinigung 3: CC-Ziele auf Effekte bleiben beim richtigen Effekt
+
+- **Zwei gleiche Effekte im Kanal:** Ein CC-Ziel auf den ersten bleibt beim ersten, auch wenn
+  man die Reihenfolge ändert. Entfernt man ihn, bleibt das Ziel offen („?") und steuert nicht
+  unbemerkt den anderen (Codex A17-04; vorher an die laufende Nummer gebunden).
+- Ändert ein Plug-in seinen Parameterbaum (manche Plug-ins tun das je Preset), liest FoF die
+  Parameter neu und löst die CC-Ziele neu auf — für Instrumente und Effekte (A17-08).
+
+**Presetformat:** zwei neue optionale Schlüssel — `instance` je Effekt (`PluginRef`) und
+`effectInstance` im CC-Ziel (`ParameterRef`). Ältere Dateien laden: fehlende Instanzen vergibt
+das Laden, Ziele mit laufender Nummer werden dabei einmal der bezeichneten Instanz zugeordnet.
+Ältere Versionen ignorieren die Schlüssel; `effect` (laufende Nummer) wird weiter geschrieben.
+
+**Technisch:** `PluginRef.instance` (neu bei jeder Einfügung, beim Laden fehlende/doppelte neu),
+`ParameterRef.effectInstance`, `parameterSource(of:)` nach Instanz, `bindEffectInstance`,
+`bindLegacyEffectTargets` direkt nach `replaceAll`. Baumbeobachtung je Effekt
+(`effectTreeObservations`), Instrument über die bestehende KVO — leeren den Cache und rufen
+`onRoutingChange`. Ein echter Baumwechsel ist im Test nicht nachgestellt.
+
+## [1.17.7] — 2026-11-14
+
+### Bereinigung 2: Spurbefehle mit Identität, Speicher bei 64 Kanälen
+
+- **Undo von Verschieben ist exakt**, auch wenn Patterns unterschiedlich viele Spuren haben
+  (vorher konnte Undo eine Spur in einem kürzeren Pattern stehen lassen; Codex A17-05).
+- **Undo von Einklappen** stellt den vorherigen Zustand jeder Spur her — eine in einem anderen
+  Pattern schon eingeklappte Spur bleibt eingeklappt (A17-06).
+- Verschieben und Spuren anlegen/löschen bauen die internen Abos einmal statt einmal je Pattern
+  neu auf (A17-07). Einklappen löst keinen Playback-Neuaufbau mehr aus (A17-08, Ansicht).
+- **Speicher:** Seit 64 Kanälen belegte jede Engine rund 39 MB für Kanäle, die nie benutzt
+  werden (Speichertest rot). Die festen Puffer je Kanal (Ereignisringe, Loop-Arbeitspuffer,
+  Loop-Ring) werden jetzt nur reserviert und erst beim Anlegen des Kanals auf Main real belegt —
+  Engine ohne Kanäle wieder im Bereich weniger MB, Echtzeit-Threads ohne erste Seitenberührung.
+
+**Technisch:** `TrackOrder` (Vorher/Nachher-Instanzfolgen je Pattern), `applyTrackOrders`,
+`CollapseChange`, `withStructureTransaction` (ein Abo-Neuaufbau), `TrackData.viewChanged`.
+`ZeroedMemory` (anonyme `mmap`-Seiten, `prefault` auf Main in `install`/`reserveEffectQueue`);
+Notenbuch bleibt fest belegt (3,2 MB).
+
+## [1.17.6] — 2026-11-14
+
+### Host-Takt: Zeitvertrag geschlossen (Codex-Architekturprüfung A17-01, -02, -03, -09)
+
+- **Songende stoppt Plug-ins auf dem geplanten Zeitpunkt**, auch wenn die Oberfläche hängt:
+  der Tick setzt das Transport-Ende selbst (bisher erst über Main). Spätere Ticks bewegen die
+  Position nicht weiter. Ein Stop der alten Sitzung kann eine neue nicht anhalten.
+- **Sample-Position ist echte Zeit seit dem Start** — Tempowechsel und Tempo-Regler im
+  Stillstand verschieben sie nicht mehr (vorher aus Viertel × aktuellem Tempo zurückgerechnet).
+- **Vorausgeplante Pulse gelten erst ab ihrem Zeitpunkt:** Ring von 32 Ankern; ein früher
+  gemeldeter Tempowechsel gilt nicht rückwirkend, vor dem Start steht der Transport.
+- **Nachweis statt Reparatur:** Jede Plug-in-Installation hat eine eigene Bindung mit
+  Aufrufzählern (Diagnose `hostCalls`). Der periodische Wächter, der fehlende Blöcke neu setzte,
+  ist entfernt. Stattdessen ein fester zweiter Installationspunkt nach dem Verdrahten: im
+  Volllauf hatte das ausgelagerte DLS-Instrument vor dem Einhängen gesetzte Blöcke nicht
+  aufgerufen (0 Aufrufe, Effekt daneben versorgt); mit dem zweiten Punkt in zwei Volläufen
+  versorgt.
+
+**Technisch:** `HostSync` mit Sitzungsnummer, fester Startzeit, Ankerring, Ende nur früher
+(CAS), `end(at:)` im Tick, `stop(at:session:)` von Main. `HostBinding` je Installation, von
+Blöcken und Observer stark gehalten — keine rohen Rack-Speicher mehr in Plug-in-Blöcken
+(Lebensdauerfrage aus dem Review). `.changed` auch bei Sitzungswechsel, threadsicher.
+
+## [1.17.5] — 2026-11-14
+
+- **Eingeklappte Spur mit LEDs:** Jeder Step trägt eine LED wie im großen Raster — aktive Steps
+  leuchten in Spurfarbe, der gespielte Step hell mit Schein; kein Rahmen mehr. Velocity als
+  schmaler Streifen unter der LED. CC-Spuren bleiben bei Balken.
+
+## [1.17.4] — 2026-11-14
+
+### Eingeklappte Spuren zeigen ihre Steps, Verschieben mit Einfügelinie
+
+- **Eingeklappte Spur zeigt die Steps** in klein, an derselben Stelle wie im großen Raster
+  (gleiche Step-Breite, scrollt mit): aktive Steps in Spurfarbe, Velocity als Helligkeit, der
+  gespielte Step umrandet; CC-Spuren zeigen ihre Werte als Balken. Nur Anzeige.
+- **Pfeil und Ziehgriff** stehen in der eingeklappten Zeile nebeneinander und werden nicht
+  mehr abgeschnitten.
+- **Verschieben:** Beim Ziehen erscheint eine Linie in der Lücke zwischen zwei Spuren, in die
+  die Spur kommt (obere/untere Hälfte einer Spur = Lücke darüber/darunter), statt eines Rahmens
+  um eine Spur. Kein Plus mehr am Zeiger (Ablegen ist Verschieben, nicht Kopieren). Lücken
+  direkt an der gezogenen Spur zeigen keine Linie.
+
+**Technisch:** `CollapsedLaneStrip` (Canvas, `CollapsedStripLayout` = Zelllage des
+Step-Rasters), Playhead als eigenes Blatt (`CollapsedPlayhead`), Scroll über `laneScrollShift`.
+`TrackDropTarget` mit `DropDelegate` (`DropProposal(.move)`), `moveDestination(from:gap:count:)`,
+`moveTrackUndoable(id:toGap:)`.
+
+## [1.17.3] — 2026-11-14
+
+### Spuren umbenennen, verschieben, einklappen; bis zu 64 Instrumentenkanäle
+
+- **Audio-Loop-Spuren lassen sich umbenennen** — mit demselben Namensfeld wie alle anderen
+  Spuren (Enter, Esc oder Klick daneben übernimmt, mit Undo).
+- **Spuren verschieben:** Ziehgriff (≡) am rechten Rand jeder Spur auf eine andere Spur ziehen,
+  oder im Spurmenü „Nach oben"/„Nach unten". Die Reihenfolge ändert sich in allen Patterns
+  gleich (Zeile n ist überall dieselbe Spur), mit Undo. Hinweis: ohne Song bestimmt die oberste
+  Spur die Länge eines Patterns.
+- **Spuren einklappen:** Pfeil am rechten Rand oder Spurmenü. Eine eingeklappte Spur ist eine
+  schmale Leiste mit Name und m/s und spielt weiter. Gilt für die Zeile in allen Patterns, mit
+  Undo, wird im Preset gespeichert.
+- **Mehr Spuren mit Instrumenten:** Das Instrumenten-Rack hat jetzt 64 Kanäle statt 16
+  (Instrumente, Audio-Loops). Die Spurzahl selbst war schon bis 128 offen; begrenzt hat die
+  Kanalzahl.
+
+**Presetformat:** neuer optionaler Schlüssel `collapsed` je Spur (nur geschrieben, wenn
+eingeklappt). Ältere Presets laden unverändert; ältere Versionen ignorieren den Schlüssel.
+
+**Technisch:** `moveTrack(from:to:)` / `setTrackCollapsed` über alle Patterns, Undo per
+`registerReversibleUndo`. `AUEventQueue` mit wählbarer Ring-/Wartelistengröße: Instrumente
+1024/512 wie bisher, Effekt-Warteschlangen 256/128 (Speicher bei 256 Effektplätzen ≈ 6,5 MB
+statt 26 MB). Loop-Markierung im Tick als 64-Bit-Maske.
+
+## [1.17.2] — 2026-11-14
+
+### Plug-ins laufen im Takt von FoF
+
+- AU-Instrumente und -Effekte bekommen Tempo, Taktart, Position und Play/Stop von FoF — so,
+  wie Logic es Plug-ins bereitstellt. Tempo-synchrone LFOs, Delays, Arpeggiatoren und
+  Sequenzer in Plug-ins folgen damit dem Sequencer statt ihrem eigenen Standardtempo; im
+  Stillstand sehen sie das eingestellte Tempo. Mit externer Clock folgt die Position den
+  empfangenen Pulsen.
+- Die Position ist auf denselben Zeitpunkt geplant wie die Noten (inklusive Latenzausgleich
+  des Kanals).
+
+## [1.17.1] — 2026-11-14
+
+### CC-Spur: Ziel in Instrument und Effekten, mit Suche
+
+- Die Zieltaste einer CC-Spur öffnet ein Auswahlfenster: oben MIDI-CC, darunter erst das
+  Plug-in (Instrument oder Effekt 1–4 des Kanals), dann die Parameter — alphabetisch sortiert
+  („Osc 2" vor „Osc 10"), Gruppe klein daneben, mit Suchfeld (mehrere Wörter, ohne Groß-/
+  Kleinschreibung). Ersetzt das lange Menü mit den Gruppen des Plug-ins.
+- **Effekte als Ziel:** Eine CC-Spur kann jetzt auch Parameter eines Effekts im Kanal steuern,
+  sample-genau wie beim Instrument (eigene Ereigniswarteschlange je Effekt). Entfernt man den
+  Effekt, sendet die Spur nichts und zeigt „?".
+- **Gate-Anzeige:** Der Gate-Regler zeigt echte Notenlängen. Auf Pad-Spuren (und Spuren mit
+  anderer Steplänge als 1/16) stimmte die Beschriftung nicht — Gate 1.0 auf einer 1-Takt-Pad
+  stand als „1/16" da und klang einen Takt. Gespeicherte Werte bleiben unverändert. Der Dialog
+  für mehrere Steps zeigt das Gate des ersten markierten Steps.
+
+**Presetformat:** `ccParameter` bekommt den optionalen Schlüssel `effect` (Effekt-Ziel).
+Versionen vor 1.17.1 ignorieren ihn; das Ziel löst dort nicht auf, die Spur sendet nichts.
+
+## [1.17.0] — 2026-11-14
+
+### Einzeltöne und Akkorde auf allen Spuren
+
+- **RND würfelt Einzeltöne, Akkorde oder gemischt** — auf normalen und auf Pad-Spuren. Die
+  Wahl steht im ▾-Menü neben RND, das jetzt alle Step-Spuren außer Drum-Spuren haben, getrennt
+  je Spurart (normal startet mit Einzeltönen, Pad mit Akkorden wie bisher). Akkorde kommen aus
+  derselben Quelle wie bei Pads: Folgen aus Lizzio/Callipari oder leitereigen, mit Stimmführung.
+- **Mehrere Steps bearbeiten:** der Dialog hat jetzt die Klaviatur mit Einzelton/Akkord und
+  setzt die ganzen Töne aller markierten Steps (vorher nur den Grundton).
+- **Fester Akkord:** „FEST" (vorher „EIN TON") hält auf Wunsch einen ganzen Akkord für die
+  Spur. Einschalten übernimmt die Töne des Steps, die Klaviatur bearbeitet ihn danach.
+- Die kleine Duplizieren-Taste „⎘" im Spurkopf entfällt; Duplizieren steht im Kontextmenü.
+- Korrektur: RND mit Einzeltönen auf einer Spur, die Akkorde enthielt, ließ deren übrige
+  Töne stehen; jetzt wird der ganze Step gesetzt.
+
+**Presetformat:** neuer optionaler Schlüssel `fixedNotes` für einen festen Akkord. Ein
+einzelner fester Ton wird wie bisher als `fixedNote` gespeichert. Versionen vor 1.17.0
+ignorieren `fixedNotes` und spielen dann die Töne der Steps.
+
+## [1.16.2] — 2026-11-14
+
+### Step-Breite startet in der Mitte
+
+- Der Step-Breiten-Schieber in der Transportleiste steht bei jedem Start auf der Mitte (75 px,
+  50 %). Der zuletzt benutzte Wert wird nicht mehr gespeichert und nicht mehr übernommen.
+  Pinch-Zoom und Schieber wirken während der Sitzung wie bisher.
+
+### Menütasten mit voller Klickfläche
+
+- Alle Tasten, die ein Menü öffnen, reagieren auf ihrer ganzen Fläche, nicht nur beim Treffen
+  der Beschriftung: „MIDI"/„AU" im Spurkopf und im CC-Lane-Kopf, Akkordquelle „▾" neben RND,
+  Auswahlfeld im Mixer-Platz, „+ Spur", Taktzahl der Loop-Spur. Alle übrigen Tasten wurden
+  geprüft und hatten die volle Fläche schon.
+- Intern: ein Test des Snapshot-Erwerbs startet seinen Reader auf einem eigenen Thread; im
+  parallelen Volllauf konnte die globale Queue belegt sein.
+
+## [1.16.1] — 2026-11-14
+
+### Nachprüfung 1.16.0 eingearbeitet (V16-1 bis V16-6)
+
+**Songende ohne Main (V16-1)**
+- Am Songende beendet der Tick selbst alle Wege auf dem geplanten Zeitpunkt: klingende Noten
+  (MIDI und Instrumente) enden spätestens dort, auch über das Ende gehaltene Gates und Drones;
+  MIDI-Stop (0xFC) folgt direkt danach. Main hält danach nur noch Anzeige und Transport an —
+  auch wenn die Oberfläche eine Sekunde hängt, klingt nichts nach.
+
+**Speichern ohne Hänger (V16-2)**
+- Speichern kodiert Loop-Material im Hintergrund. Der Stand beim Speicherbeginn wird
+  gespeichert; Änderungen während des Kodierens bleiben als ungespeichert markiert. Gemessen
+  (Debug, 4 Loops à 4 Takte): synchron 1168 ms, Main-Anteil jetzt 4,4 ms.
+- „Sichern" vor Laden, Neu und Beenden wartet auf den Abschluss.
+
+**Timing (V16-3)**
+- Negative Spuroffsets bis −50 ms wirken auch mit externer Clock vollständig (der EXT-Vorlauf
+  enthält jetzt die Offsetreserve). Spuroffsets sind auf ±50 ms begrenzt, auch beim Laden.
+
+**Messungen und Tests (V16-4, V16-5)**
+- Renderkosten-Test trennt Arbeitskosten (Thread-CPU-Zeit: p95 < 500 µs, Maximum unter der
+  Blockzeit) von Scheduler-Störungen (Wandzeit, Überschreitungen gezählt) und legt p95/p99/max
+  immer als Messdatei ab.
+- Ursache der drei roten Tests im Volllauf behoben: Tests hielten Main im parallelen Lauf
+  bis zu 20 s fest (verschachtelte RunLoops in Main-Jobs, ein 60-s-Schlaf). Sie suspendieren
+  jetzt; die Stop-Tests messen stop() selbst. Volllauf erstmals vollständig grün (614/0).
+- Loop-Renderkosten optimiert gemessen wie bisher (p99 ≈ 640 µs). Offen: parallel zu den
+  Speichertests steigen sie auf p99 ≈ 4,5 ms, Ursache nicht belegt.
+
+**Fehlerbehebung**
+- Der Positionskopf der Loop-Spur läuft jetzt auch bei Wiedergabe, nicht nur bei Aufnahme
+  (Stephan-Meldung). Beim Start hatte der erste Tick den Wiedergabeort noch nicht gesetzt; die
+  Anzeige hielt das für Leerlauf und fragte nicht weiter ab.
+
+**Zerlegung (V16-6)**
+- Der Tick-Kern erreicht vom Rack nur noch Warteschlangen, Loop-Kerne und Taktanker
+  (`TickOutputs`); Zeitumrechnung als eigener Typ `HostTime`.
+
+## [1.16.0] — 2026-11-14
+
+### Zerlegung von Engine und Rack, neues Presetformat, macOS 12
+
+Schließt M4 und einen wesentlichen Teil von M6 des Codex-Reviews (Engine und Rack bleiben
+breit verantwortlich, siehe 1.16.1). Verhalten im Betrieb unverändert; Details und Verträge: ENGINEERING „Zerlegung und Presetformat".
+
+**Presetformat (bricht ältere Presets)**
+- Der Ausgang einer Spur ist ein einziger Fall: MIDI, Instrumentenkanal oder Audio-Loop-Kanal
+  (`output`, Pflicht). Die Quelle eines Kanals ist Instrument oder Audio-Loop (`source`,
+  Pflicht). Ungültige Kombinationen (Loop-Spur an einem Instrument, Instrument mit
+  Loop-Einstellungen) sind nicht mehr darstellbar.
+- Loop-Spuren speichern keine Step-Lane mehr.
+- **Presets und Projekte vor 1.16.0 laden nicht mehr** (bewusste Entscheidung, kein Migrator).
+
+**Zerlegung**
+- `SequencerEngine` gibt Tick-Pfad (`TickKernel`), Snapshot-Publikation (`SnapshotPublisher`),
+  Notenbuch und Ausgabe (`NoteOutput`) sowie Songplanung (`SongPlanner`, `PlanLedger`) an
+  eigene Besitzer ab.
+- `InstrumentRack` gibt den Wächter der Audioausgabe an `OutputWatchdog` ab; das Routing einer
+  Spur prüft der Rack über den Ausgangsfall (`route(for:)`).
+
+**macOS 12**
+- Mindestsystem bleibt macOS 12. Neuere SwiftUI-Aufrufe laufen über kleine Ausweichstellen
+  (`onValueChange`, `hiddenScrollBackground`, Tippen per Ziehgeste, Fenstergröße über
+  Idealmaß, Tastenkürzel ⌥1–⌥9).
+
+**Tests**
+- Formatvertrag und Routingprüfung (`outputAndSourceAreExplicitCases`); Renderkosten-Test
+  prüft p95 statt des schlechtesten Blocks (Ausreißer unter Last).
+
+## [1.15.2] — 2026-11-14
+
+### Nachprüfung eingearbeitet, offene Review-Punkte
+
+Arbeitet die Codex-Nachprüfung von 1.15.1 (R1–R8) und die dort offenen Timing- und
+Architekturbefunde ab. Details und Verträge: ENGINEERING „Nachprüfung und offene Punkte".
+
+**Transport und Song**
+- Jeder Start ist eine eigene Sitzung: Puls 0 und neue Taktanker, auch wenn der Song ohne
+  Main bereits weitergeschaltet hatte (R1).
+- Songwechsel werden der tatsächlich verwendeten Planlinie zugeordnet; ändert sich der Plan,
+  während der Tick noch den alten spielt, hält er definiert an (R6). Song ohne Loop wird bis
+  zum Ende vorausgeplant, mit Loop 16 Wechsel; ein erschöpfter Horizont wird gemeldet (R7).
+- Songende stoppt MIDI, Instrumente und Loops gemeinsam zum geplanten Zeitpunkt (R2).
+- Externer Start (0xFA) startet direkt auf dem MIDI-Thread — der erste Clock-Puls spielt
+  Puls 0, auch wenn die Oberfläche gerade beschäftigt ist.
+
+**Timing**
+- Eine Verspätungsregel für alle Wege: verspätete Ticks verschieben Noten, CCs, MIDI-Clock,
+  Taktanker und Loop-Fenster gemeinsam; MIDI-Clock-Pulse werden nicht mehr verworfen (T2).
+- Negative Spuroffsets wirken richtig (T8); der Vorlauf der internen und externen Clock
+  deckt Ausgabepuffer, negative Offsets und Plug-in-Latenz ab und folgt Gerätewechseln (T3, R8).
+- Plug-in-Latenz je Kanal wird ausgeglichen (Instrument, Effekte, Gate; bis 100 ms): ein
+  Kanal mit Lookahead-Effekt klingt nicht mehr später als ein trockener (T7).
+- Audiogerät und Hostuhr driften: Aufnahme und Wiedergabe folgen dem tatsächlichen
+  Gerätetakt, Drift wird in Einzelschritten ausgeglichen — keine doppelt addierten oder
+  leeren Samples mehr; Mithören regelt seinen Füllstand (T5).
+
+**Audio-Loops**
+- **Latenz messen** (Eingangs-Popover → MESSEN): Klick über ein Kabel vom Ausgang zum
+  Eingang; der Ausgleich wird aus den Gerätezeitstempeln gesetzt (T4/M1).
+- Loop-Zeilen beobachten nur ihren Kanal; im Leerlauf läuft keine Abfrage; Fehler erscheinen
+  nur am betroffenen Kanal (M5).
+- Loop löschen und Durchlauf zurücknehmen sind über Bearbeiten → Widerrufen rückgängig zu
+  machen, gebunden an genau dieses Material (M2).
+- Eingangsblöcke über einen Belegungswechsel schreiben nicht mehr in den neuen Speicher (R3).
+- Loop-Dateien, deren CAF-Format den Metadaten widerspricht, werden abgelehnt (R4).
+- Speicherbudget gilt vor jeder Allokation (Aufnahme, Duplizieren, Undo, Laden, Umrechnen) und
+  zählt jeden lebenden Speicher (R5).
+- Speichern kodiert nicht mehr auf Main: ruhendes Material wird im Hintergrund vorkodiert.
+
+**Oberfläche**
+- Gemeinsame Mute/Solo-Tasten für alle Spurköpfe; Pad-Längen auf Englisch „2 bars" statt
+  „2 T" (N2).
+
+**Architektur**
+- Loop-Material, Kodierung und Wellenform haben einen eigenen Besitzer (`AudioLoopAssets`),
+  Anzeigezustand je Kanal (`AudioLoopDisplay`); das Rack wird schmaler (M6, Teil).
+
+**Tests und Messung**
+- Neu: `TransportPlanTests`, `AudioLoopDriftTests`, weitere Fälle in `AudioLoopSafetyTests`
+  und `AUHostTests`.
+- Gemessen (optimiert, arm64): 16 Loops, 512 Frames bei 48 kHz — median 0,43 ms, p99 0,62 ms
+  je Block (Blockzeit 10,7 ms).
+- Behoben: ein Debug-Prüfpunkt beim Stopp meldete einen harmlosen, sofort abbrechenden Tick
+  als Fehler und brachte den Testlauf zum Absturz.
+- Offen: Gerätenachweise per Kabel-Loopback (Aufnahmelatenz, Plug-in-Latenz, gemeinsamer
+  Onset MIDI/AU/Loop) und Drift über Stunden mit zwei Geräten; M4 (Spurinhalt als eigener Typ,
+  Presetformat) und die Zerlegung von `SequencerEngine` als eigene Pakete.
+
+---
+
+## [1.15.1] — 2026-11-14
+
+### Konsolidierung nach dem Architekturreview
+
+Arbeitet den kritischen Codex-Review vom 14.11.2026 ein (Architektur und Timing). Keine neuen
+Funktionen. Speicher-, Zeit- und Persistenzverträge der Audio-Loops und des Songs sind
+weitgehend festgelegt und getestet; die Nachprüfung fand noch Lücken (Sitzung, Songende,
+Belegungswechsel, CAF, Budget) — geschlossen in 1.15.2.
+
+**Audio-Loops — Speichersicherheit**
+- Freigabe des Loop-Speichers nach demselben Protokoll wie der Playback-Snapshot (S01): kein
+  vorzeitiges Freigeben, kein Retain/Release auf dem Audio-Thread.
+- Mithör-Ring ist ein echter Ein-Schreiber/Ein-Leser-Ring: atomare Indizes, kein Überschreiben
+  ungelesener Daten, verworfene Samples gezählt.
+- Samples atomar: Aufnahme, Wiedergabe, Wellenform und Speichern greifen ohne Datenrennen zu.
+  Undo und Löschen tauschen den Speicher aus statt in den abgespielten Speicher zu schreiben.
+- Undo-Kopie abschnittsweise (1024 Frames) mit festem Budget je Block; nach einem
+  Eingangsaussetzer wird die Lücke weder kopiert noch beim Undo getauscht.
+- Belegungsepoche je Loop-Kanal: Meldungen und Zustände einer früheren Belegung des Slots
+  wirken nicht mehr.
+
+**Timing**
+- Taktanker beginnen je Sitzung im Tick-Thread neu — auch bei MIDI-Start aus dem Stopp und bei
+  Neustart durch den externen Master. MIDI-Start beginnt einen aktiven Song wie Play.
+- Loops verstummen exakt auf dem Puls von Mute, Patternwechsel und Songende (vorher bis zu
+  ¼ Puls Überhang); am Songende enden die Taktanker zur geplanten Zeit, nicht wenn Main reagiert.
+- Song plant bis zu acht Szenenwechsel voraus; der Tick-Thread wechselt ohne Main weiter
+  (vorher nur einen Wechsel). Ein zurückkehrendes Pattern beginnt frisch.
+- Externe Clock: Zeitbezug ist der Zeitstempel des MIDI-Pakets, jeder Puls — auch der erste —
+  mit demselben Vorlauf (10 ms + ein Ausgabepuffer). Vorher Callbackzeit plus geschätztes
+  Pulsintervall und erster Puls ohne Vorlauf.
+- Eingangs- und Ausgangs-Render verarbeiten beliebige Blocklängen.
+
+**Geräte**
+- Eingang startet bei Geräte-/Formatwechsel neu; Status zeigt den echten Zustand.
+- Mikrofonfreigabe: ein verspätet bestätigter Dialog startet den Eingang nur, wenn er noch
+  gebraucht wird.
+- Wechselt die Ausgaberate, wird ruhendes Loop-Material umgerechnet; Material mit falscher
+  Rate spielt nicht (statt falsch schnell).
+
+**Projekt**
+- Loop-Metadaten werden vor jeder Speicheranlage geprüft (keine Abstürze/Riesenallokationen
+  bei manipulierten Dateien); Gesamtbudget 1 GB Loop-Speicher je Projekt.
+- Kann Loop-Material nicht kodiert werden, schlägt das Speichern sichtbar fehl.
+- Nicht ladbares Loop-Material bleibt erhalten, wird gemeldet und beim Speichern unverändert
+  zurückgeschrieben.
+- Überpegel aus Overdub wird vor der 24-Bit-Speicherung skaliert statt abgeschnitten
+  (neuer optionaler Schlüssel `scale` in `audioLoops`; ältere Versionen spielen solches Material
+  leiser). NaN/∞ werden als Stille gespeichert.
+- Undo von „Audio-Loop-Spur hinzufügen" entfernt auch den angelegten Kanal; Redo bringt ihn mit
+  Material zurück.
+
+**Tests und Messung**
+- Neue `AudioLoopSafetyTests` (15) und `AudioLoopRenderCostTests`, Song über mehrere Grenzen
+  ohne Main, EXT-Paketzeit. Playback-Baseline zählt jetzt unabhängig die gespielten Noten.
+- Gemessen (optimiert, arm64): 16 gleichzeitig aufnehmende Loops, 512 Frames bei 48 kHz —
+  median 0,44 ms, p99 0,67 ms je Block (Blockzeit 10,7 ms).
+- Offen: Messung mit Kabel-Loopback am Interface (Aufnahmelatenz), Drift getrennter Geräte,
+  Latenz je Route, gemeinsame Überlastpolitik für Noten/Clock/Anker.
+
+---
+
+## [1.15.0] — 2026-11-14
+
+### Audio-Loop-Spur
+
+**Neu**
+- **Audio-Loop-Spur** („Audio-Loop-Spur hinzufügen" im Plus- und im Spurmenü): nimmt vom
+  Audioeingang einen Loop fester Länge auf (1, 2, 4, 8 oder 16 Takte), taktgenau zum Sequencer.
+  Jede Audio-Loop-Spur bekommt einen eigenen Mixer-Kanal mit Effekten, Fader, Panorama,
+  Solo und Pegelanzeige; der Loop gilt für alle Patterns, je Pattern über Mute schaltbar.
+- **Aufnahme während der Wiedergabe:** REC oder Taste **R** schaltet scharf; die Aufnahme
+  beginnt am nächsten Takt und schichtet in jedem Durchlauf weiter (Overdub), bis sie beendet
+  wird — erneut REC/R beendet sie am Ende des laufenden Durchlaufs. Ein- und Ausblenden an den
+  Rändern, kein Knacken.
+- **UNDO** nimmt den letzten Durchlauf zurück (erneut: wiederherstellen), **CLR** löscht den Loop.
+- **Eingang:** Kanal (Mono) oder Kanalpaar (Stereo) des Audiogeräts, **MON** zum Mithören über
+  den Kanalzug, Latenzausgleich (Gerätelatenz automatisch, dazu ein Feinwert in ms).
+- **Gate** gegen Störgeräusche, wahlweise am Eingang (vor Mithören und Aufnahme), vor oder
+  nach dem Fader; Schwelle, Ausklingen, Halten einstellbar.
+- Das Mikrofon ist nur aktiv, solange eine Spur scharf ist, aufnimmt oder mithört. Beim ersten
+  Mal fragt macOS nach der Freigabe.
+
+**Grenzen**
+- Keine Zeitdehnung: läuft der Sequencer langsamer als bei der Aufnahme, bleibt der Rest jedes
+  Takts still; schneller, entfällt das Taktende. Länge höchstens 120 s.
+- Ein- und Ausgang müssen mit derselben Abtastrate laufen.
+
+**Presetformat:** neue optionale Schlüssel `audioLoop` (Spur, Kanal-Einstellungen) und
+`audioLoops` (Material, Apple Lossless 24 Bit als Base64). Ältere Versionen laden solche
+Dateien; die Audio-Loop-Spur erscheint dort als leere Step-Spur, der Kanal ohne Instrument.
+
+---
+
 ## [1.14.0] — 2026-11-14
 
 ### Song-Lane und 16 Patterns

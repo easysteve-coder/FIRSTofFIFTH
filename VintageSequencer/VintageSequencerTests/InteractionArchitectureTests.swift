@@ -687,9 +687,9 @@ struct InteractionControllerTests {
         let contentUnit: CGFloat = 1000
         ic.beginRatioDrag(track: track, contentUnit: contentUnit, baseRatioIndex: 6)
 
-        // Large positive drag → should land on last ratio (2,1)
+        // Large positive drag → longest length (v1.18.29: lange Steps, 8 Takte = 128/1)
         ic.updateRatioDrag(totalX: 1_000_000, track: track)
-        #expect(track.lane.stepLengthNumerator   == 2)
+        #expect(track.lane.stepLengthNumerator   == 128)
         #expect(track.lane.stepLengthDenominator == 1)
     }
 
@@ -733,7 +733,7 @@ struct InteractionControllerTests {
 
         // Drag to large ratio
         ic.updateRatioDrag(totalX: 1_000_000, track: track)
-        #expect(track.lane.stepLengthNumerator == 2)
+        #expect(track.lane.stepLengthNumerator == 128)
 
         ic.cancelRatioDrag(track: track)
         #expect(track.lane.stepLengthNumerator   == 1)   // restored

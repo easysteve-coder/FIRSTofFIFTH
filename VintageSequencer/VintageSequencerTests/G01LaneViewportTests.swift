@@ -57,9 +57,9 @@ struct G01LaneViewportTests {
     /// Wartet per `await` (der Main-Thread bleibt für andere Tests/Dispatch frei, kein blockierender RunLoop).
     private func pump(_ host: NSView, _ t: TimeInterval = 0.4) async {
         host.layoutSubtreeIfNeeded()
-        try? await Task.sleep(for: .milliseconds(Int(t * 1000)))
+        try? await Task.sleep(nanoseconds: UInt64(Int(t * 1000) * 1_000_000))
         host.layoutSubtreeIfNeeded()
-        try? await Task.sleep(for: .milliseconds(80))
+        try? await Task.sleep(nanoseconds: UInt64(80) * 1_000_000)
         host.layoutSubtreeIfNeeded()
     }
 
@@ -365,7 +365,7 @@ struct G01ViewportControllerTests {
         vc.reportLaneShapes([LaneShape(stepCount: 10)])
         vc.reportLaneShapes([LaneShape(stepCount: 34)])          // überholt die erste Meldung
         #expect(vc.maxScrollOffset == .greatestFiniteMagnitude)   // noch nichts angewendet (nie synchron)
-        try? await Task.sleep(for: .milliseconds(50))
+        try? await Task.sleep(nanoseconds: UInt64(50) * 1_000_000)
         #expect(vc.maxScrollOffset == 1500)
         #expect(vc.laneMetrics.shapes == [LaneShape(stepCount: 34)])
     }
@@ -516,7 +516,7 @@ struct G01ScrollbarBridgeTests {
     private func settle(_ host: NSView) async {
         host.layoutSubtreeIfNeeded()
         RunLoop.main.run(until: Date().addingTimeInterval(0.15))
-        try? await Task.sleep(for: .milliseconds(80))
+        try? await Task.sleep(nanoseconds: UInt64(80) * 1_000_000)
         host.layoutSubtreeIfNeeded()
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
     }
@@ -592,9 +592,9 @@ struct G01LaneRenderTests {
 
     private func pump(_ host: NSView) async {
         host.layoutSubtreeIfNeeded()
-        try? await Task.sleep(for: .milliseconds(250))
+        try? await Task.sleep(nanoseconds: UInt64(250) * 1_000_000)
         host.layoutSubtreeIfNeeded()
-        try? await Task.sleep(for: .milliseconds(80))
+        try? await Task.sleep(nanoseconds: UInt64(80) * 1_000_000)
         host.layoutSubtreeIfNeeded()
     }
 

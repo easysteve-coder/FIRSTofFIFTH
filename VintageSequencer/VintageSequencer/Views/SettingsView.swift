@@ -85,7 +85,7 @@ struct SettingsView: View {
                         .labelsHidden()
                         .pickerStyle(.menu)
                         .frame(width: 220)
-                        .onChange(of: midi.selectedInput) { _, ep in
+                        .onValueChange(of: midi.selectedInput) { ep in
                             midi.connectInput(ep)
                         }
                     }

@@ -39,7 +39,16 @@ final class PresetEditorState: ObservableObject {
     //
     // True sobald patterns/bpm/swing seit dem letzten Save/Load geändert wurden.
     // Wird von TransportView als oranger Punkt neben dem Dateinamen angezeigt.
-    @Published var hasUnsavedChanges: Bool = false
+    @Published var hasUnsavedChanges: Bool = false {
+        didSet { if hasUnsavedChanges { changeEpoch &+= 1 } }
+    }
+    /// Zählt jede Änderungsmeldung (v1.16.1): ein asynchrones Speichern setzt den
+    /// Indikator nur zurück, wenn seit seinem Beginn keine Änderung kam.
+    private(set) var changeEpoch = 0
+    /// Änderung melden, ohne `objectWillChange` erneut auszulösen, wenn schon markiert.
+    func markChanged() {
+        if hasUnsavedChanges { changeEpoch &+= 1 } else { hasUnsavedChanges = true }
+    }
 
     // MARK: - Aktuell geladene/gespeicherte Datei
     //

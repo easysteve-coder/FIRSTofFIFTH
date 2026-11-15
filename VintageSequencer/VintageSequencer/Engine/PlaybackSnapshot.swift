@@ -112,6 +112,65 @@ struct LaneSnapshot: Sendable {
     let pulsesPerStep: Double          // > 0, geclampt vor Speicherung
     /// Kind-abhängige Payload — Step-Steps oder CC-Werte/Nummer/Mute.
     let payload:       LaneSnapshotPayload
+    /// Steplänge „Gruppe" (v1.18.30): Länge je Step zyklisch aus der Gruppierung; leer =
+    /// alle Steps `pulsesPerStep`.
+    var groups:        StepGroups = StepGroups()
+
+    /// Pulse von Step `k` (Tick-Pfad, ohne Allokation).
+    @inline(__always)
+    func pulses(ofStep k: Int) -> Double {
+        groups.count == 0 ? pulsesPerStep : groups.pulses(at: k)
+    }
+    /// Pulse eines ganzen Durchlaufs (Drone).
+    @inline(__always)
+    func cyclePulses() -> Double {
+        guard groups.count > 0 else { return pulsesPerStep * Double(stepCount) }
+        var sum = 0.0
+        for k in 0..<stepCount { sum += groups.pulses(at: k) }
+        return sum
+    }
+}
+
+/// Bis zu 8 Gruppenlängen in Pulsen als festes Tupel (v1.18.30): der Tick liest sie ohne
+/// Allokation und ohne Array-Zugriff über Referenzen.
+struct StepGroups: Sendable {
+    private(set) var count = 0
+    private var p: (Double, Double, Double, Double, Double, Double, Double, Double) = (0, 0, 0, 0, 0, 0, 0, 0)
+
+    init() {}
+    /// Main: Längen in Pulsen (> 0), höchstens 8 werden übernommen.
+    init(_ pulses: [Double]) {
+        count = min(8, pulses.count)
+        for (i, v) in pulses.prefix(8).enumerated() {
+            let x = max(0.001, v)
+            switch i {
+            case 0: p.0 = x
+            case 1: p.1 = x
+            case 2: p.2 = x
+            case 3: p.3 = x
+            case 4: p.4 = x
+            case 5: p.5 = x
+            case 6: p.6 = x
+            default: p.7 = x
+            }
+        }
+    }
+
+    /// Länge der Gruppe für Step `k` (zyklisch, auch für negative k). Nur mit count > 0.
+    @inline(__always)
+    func pulses(at k: Int) -> Double {
+        let i = ((k % count) + count) % count
+        switch i {
+        case 0: return p.0
+        case 1: return p.1
+        case 2: return p.2
+        case 3: return p.3
+        case 4: return p.4
+        case 5: return p.5
+        case 6: return p.6
+        default: return p.7
+        }
+    }
 }
 
 // MARK: - TrackSnapshot
@@ -126,6 +185,10 @@ struct ParameterTarget: Sendable, Equatable {
     let address: UInt64
     let min: Float
     let max: Float
+    /// Platz im Block `InstrumentRack.effectQueues` (v1.17.1); −1 = Instrument des Kanals.
+    var queue: Int = -1
+    /// Belegung dieses Platzes, für die geplant wird (nur bei `queue >= 0`).
+    var epoch: UInt32 = 0
 }
 
 struct TrackSnapshot: Sendable {
@@ -154,10 +217,15 @@ struct TrackSnapshot: Sendable {
     /// anderes Instrument, Parameter fehlt): die Lane sendet dann NICHTS — nicht still
     /// MIDI-CC statt des gewählten Parameters (v1.13.13).
     let ccUnresolved:  Bool
+    /// Audio-Loop-Spur (v1.15.0): der Tick-Thread markiert nur das Zeitfenster, in dem der
+    /// Loop-Kern `route` klingt; keine Steps, keine Ereignisse.
+    let isAudioLoop:   Bool
 
     init(lane: LaneSnapshot, midiChannel: Int, isMuted: Bool, isSolo: Bool,
          timingOffset: Double, slot: Int = -1, epoch: UInt32 = 0, route: Int = -1,
-         routeEpoch: UInt32 = 0, parameter: ParameterTarget? = nil, ccUnresolved: Bool = false) {
+         routeEpoch: UInt32 = 0, parameter: ParameterTarget? = nil, ccUnresolved: Bool = false,
+         isAudioLoop: Bool = false) {
+        self.isAudioLoop = isAudioLoop
         self.parameter = parameter
         self.routeEpoch = routeEpoch
         self.ccUnresolved = ccUnresolved
@@ -173,6 +241,15 @@ struct TrackSnapshot: Sendable {
 struct PatternSnapshot: Sendable {
     let tracks:  [TrackSnapshot]
     let hasSolo: Bool              // vorberechnet — kein contains() im Hot Path
+    /// Taktart dieses Patterns (v1.18.23, Konzept Taktart und Zeit 4.1). Der Tick übernimmt sie
+    /// beim Öffnen eines Abschnitts. Bis zur Taktart je Pattern (Paket 3) = Projekttaktart.
+    let meter:   TimeSignature
+    /// Pattern-Platz 0…15 (Anzeige des Abschnitts); −1 = unbekannt.
+    let pattern: Int
+
+    init(tracks: [TrackSnapshot], hasSolo: Bool, meter: TimeSignature = .common, pattern: Int = -1) {
+        self.tracks = tracks; self.hasSolo = hasSolo; self.meter = meter; self.pattern = pattern
+    }
 }
 
 // MARK: - PlaybackStateBundle
@@ -192,6 +269,12 @@ struct PlaybackStateBundle: Sendable {
     let snapshot: PatternSnapshot
     let bpm:      Double
     let swing:    Double
+    /// Taktart (v1.18.12). Der Tick-Thread übernimmt sie zu Beginn einer Sitzung; geändert
+    /// wird sie nur im Stillstand.
+    let meter:    TimeSignature
+    /// Manueller Wechsel (`switchAtPulse` −1) auf dem nächsten Taktstrich statt am Ende von
+    /// Spur 1 (v1.18.24, Entscheidung E3).
+    let switchOnBar: Bool
     /// Aktivierungsnummer des Patterns in `snapshot`. Erhöht sich bei jedem vollzogenen
     /// Patternwechsel und jedem Session-Start.
     let serial:   Int
@@ -204,13 +287,70 @@ struct PlaybackStateBundle: Sendable {
     let switchAtPulse: Int
     /// Song-Ende ohne Loop: ab diesem Puls schlägt der Tick-Thread nichts mehr an. −1 = nie.
     let stopAtPulse:   Int
+    /// Song (v1.15.1, Codex H3): weitere vorausgeplante Wechsel nach `queued`, in Reihenfolge.
+    /// Der Tick-Thread geht sie ohne Main durch (Aktivierung `serial + 2`, `+ 3`, …); Main
+    /// zieht nur nach und füllt den Horizont wieder auf.
+    let later:         [PlanStep]
 
-    init(snapshot: PatternSnapshot, bpm: Double, swing: Double,
-         serial: Int = 0, queued: PatternSnapshot? = nil,
-         switchAtPulse: Int = -1, stopAtPulse: Int = -1) {
-        self.snapshot = snapshot; self.bpm = bpm; self.swing = swing
+    struct PlanStep: Sendable {
+        let snapshot:      PatternSnapshot
+        let switchAtPulse: Int
+    }
+
+    /// Anzahl vorausgeplanter Wechsel (`queued` + `later`).
+    var planCount: Int { queued == nil ? 0 : 1 + later.count }
+
+    /// Snapshot der Aktivierung `serial + k` (0 = `snapshot`); nil außerhalb des Plans.
+    @inline(__always)
+    func plannedSnapshot(_ k: Int) -> PatternSnapshot? {
+        if k == 0 { return snapshot }
+        if k == 1 { return queued }
+        return k - 2 < later.count && k >= 2 ? later[k - 2].snapshot : nil
+    }
+
+    /// Wechselpuls in die Aktivierung `serial + k` (k ≥ 1); −1 = an der Track-0-Grenze.
+    @inline(__always)
+    func switchPulse(_ k: Int) -> Int { k == 1 ? switchAtPulse : later[k - 2].switchAtPulse }
+
+    // MARK: Identität (v1.15.2, Codex R1/R6/R7)
+
+    /// Wiedergabe-Sitzung. Getrennt von der Aktivierungsnummer: eine neue Sitzung erkennt der
+    /// Tick-Thread an diesem Wert, nicht an einer höheren `serial` (die kann ein schon ohne
+    /// Main vollzogener Songwechsel ebenfalls erreicht haben).
+    let session: UInt32
+    /// Plan-Linie. Gleich bleibt sie, solange Main den Plan nur fortschreibt (Nachziehen,
+    /// Horizont auffüllen); jede inhaltliche Änderung (Vormerkung, Song) bekommt eine neue.
+    let planID: UInt32
+    /// Vorgänger-Linie samt ihrer geplanten Snapshots: Hat der Tick-Thread unter ihr schon
+    /// gewechselt, ohne dass Main es vor dem Bau dieses Bundles gesehen hat, spielt er den dort
+    /// erreichten Schritt weiter und wartet auf Main, statt ihn dem neuen Plan zuzuordnen.
+    let prevPlanID: UInt32
+    let prevBase:   Int
+    let prevSteps:  [PatternSnapshot]
+    /// Puls, auf dem nach dem letzten geplanten Schritt der nächste Wechsel fällig wäre
+    /// (−1 = keiner). Erreicht der Tick ihn ohne neuen Plan: Horizont erschöpft (gezählt).
+    let planEndPulse: Int
+
+    init(snapshot: PatternSnapshot, bpm: Double, swing: Double, meter: TimeSignature = .common,
+         switchOnBar: Bool = false, serial: Int = 0, queued: PatternSnapshot? = nil,
+         switchAtPulse: Int = -1, stopAtPulse: Int = -1, later: [PlanStep] = [],
+         session: UInt32 = 0, planID: UInt32 = 0,
+         prevPlanID: UInt32 = 0, prevBase: Int = 0, prevSteps: [PatternSnapshot] = [],
+         planEndPulse: Int = -1) {
+        self.snapshot = snapshot; self.bpm = bpm; self.swing = swing; self.meter = meter
+        self.switchOnBar = switchOnBar
         self.serial = serial; self.queued = queued
         self.switchAtPulse = switchAtPulse; self.stopAtPulse = stopAtPulse
+        self.later = queued == nil ? [] : later
+        self.session = session; self.planID = planID
+        self.prevPlanID = prevPlanID; self.prevBase = prevBase; self.prevSteps = prevSteps
+        self.planEndPulse = planEndPulse
+    }
+
+    /// Alle geplanten Snapshots (für `prevSteps` des Nachfolgers). Main.
+    var plannedSnapshots: [PatternSnapshot] {
+        guard let q = queued else { return [] }
+        return [q] + later.map(\.snapshot)
     }
 }
 

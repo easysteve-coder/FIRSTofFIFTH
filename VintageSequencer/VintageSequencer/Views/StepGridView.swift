@@ -52,6 +52,8 @@ struct StepGridView: View {
     /// Scroll-Offset zum Ereigniszeitpunkt (Gesten) — bewusst ohne Beobachtung.
     private var scrollOffsetNow: CGFloat { engine.scrollState.hScrollOffset }
     @Environment(\.undoManager) private var undoManager
+    @AppStorage("appLanguage") private var lang: String = "en"
+    private var s: Str { Str(lang) }
     /// Step, dessen Edit-Card offen ist (Rechtsklick, ctrl+Klick, ⌥+Klick).
     @State private var editIndex: Int?
 
@@ -110,7 +112,7 @@ struct StepGridView: View {
                     // ── Beat-Linien (P3/Zoom-Fix) ─────────────────────────
                     // Kein Scroll im Canvas selbst — .offset(x:) übernimmt das,
                     // analog zur VStack-Gruppe darunter.
-                    StepBeatLinesView(stepWidthSize: stepWidthState.size)
+                    StepBeatLinesView(stepWidthSize: stepWidthState.size, meter: engine.timeSignature)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .laneScrollShift()
                         .allowsHitTesting(false)
@@ -329,9 +331,12 @@ struct StepGridView: View {
             .equatable()    // P3: nur bei isCurrentStep / isSelected / width re-rendern
             .overlay(alignment: .topTrailing) {
                 // Pad-Lane: Länge jedes Steps sichtbar, folgt dem Ziehen live (v1.13.18).
-                if track.lane.isPad {
-                    Text(TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
-                                              den: track.lane.stepLengthDenominator))
+                if track.lane.isLongStep {
+                    // „Gruppe": jeder Step zeigt seine eigene Länge (3/8, 4/8 …).
+                    Text(track.lane.stepGroup
+                         ? s.noteValue(num: Int(track.lane.sixteenths(ofStep: i, meter: engine.timeSignature)),
+                                       den: 1, meter: engine.timeSignature)
+                         : s.laneLength(track.lane, meter: engine.timeSignature))
                         .font(.system(size: 8, weight: .semibold, design: .monospaced))
                         .foregroundColor(accentColor.opacity(0.85))
                         .padding(.top, 4)
@@ -341,10 +346,9 @@ struct StepGridView: View {
             }
             .overlay(alignment: .bottom) {
                 // Pad-Lane: lange Steps zeigen, wie weit der laufende Step ist.
-                if isCurrent && track.lane.isPad {
+                if isCurrent && track.lane.isLongStep {
                     PadProgressBar(seconds: 60.0 / max(1, engine.bpm)
-                                            * Double(track.lane.stepLengthNumerator)
-                                            / Double(track.lane.stepLengthDenominator) / 4.0,
+                                            * track.lane.sixteenths(ofStep: i, meter: engine.timeSignature) / 4.0,
                                    color: accentColor)
                 }
             }
@@ -411,7 +415,7 @@ struct StepGridView: View {
                                 notes:    newNotes,
                                 channel:  track.midiChannel,
                                 velocity: track.lane.steps[i].velocity,
-                                route:    engine.rack.route(for: track.instrumentID)
+                                route:    engine.rack.route(for: track.data.output)
                             )
                         }
                     } else if case .stepSwap = interactionController.activeSession {
@@ -461,6 +465,8 @@ struct StepGridView: View {
 struct StepBeatLinesView: View {
 
     let stepWidthSize: Double
+    /// Taktart (v1.18.12): Linie je Schlag, kräftiger auf dem Taktstrich.
+    var meter: TimeSignature = .common
 
     private var naturalSlotSize: CGFloat {
         CGFloat(stepWidthSize) + VintageTheme.stepSpacing
@@ -469,10 +475,16 @@ struct StepBeatLinesView: View {
     var body: some View {
         let slotSize  = naturalSlotSize
         let lineColor = Color(red: 0.55, green: 0.42, blue: 0.20).opacity(0.45)
+        let barColor  = Color(red: 0.75, green: 0.56, blue: 0.24).opacity(0.75)
         let style     = StrokeStyle(lineWidth: 1.0)
+        let beat      = max(1, meter.sixteenthsPerBeat)
+        let bar       = max(beat, meter.sixteenthsPerBar)
+        // Gruppierung (v1.18.30): Linien an den Gruppengrenzen statt je Schlag.
+        let groups    = meter.grouping == nil ? nil : meter.groupSixteenths
 
         Canvas { ctx, size in
-            // Beat-Linien alle 4 Steps, linksbündig zur HStack-Padding-Grenze (8px).
+            // Beat-Linien je Schlag der Taktart (4/4: alle 4 Steps), Taktstrich kräftiger;
+            // linksbündig zur HStack-Padding-Grenze (8px).
             // Kein Scroll-Abzug: wird per .offset(x: -hScrollOffset) auf dem Container erledigt.
             var i = 0
             while true {
@@ -485,9 +497,17 @@ struct StepBeatLinesView: View {
                     var path = Path()
                     path.move(to:    CGPoint(x: x, y: 0))
                     path.addLine(to: CGPoint(x: x, y: size.height))
-                    ctx.stroke(path, with: .color(lineColor), style: style)
+                    ctx.stroke(path, with: .color(i % bar == 0 ? barColor : lineColor), style: style)
                 }
-                i += 4
+                if let groups {
+                    // Nächste Gruppengrenze im Takt: Summe der Gruppen bis über die Lage im Takt.
+                    let inBar = i % bar
+                    var edge = 0
+                    for g in groups { edge += max(1, g); if edge > inBar { break } }
+                    i += max(1, edge - inBar)
+                } else {
+                    i += beat
+                }
             }
         }
     }

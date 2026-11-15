@@ -37,8 +37,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: s.cancel)
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            engine.savePreset()
-            return engine.hasUnsavedChanges ? .terminateCancel : .terminateNow
+            // Speichern läuft asynchron (v1.16.1): beenden erst nach dem Schreiben.
+            engine.savePreset { ok in
+                sender.reply(toApplicationShouldTerminate: ok && !engine.hasUnsavedChanges)
+            }
+            return .terminateLater
         case .alertSecondButtonReturn:
             return .terminateNow
         default:
@@ -71,8 +74,19 @@ private struct MuteMenuItem: View {
         }
         // Kürzel ⌥1…⌥9 nur für die ersten neun Spuren: `Character("10")` ist kein
         // einzelnes Zeichen und bricht beim Menüaufbau ab.
-        .keyboardShortcut(number <= 9 ? KeyboardShortcut(KeyEquivalent(Character(String(number))),
-                                                         modifiers: .option) : nil)
+        .modifier(OptionDigitShortcut(number: number))
+    }
+}
+
+/// ⌥1…⌥9 (ab macOS 12: ohne die optionale `keyboardShortcut(_:)`-Variante aus 12.3).
+private struct OptionDigitShortcut: ViewModifier {
+    let number: Int
+    func body(content: Content) -> some View {
+        if number <= 9 {
+            content.keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .option)
+        } else {
+            content
+        }
     }
 }
 
@@ -111,6 +125,8 @@ struct VintageSequencerApp: App {
     var body: some Scene {
         WindowGroup("FIRSTofFIFTH") {
             MainView()
+                // Anfangsgröße des Fensters (statt `defaultSize`, das es erst ab macOS 13 gibt).
+                .frame(idealWidth: 1200, idealHeight: 700)
                 .environmentObject(notesStore)
                 .environmentObject(engine)
                 .environmentObject(engine.transportState)
@@ -138,7 +154,6 @@ struct VintageSequencerApp: App {
                     #endif
                 }
         }
-        .defaultSize(width: 1200, height: 700)
         .commands {
             // Remove "New Window" from File menu — single-window app
             CommandGroup(replacing: .newItem) {
@@ -197,6 +212,9 @@ struct VintageSequencerApp: App {
                     engine.isPlaying ? engine.stop() : engine.play()
                 }
                 .keyboardShortcut(.space, modifiers: [])
+
+                Button(s.loopRecordMenuItem) { engine.toggleAudioLoopRecording() }
+                    .keyboardShortcut("r", modifiers: [])
 
                 Divider()
 

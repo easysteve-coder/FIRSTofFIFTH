@@ -18,9 +18,11 @@ FIRSTofFIFTH into *Applications*. *Auf der Release-Seite unter **Assets** die
 
 ## What's new
 
-**1.14.0** — Song lane: chain scenes (pattern + length in bars) above all tracks; patterns change
-exactly on the bar line; loop or stop at the end. 16 patterns (A–P) instead of 4. Pad tracks get
-their own display width and look. Download: [latest release](https://github.com/easysteve-coder/FIRSTofFIFTH/releases/latest).
+**1.18.32** — Since 1.14: audio loop tracks with time-stretching; time signature per pattern
+and free grouping of odd meters (7/8 as 3+4 …), per pattern or per track; step lengths as note
+values and long steps on every track; Apple Sampler (EXS/SoundFont/DLS) with drum choke groups;
+channel EQ; plug-ins follow FoF's clock; crashed plug-ins are reloaded automatically. Presets
+from before 1.16.0 no longer load. Download: [latest release](https://github.com/easysteve-coder/FIRSTofFIFTH/releases/latest).
 
 All changes: [`CHANGELOG.en.md`](VintageSequencer/CHANGELOG.en.md) (English) ·
 [`CHANGELOG.md`](VintageSequencer/CHANGELOG.md) (German, detailed).
@@ -31,11 +33,14 @@ All changes: [`CHANGELOG.en.md`](VintageSequencer/CHANGELOG.en.md) (English) ·
   play direction, timing offset.
 - **Steps:** chords, velocity, gate, probability, ratchets, drone steps that
   hold across the whole track length, hold steps, scale quantisation.
-- **Pad tracks:** steps from a quarter note to 8 bars for pads and drones, own display width;
-  RND rolls chord progressions (from Lizzio's *Chord Progression Codex* and
-  Callipari's *Illustrierte Harmonie*, or from the track's scale).
-- **Lanes:** note lanes and CC lanes; a CC lane can drive an instrument
-  parameter directly.
+- **Long steps** on every track, from a beat to 8 bars, for pads and drones; RND rolls single
+  notes or chord progressions (from Lizzio's *Chord Progression Codex* and Callipari's
+  *Illustrierte Harmonie*, or from the track's scale).
+- **Time signatures:** per pattern, odd meters grouped freely (per pattern or per track).
+- **Lanes:** note lanes and CC lanes; a CC lane can drive an instrument or
+  effect parameter directly.
+- **Audio loop tracks:** record loops from the audio input, locked to the bar, with overdub and
+  time-stretching.
 - **16 patterns (A–P)**, switched quantised while playing.
 - **Song lane:** a sequence of scenes (pattern + bars) above all tracks; patterns change exactly on
   the bar line, loop or stop at the end.
@@ -43,16 +48,17 @@ All changes: [`CHANGELOG.en.md`](VintageSequencer/CHANGELOG.en.md) (English) ·
   MIDI clock (24 PPQN). All events are scheduled ahead with CoreMIDI host
   timestamps.
 - **Audio Unit hosting:** instrument rack with effect chain per channel,
-  mixer with channel strips, solo, meters and master bus; plug-in editors in
-  their own windows.
+  mixer with channel strips, channel EQ, solo, meters and master bus; plug-in editors in
+  their own windows; Apple Sampler with EXS, SoundFont and DLS.
 - **MIDI Learn**, undo/redo for sequencer edits, presets as JSON.
 
 ## Requirements
 
-- macOS 14.6 or later
-- Xcode 26 or later
+- macOS 12 or later (Intel and Apple silicon)
+- Xcode 16 or later to build (project format 77; developed with Xcode 27)
 - Dependency: [swift-atomics](https://github.com/apple/swift-atomics),
-  resolved automatically by Swift Package Manager
+  resolved automatically by Swift Package Manager. Signalsmith Stretch and
+  Signalsmith Linear (MIT) are included as headers in `ThirdParty/`.
 
 ## Building
 
@@ -101,4 +107,11 @@ Copyright © 2026 Stephan Schmitt
 
 FIRSTofFIFTH is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
-Foundation, version 3. See [`LICENSE`](LICENSE).
+Foundation, either version 3 of the License, or (at your option) any later
+version (GPL-3.0-or-later). See [`LICENSE`](LICENSE).
+
+Third-party components (swift-atomics, Apache 2.0 with Runtime Library
+Exception; Signalsmith Stretch and Signalsmith Linear, MIT) and their notices:
+[`VintageSequencer/VintageSequencer/Licenses/THIRD_PARTY_NOTICES.md`](VintageSequencer/VintageSequencer/Licenses/THIRD_PARTY_NOTICES.md).
+Audio Unit plug-ins and sample libraries you use with FIRSTofFIFTH are not part
+of it and keep their own licenses.

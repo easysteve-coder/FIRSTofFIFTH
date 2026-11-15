@@ -63,10 +63,18 @@ final class ClockSource {
 
     var isRunning: Bool { state.running.load(ordering: .acquiring) }
 
+    /// Zusätzlicher Vorlauf in ns (v1.15.2): Ausgabepuffer + negativer Spuroffset. Wirkt nur
+    /// auf den Aufrufzeitpunkt des Ticks, nie auf sein Raster; jederzeit änderbar.
+    var extraLeadNs: Double {
+        get { Double(bitPattern: state.extraLeadBits.load(ordering: .relaxed)) }
+        set { state.extraLeadBits.store(max(0, min(200_000_000, newValue)).bitPattern, ordering: .relaxed) }
+    }
+
     // MARK: - Geteilter Zustand
 
     fileprivate final class State: @unchecked Sendable {
         let bpmBits    = ManagedAtomic<UInt64>((120.0).bitPattern)
+        let extraLeadBits = ManagedAtomic<UInt64>((0.0).bitPattern)
         /// Jede start()/stop()-Flanke erhöht die Generation; ein Thread läuft nur, solange
         /// seine Generation aktuell ist.
         let generation = ManagedAtomic<Int>(0)
@@ -139,9 +147,11 @@ final class ClockSource {
 
     private static func run(state: State, generation: Int) {
         requestRealtime(periodMach: tickIntervalMach(state))
-        let margin = emitMarginNs * nsToMach
+        func margin() -> Double {
+            (emitMarginNs + Double(bitPattern: state.extraLeadBits.load(ordering: .relaxed))) * nsToMach
+        }
         // T(0): ein Intervall + Marge in der Zukunft, damit schon der erste Tick den vollen Vorlauf hat.
-        var tickTime = Double(mach_absolute_time()) + tickIntervalMach(state) + margin
+        var tickTime = Double(mach_absolute_time()) + tickIntervalMach(state) + margin()
 
         // Einmal laden: onTick ändert sich während des Laufs nicht (Vertrag der Property);
         // so entfällt Retain/Release der Closure pro Tick.
@@ -149,6 +159,7 @@ final class ClockSource {
 
         while state.generation.load(ordering: .acquiring) == generation {
             let interval = tickIntervalMach(state)
+            let margin = margin()
             // Ausgabezeitpunkt dieses Ticks: Marge vor dem Zeitpunkt des vorherigen Ticks.
             let emitAt = tickTime - interval - margin
             let now    = Double(mach_absolute_time())

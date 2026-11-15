@@ -32,80 +32,31 @@ struct CornerHandlesView: View {
     /// Nur Aufrufe, keine Darstellung → einfache Referenz statt Beobachtung.
     private var interactionController: InteractionController { engine.interactionController }
     @Environment(\.undoManager) private var undoManager
+    @AppStorage("appLanguage") private var lang: String = "en"
+    private var s: Str { Str(lang) }
 
     /// Ziehen am Längen-Anfasser läuft (nur Anzeige): bei Pad-Lanes erscheint die Länge
     /// am Anfasser, weil sich die Breite im kompakten Raster nicht ändert (v1.13.18).
     @State private var isDraggingLength = false
 
     private var currentRatioIndex: Int {
-        track.lane.ratioOptions.firstIndex(where: {
-            $0.num == track.lane.stepLengthNumerator && $0.den == track.lane.stepLengthDenominator
-        }) ?? (track.lane.ratioOptions.count / 2)
+        let options = track.lane.ratioOptions(engine.timeSignature)
+        // Nächstliegender Wert (v1.18.31: eigene Brüche stehen nicht in der Liste).
+        let v = track.lane.stepSixteenths
+        return options.indices.min(by: {
+            abs(Double(options[$0].num) / Double(options[$0].den) - v)
+                < abs(Double(options[$1].num) / Double(options[$1].den) - v)
+        }) ?? 0
     }
 
     var body: some View {
         VStack(spacing: 0) {
 
-            // ── Top: Ratio Handle (Arch-Slice-2 — neue Architektur) ──────────
-            //
-            // onStart: Berechnet contentUnit einmalig bei Drag-Start und übergibt
-            //          sie zusammen mit baseRatioIndex an InteractionController.
-            //          Die Werte landen in RatioDragSession — kein Binding nötig.
-            //
-            // onDrag:  updateRatioDrag leitet totalX weiter; der Controller
-            //          berechnet den nächstgelegenen Ratio-Index via
-            //          HandleDragLogic.ratioIndex und schreibt über ModelWriter.
-            //
-            // onEnd:   commitRatioDrag registriert einen einzelnen Undo-Eintrag
-            //          (snapshot → final) und gibt die Session frei.
-            //
-            // onEdgeScroll: Identisch zum Count-Handle — routed über
-            //          ViewportController.scroll(by:).
-            CornerDotHandle(
-                color: accentColor.opacity(0.7),
-                dotAtTop: true,
-                onStart: {
-                    isDraggingLength = true
-                    let contentUnit = CGFloat(track.lane.stepCount)
-                                    * (stepWidthSize + VintageTheme.stepSpacing)
-                    interactionController.beginRatioDrag(
-                        track:          track.data,
-                        contentUnit:    contentUnit,
-                        baseRatioIndex: currentRatioIndex
-                    )
-                },
-                onDrag: { totalX in
-                    interactionController.updateRatioDrag(totalX: totalX, track: track.data)
-                },
-                onEnd: {
-                    isDraggingLength = false
-                    interactionController.commitRatioDrag(
-                        track:       track.data,
-                        undoManager: undoManager
-                    )
-                },
-                onEdgeScroll: { velocity in
-                    interactionController.applyEdgeScroll(velocity: velocity)
-                }
-            )
-            .overlay(alignment: .topTrailing) {
-                if isDraggingLength && track.lane.isPad {
-                    Text(TrackData.ratioLabel(num: track.lane.stepLengthNumerator,
-                                              den: track.lane.stepLengthDenominator))
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(accentColor))
-                        .fixedSize()
-                        .offset(x: 6, y: -18)
-                        .allowsHitTesting(false)
-                }
-            }
+            // v1.18.25 (Stephan: „Die anfasser sind falsch rum: der obere muss die Step-Anzahl, der
+            // untere die Step-Length beeinflussen"): oben Anzahl, unten Länge — wie die Angabe am
+            // rechten Rand der Lane (StretchHandleView: oben Anzahl, unten Länge).
 
-            Spacer()
-
-            // ── Bottom: Step-Count Handle (Arch-Slice-1 — unverändert) ───────
+            // ── Oben: Step-Anzahl (Arch-Slice-1) ─────────────────────────────
             //
             // Vollständig über InteractionController:
             //   onStart  → beginHandleDrag captures pxPerStep + snapshot
@@ -113,6 +64,7 @@ struct CornerHandlesView: View {
             //   onEnd    → commitHandleDrag writes final value + registers undo
             //   edge     → applyEdgeScroll routes through ViewportController
             CornerDotHandle(
+                dotAtTop: true,
                 onStart: {
                     let pxPerStep = (stepWidthSize + VintageTheme.stepSpacing)
                                    * CGFloat(track.lane.displayNumerator)
@@ -135,6 +87,65 @@ struct CornerHandlesView: View {
                     interactionController.applyEdgeScroll(velocity: velocity)
                 }
             )
+
+            Spacer()
+
+            // ── Unten: Step-Länge (Ratio, Arch-Slice-2) ───────────────────────
+            //
+            // onStart: Berechnet contentUnit einmalig bei Drag-Start und übergibt
+            //          sie zusammen mit baseRatioIndex an InteractionController.
+            //          Die Werte landen in RatioDragSession — kein Binding nötig.
+            //
+            // onDrag:  updateRatioDrag leitet totalX weiter; der Controller
+            //          berechnet den nächstgelegenen Ratio-Index via
+            //          HandleDragLogic.ratioIndex und schreibt über ModelWriter.
+            //
+            // onEnd:   commitRatioDrag registriert einen einzelnen Undo-Eintrag
+            //          (snapshot → final) und gibt die Session frei.
+            //
+            // onEdgeScroll: Identisch zum Count-Handle — routed über
+            //          ViewportController.scroll(by:).
+            CornerDotHandle(
+                color: accentColor.opacity(0.7),
+                dotAtTop: false,
+                onStart: {
+                    isDraggingLength = true
+                    let contentUnit = CGFloat(track.lane.stepCount)
+                                    * (stepWidthSize + VintageTheme.stepSpacing)
+                    interactionController.beginRatioDrag(
+                        track:          track.data,
+                        contentUnit:    contentUnit,
+                        baseRatioIndex: currentRatioIndex,
+                        ratios:         track.lane.ratioOptions(engine.timeSignature)
+                    )
+                },
+                onDrag: { totalX in
+                    interactionController.updateRatioDrag(totalX: totalX, track: track.data)
+                },
+                onEnd: {
+                    isDraggingLength = false
+                    interactionController.commitRatioDrag(
+                        track:       track.data,
+                        undoManager: undoManager
+                    )
+                },
+                onEdgeScroll: { velocity in
+                    interactionController.applyEdgeScroll(velocity: velocity)
+                }
+            )
+            .overlay(alignment: .bottomTrailing) {
+                if isDraggingLength && track.lane.isLongStep {
+                    Text(s.laneLength(track.lane, meter: engine.timeSignature))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(RoundedRectangle(cornerRadius: 3).fill(accentColor))
+                        .fixedSize()
+                        .offset(x: 6, y: 18)
+                        .allowsHitTesting(false)
+                }
+            }
         }
         .frame(width: VintageTheme.cornerHandlesWidth, height: stepDisplaySize)
     }

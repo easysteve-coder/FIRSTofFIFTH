@@ -182,7 +182,7 @@ struct LaneGeometryProbeView: View {
         GeometryReader { g in
             Color.clear
                 .onAppear { LaneGeometryProbe.shared.record(key, g.size.width) }
-                .onChange(of: g.size.width) { _, w in LaneGeometryProbe.shared.record(key, w) }
+                .onValueChange(of: g.size.width) { w in LaneGeometryProbe.shared.record(key, w) }
         }
         .allowsHitTesting(false)
     }

@@ -50,20 +50,31 @@ enum HandleDragLogic {
     ///   - baseRatioIndex: Index des Ausgangs-Ratios bei Drag-Start.
     ///   - ratios:         Die Ratio-Tabelle (typischerweise Track.sortedRatios).
     /// - Returns: Index in `ratios` des nächstgelegenen Ratios.
+    ///   - longStepPx:     Ziehweg je Stufe der langen Längen (> 2 Sechzehntel, v1.18.29) —
+    ///                     zeitgetreu wäre der Weg bis 8 Takte unbedienbar lang. nil = alles
+    ///                     zeitgetreu.
     static func ratioIndex(
         totalX:         CGFloat,
         contentUnit:    CGFloat,
         baseRatioIndex: Int,
-        ratios:         [(num: Int, den: Int)]
+        ratios:         [(num: Int, den: Int)],
+        longStepPx:     CGFloat? = nil
     ) -> Int {
         guard !ratios.isEmpty else { return baseRatioIndex }
-        let baseVal = CGFloat(ratios[baseRatioIndex].num)
-                    / CGFloat(ratios[baseRatioIndex].den)
-        var bestIdx  = baseRatioIndex
+        let base = max(0, min(ratios.count - 1, baseRatioIndex))
+        // Lage jeder Stufe auf dem Ziehweg: kurze Längen zeitgetreu, lange in festen Stufen
+        // hinter der längsten kurzen.
+        let values = ratios.map { CGFloat($0.num) / CGFloat($0.den) }
+        let lastShort = values.lastIndex { $0 <= 2 }
+        func position(_ i: Int) -> CGFloat {
+            guard let px = longStepPx, px > 0, let ls = lastShort, i > ls else { return contentUnit * values[i] }
+            return contentUnit * values[ls] + CGFloat(i - ls) * px
+        }
+        let basePos  = position(base)
+        var bestIdx  = base
         var bestDist = CGFloat.infinity
         for i in 0..<ratios.count {
-            let v   = CGFloat(ratios[i].num) / CGFloat(ratios[i].den)
-            let thr = contentUnit * (v - baseVal)
+            let thr = position(i) - basePos
             let dist = abs(totalX - thr)
             if dist < bestDist {
                 bestDist = dist

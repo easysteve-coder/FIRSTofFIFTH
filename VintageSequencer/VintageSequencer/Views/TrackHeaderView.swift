@@ -10,20 +10,15 @@ struct TrackHeaderView: View {
     var onRandomize:   (() -> Void)?
     var onClear:       (() -> Void)?
     var onDelete:      (() -> Void)?
-    var onDuplicate:   (() -> Void)?
 
     @Environment(\.undoManager) private var undoManager
     /// Nur für die Ausgangsanzeige (Rack-Kanal der Spur). Die Engine publiziert nur bei
     /// Struktur-/Transport-Ereignissen — der Spurkopf wird dadurch nicht häufiger neu gebaut.
     @EnvironmentObject private var engine: SequencerEngine
-    @FocusState private var nameFocused: Bool
     @State private var showScalePicker = false
     @State private var showFeelPopover = false
     @State private var showPadWidth    = false
-    // nameEdit: lokaler @State für den TextField. Wird bei Focus-In aus track.name
-    // initialisiert; ModelWriter-Commit beim Focus-Out. Verhindert, dass jeder
-    // Tastendruck direkt in track.name schreibt (Slice E). Undo bleibt erhalten.
-    @State private var nameEdit: String = ""
+    // Namensfeld: `TrackNameField` (gemeinsam für alle Spurarten, v1.17.3).
     private let writer = ModelWriter()
 
     @AppStorage("showTooltips") private var showTooltips: Bool   = true
@@ -64,52 +59,13 @@ struct TrackHeaderView: View {
                 // Anzeige-Only (v1.12.1): Der Farbpunkt ist rein visuell und
                 // nicht mehr interaktiv. Farbwahl läuft über das
                 // Track-Kontextmenü (siehe TrackRowView.trackContextMenu).
-                // Pad-Spuren tragen statt des Punkts ein „PAD“-Schild (v1.13.19).
-                if track.lane.isPad {
-                    Text("PAD")
-                        .font(.system(size: 8, weight: .heavy, design: .monospaced))
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 3)
-                        .padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 2).fill(accentColor))
-                } else {
-                    Circle().fill(accentColor).frame(width: 6, height: 6)
-                }
+                Circle().fill(accentColor).frame(width: 6, height: 6)
 
-                // TextField bindet an lokalen nameEdit-State, nicht direkt an track.name.
-                // Commit (ModelWriter) erfolgt beim Verlassen des Fokus — Undo bleibt.
-                TextField(s.namePlaceholder, text: $nameEdit)
-                    .font(VintageTheme.monoBold)
-                    .foregroundColor(accentColor)
-                    .textFieldStyle(.plain)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 2)
-                    .background(GlassDisplayBackground(cornerRadius: 3))   // GUI-01: versenktes Namensfeld
-                    .focused($nameFocused)
-                    .onChange(of: nameFocused) { _, focused in
-                        if focused {
-                            nameEdit = track.name   // Snapshot beim Focus-In
-                        } else {
-                            let old = track.name
-                            let new = nameEdit
-                            guard new != old else { return }
-                            writer.apply(.setName(trackID: track.id, old: old, new: new),
-                                         to: track.data,
-                                         undoManager: undoManager)
-                        }
-                    }
-                    .onChange(of: track.name) { _, external in
-                        // Sync wenn track.name extern geändert wird (z.B. Paste-Pattern, Undo).
-                        if !nameFocused { nameEdit = external }
-                    }
-                    .onAppear { nameEdit = track.name }
-                    .onSubmit   { nameFocused = false }
-                    .onExitCommand { nameFocused = false }
+                TrackNameField(track: track, accentColor: accentColor, placeholder: s.namePlaceholder)
 
-                if track.lane.isPad {
-                    // Breite der Pad-Steps dieser Spur (eigene Weitenregelung, v1.13.19).
-                    Button("↔\(track.lane.padWidth)") { showPadWidth = true }
+                if track.lane.isLongStep {
+                    // Breite langer Steps dieser Spur (v1.13.19 Pads, v1.18.29 jede Spur).
+                    Button("↔\(track.lane.stepWidth == 0 ? "A" : "\(track.lane.stepWidth)")") { showPadWidth = true }
                         .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: accentColor))
                         .popover(isPresented: $showPadWidth, arrowEdge: .bottom) {
                             PadWidthPopover(track: track, accentColor: accentColor)
@@ -117,34 +73,7 @@ struct TrackHeaderView: View {
                         .help(tip(s.padWidthHelp))
                 }
 
-                Button(track.isMuted ? "M" : "m") {
-                    writer.apply(.setMuted(trackID: track.id,
-                                           old: track.isMuted,
-                                           new: !track.isMuted),
-                                 to: track.data, undoManager: nil)
-                }
-                .buttonStyle(VintageSmallButtonStyle(isActive: track.isMuted, accent: .orange))
-                .help(tip(track.isMuted ? s.mutedTooltip : s.muteTooltip))
-
-                Button(track.isSolo ? "S" : "s") {
-                    writer.apply(.setSolo(trackID: track.id,
-                                          old: track.isSolo,
-                                          new: !track.isSolo),
-                                 to: track.data, undoManager: nil)
-                }
-                .buttonStyle(VintageSmallButtonStyle(isActive: track.isSolo,
-                    accent: Color(red: 0.9, green: 0.9, blue: 0.1)))
-                .help(tip(track.isSolo ? s.soloActiveTooltip : s.soloTooltip))
-
-                if let onDuplicate {
-                    Button { onDuplicate() } label: {
-                        Text("⎘")
-                            .font(.system(size: 15))
-                            .foregroundColor(VintageTheme.textSecondary)
-                    }
-                    .buttonStyle(.fullArea)
-                    .help(tip(s.duplicateTooltip))
-                }
+                TrackMuteSoloButtons(track: track, s: s, tip: tip)
             }
 
             // ── Row 2: Direction buttons (symbols) · CH ───────────────────
@@ -233,14 +162,18 @@ struct TrackHeaderView: View {
 
                 // RND/CLR laufen über ModelWriter (engine.randomize bzw. onClear) und
                 // registrieren ihr Undo dort — keine Direktmutation aus der View.
-                // RND; auf Pad-Spuren daneben die Wahl der Akkordquelle (▾).
+                // RND; daneben (außer Drum-Spuren) die RND-Wahl ▾: Einzeltöne/Akkorde/gemischt
+                // und Akkordquelle (v1.16.2: auch normale Spuren).
                 Button("RND") { onRandomize?() }
                 .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: accentColor))
-                .help(tip(track.lane.isPad ? s.padRandomizeTooltip : s.randomizeTooltip))
-                if track.lane.isPad {
-                    Menu {
-                        PadChordMenuItems(s: s, german: lang == "de") { onRandomize?() }
-                    } label: {
+                .help(tip(track.lane.isLongStep ? s.padRandomizeTooltip : s.randomizeTooltip))
+                if !track.isDrum {
+                    MenuKey(menu: { PadChordMenu.make(s: s, german: lang == "de", mode: track.lane.rndMode ?? .single,
+                                                      setMode: { m in
+                                                          writer.apply(.setRndMode(trackID: track.id, old: track.lane.rndMode,
+                                                                                   new: m == .single ? nil : m),
+                                                                       to: track.data, undoManager: undoManager)
+                                                      }) { onRandomize?() } }) {
                         Text("▾")
                             .font(VintageTheme.monoSmall)
                             .foregroundColor(VintageTheme.textPrimary)
@@ -248,10 +181,8 @@ struct TrackHeaderView: View {
                             .padding(.vertical, 3)
                             .background(PlasticKeyBackground(tint: nil, tintStrength: 0.3,
                                                              cornerRadius: 3, pressed: false))
-                            .contentShape(Rectangle())
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
                     .fixedSize()
                     .help(tip(s.padChordSourceTooltip))
                 }
@@ -301,7 +232,7 @@ fileprivate struct FeelPopover: View {
                     get: { track.timingOffset * 1000 },
                     set: { writer.apply(.setTimingOffset(trackID: track.id,
                                                           old: track.timingOffset,
-                                                          new: max(-0.05, min(0.05, $0 / 1000))),
+                                                          new: max(-TrackData.maxTimingOffset, min(TrackData.maxTimingOffset, $0 / 1000))),
                                         to: track.data, undoManager: nil) }
                 ),
                 range: -50...50,
@@ -403,10 +334,14 @@ struct TrackOutputItems: View {
 
     var body: some View {
         let current = directory.entries.first { $0.id == track.instrumentID }?.id
-        item(nil, s.trackOutputMIDI, current)
-        if !directory.entries.isEmpty { Divider() }
-        ForEach(directory.entries) { item($0.id, $0.name, current) }
-        Divider()
+        // Audio-Loop-Spuren spielen nur Audio-Loop-Kanäle, alle anderen nur Instrumentenkanäle.
+        let loop = track.data.isAudioLoop
+        let entries = directory.entries.filter { $0.isAudioLoop == loop }
+        if !loop { item(nil, s.trackOutputMIDI, current) }
+        if !entries.isEmpty && !loop { Divider() }
+        ForEach(entries) { item($0.id, $0.name, current) }
+        if !loop { Divider() }
+        if !loop {
         // Legt einen Kanal an, weist ihn zu und zeigt den Mixer: dort wird das Instrument gewählt.
         Button {
             let name = s.rackDefaultChannelName(engine.rack.channels.count + 1)
@@ -415,6 +350,7 @@ struct TrackOutputItems: View {
             Label(s.trackOutputNewChannel, systemImage: "plus")
         }
         .disabled(!engine.rack.canAddChannel)
+        }
     }
 
     @ViewBuilder
@@ -426,80 +362,124 @@ struct TrackOutputItems: View {
 }
 
 /// Taste „MIDI"/„AU" im Spurkopf mit der Ausgangswahl als Menü.
+///
+/// Klickfläche ist die ganze Taste (v1.16.2): ein Button mit `.fullArea` öffnet beim Klick ein
+/// AppKit-Menü — wie `CCTargetButton`. Ein SwiftUI-`Menu` (borderless) reagiert nur auf die
+/// Fläche seines Titels, auch mit größerem transparentem Label darüber.
 struct TrackOutputMenu: View {
     @ObservedObject var track: TrackViewModel
     @ObservedObject var directory: ChannelDirectory
     let accent: Color
     let s: Str
+    @EnvironmentObject private var engine: SequencerEngine
+    @AppStorage("showMixer") private var showMixer: Bool = false
 
     var body: some View {
         let routed = directory.entries.first { $0.id == track.instrumentID }
-        // Sichtbare Taste ist eine eigene Ebene; das Menü liegt unsichtbar darüber. Ein
-        // borderless-Menü zeichnet sein Label nur abgeblendet und ohne Tastenfläche.
-        HStack(spacing: 1) {
-            Text(routed == nil ? "MIDI" : "AU")
-                .font(VintageTheme.monoSmall)
-            Image(systemName: "chevron.down")
-                .font(.system(size: 6, weight: .bold))
-        }
-        .foregroundColor(routed == nil ? VintageTheme.textPrimary : .black)
-        .frame(width: 38, height: 20)
-        .background(
-            ZStack {
-                PlasticKeyBackground(cornerRadius: 3)
-                if routed != nil {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(LinearGradient(colors: [accent, accent.opacity(0.78)],
-                                             startPoint: .top, endPoint: .bottom))
-                        .padding(1)
-                }
+        Button { showMenu() } label: {
+            HStack(spacing: 1) {
+                Text(routed == nil ? "MIDI" : "AU")
+                    .font(VintageTheme.monoSmall)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 6, weight: .bold))
             }
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 3))
-        .overlay(RoundedRectangle(cornerRadius: 3).stroke(accent.opacity(0.55), lineWidth: 1))
-        .overlay(
-            Menu {
-                TrackOutputItems(track: track, directory: directory, s: s)
-            } label: {
-                Color.clear.frame(width: 38, height: 20).contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
+            .foregroundColor(routed == nil ? VintageTheme.textPrimary : .black)
             .frame(width: 38, height: 20)
+            .background(
+                ZStack {
+                    PlasticKeyBackground(cornerRadius: 3)
+                    if routed != nil {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(LinearGradient(colors: [accent, accent.opacity(0.78)],
+                                                 startPoint: .top, endPoint: .bottom))
+                            .padding(1)
+                    }
+                }
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 3))
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(accent.opacity(0.55), lineWidth: 1))
             .contentShape(Rectangle())
-        )
+        }
+        .buttonStyle(.fullArea)
         .help(routed.map { s.trackOutputHelp($0.name) } ?? s.trackOutputChooseHelp)
+    }
+
+    /// Dieselben Einträge wie `TrackOutputItems` (Kontextmenü), beim Klick gebaut.
+    private func showMenu() {
+        let current = directory.entries.first { $0.id == track.instrumentID }?.id
+        let loop = track.data.isAudioLoop
+        let entries = directory.entries.filter { $0.isAudioLoop == loop }
+        let td = track.data
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        if !loop {
+            menu.addItem(ClosureMenuItem(title: s.trackOutputMIDI, checked: current == nil) {
+                engine.setOutput(of: td, to: nil)
+            })
+            if !entries.isEmpty { menu.addItem(.separator()) }
+        }
+        for e in entries {
+            let id = e.id
+            menu.addItem(ClosureMenuItem(title: e.name, checked: current == id) {
+                engine.setOutput(of: td, to: id)
+            })
+        }
+        if !loop {
+            menu.addItem(.separator())
+            let add = ClosureMenuItem(title: s.trackOutputNewChannel, checked: false) {
+                let name = s.rackDefaultChannelName(engine.rack.channels.count + 1)
+                if engine.setOutputToNewChannel(of: td, name: name) != nil { showMixer = true }
+            }
+            add.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
+            add.isEnabled = engine.rack.canAddChannel
+            menu.addItem(add)
+        }
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
     }
 }
 
 /// Menü der Pad-RND-Taste: Quelle (Bücher/leitereigen) und optional eine feste Folge.
 /// Die Wahl bleibt für weitere Klicks auf RND gespeichert.
-private struct PadChordMenuItems: View {
-    let s: Str
-    let german: Bool
-    let roll: () -> Void
-    @AppStorage(SequencerEngine.padChordSourceKey) private var source: String = PadChordSource.books.rawValue
-    @AppStorage(SequencerEngine.padChordFamilyKey) private var family: String = ""
-
-    var body: some View {
-        Button(mark(source == PadChordSource.books.rawValue && family.isEmpty) + s.padChordsBooksAny) {
-            source = PadChordSource.books.rawValue; family = ""; roll()
+/// AppKit-Menü (v1.16.2, `MenuKey`): RND-Töne je Spurart und Akkordquelle. Liest und
+/// schreibt dieselben Schlüssel wie zuvor `@AppStorage`; jede Wahl würfelt sofort.
+enum PadChordMenu {
+    /// Töne je Spur (v1.18.29): `setMode` schreibt über den ModelWriter (mit Undo).
+    static func make(s: Str, german: Bool, mode: RandomNoteMode, setMode: @escaping (RandomNoteMode) -> Void,
+                     roll: @escaping () -> Void) -> NSMenu {
+        let d = UserDefaults.standard
+        func modeItem(_ m: RandomNoteMode, _ title: String) -> NSMenuItem {
+            ClosureMenuItem(title: title, checked: mode == m) { setMode(m); roll() }
         }
-        Button(mark(source == PadChordSource.free.rawValue) + s.padChordsFree) {
-            source = PadChordSource.free.rawValue; family = ""; roll()
+        let source = d.string(forKey: SequencerEngine.padChordSourceKey) ?? PadChordSource.books.rawValue
+        let family = d.string(forKey: SequencerEngine.padChordFamilyKey) ?? ""
+        func choose(_ src: PadChordSource, _ fam: String) {
+            d.set(src.rawValue, forKey: SequencerEngine.padChordSourceKey)
+            d.set(fam, forKey: SequencerEngine.padChordFamilyKey)
+            roll()
         }
-        Divider()
-        Section(s.padChordsBooksHeader) {
-            ForEach(PadChords.families) { f in
-                Button(mark(source == PadChordSource.books.rawValue && family == f.id) + f.name(german: german)) {
-                    source = PadChordSource.books.rawValue; family = f.id; roll()
-                }
-                .help(f.source)
-            }
+        var items: [NSMenuItem] = [
+            .note(s.rndNotesHeader),
+            modeItem(.single, s.rndNotesSingle),
+            modeItem(.chords, s.rndNotesChords),
+            modeItem(.mixed, s.rndNotesMixed),
+            .separator(),
+            .note(s.rndChordSourceHeader),
+            ClosureMenuItem(title: s.padChordsBooksAny,
+                            checked: source == PadChordSource.books.rawValue && family.isEmpty) { choose(.books, "") },
+            ClosureMenuItem(title: s.padChordsFree,
+                            checked: source == PadChordSource.free.rawValue) { choose(.free, "") },
+            .separator(),
+            .note(s.padChordsBooksHeader),
+        ]
+        for f in PadChords.families {
+            let id = f.id
+            items.append(ClosureMenuItem(title: f.name(german: german),
+                                         checked: source == PadChordSource.books.rawValue && family == id) {
+                choose(.books, id)
+            }.with(toolTip: f.source))
         }
+        return .of(items)
     }
-
-    private func mark(_ on: Bool) -> String { on ? "✓ " : "    " }
 }
 
 // MARK: - Pad width popover
@@ -514,9 +494,9 @@ fileprivate struct PadWidthPopover: View {
     private let writer = ModelWriter()
 
     private func set(_ w: Int) {
-        let clamped = max(LaneData.padWidthRange.lowerBound, min(LaneData.padWidthRange.upperBound, w))
-        guard clamped != track.lane.padWidth else { return }
-        writer.apply(.setPadWidth(trackID: track.id, old: track.lane.padWidth, new: clamped),
+        let clamped = max(LaneData.stepWidthRange.lowerBound, min(LaneData.stepWidthRange.upperBound, w))
+        guard clamped != track.lane.stepWidth else { return }
+        writer.apply(.setStepWidth(trackID: track.id, old: track.lane.stepWidth, new: clamped),
                      to: track.data, undoManager: undoManager)
     }
 
@@ -526,9 +506,9 @@ fileprivate struct PadWidthPopover: View {
                 .font(VintageTheme.monoBold)
                 .foregroundColor(VintageTheme.textAmber)
             HStack(spacing: 4) {
-                ForEach(Array(LaneData.padWidthRange), id: \.self) { w in
-                    Button("\(w)") { set(w) }
-                        .buttonStyle(VintageSmallButtonStyle(isActive: track.lane.padWidth == w,
+                ForEach(Array(LaneData.stepWidthRange), id: \.self) { w in
+                    Button(w == 0 ? s.stepWidthAuto : "\(w)") { set(w) }
+                        .buttonStyle(VintageSmallButtonStyle(isActive: track.lane.stepWidth == w,
                                                              accent: accentColor))
                 }
             }

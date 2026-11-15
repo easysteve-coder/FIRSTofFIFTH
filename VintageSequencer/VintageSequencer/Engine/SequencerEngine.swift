@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import AppKit
 import CoreMIDI
+import CoreAudio
 import Darwin
 import UniformTypeIdentifiers
 import Atomics   // E3: ManagedAtomic — add via Xcode: File → Add Package Dependencies
@@ -27,7 +28,10 @@ class SequencerEngine: ObservableObject {
 
     var bpm: Double {
         get { transportState.bpm }
-        set { transportState.bpm = newValue }
+        set {
+            transportState.bpm = newValue
+            updateExtLookahead(refreshDevice: false)   // EXT-Vorlauf enthält ein Pulsintervall
+        }
     }
     var isPlaying: Bool {
         get { transportState.isPlaying }
@@ -40,6 +44,7 @@ class SequencerEngine: ObservableObject {
             // seq_cst: bildet mit dem Tick-Zutritt (enterTick) ein Dekker-Paar — siehe dort.
             isPlayingRT.store(newValue, ordering: .sequentiallyConsistent)
             transportState.isPlaying = newValue
+            if newValue { rack.transportStarted() }   // Loop-Anzeigen: Wiedergabeort abfragen
         }
     }
     var clockMode: ClockMode {
@@ -57,7 +62,8 @@ class SequencerEngine: ObservableObject {
     }
     var currentPatternIndex: Int {
         get { transportState.currentPatternIndex }
-        set { transportState.currentPatternIndex = newValue }
+        // Taktart, Raster und Vormerkanzeige folgen dem aktuellen Pattern (v1.18.24).
+        set { transportState.currentPatternIndex = newValue; if patterns.indices.contains(newValue) { syncMeter() } }
     }
     var queuedPatternIndex: Int? {
         get { transportState.queuedPatternIndex }
@@ -78,7 +84,7 @@ class SequencerEngine: ObservableObject {
         set { presetEditorState.swing = newValue }
     }
 
-    @Published var patterns: [Pattern] = Pattern.slotNames.map { Pattern(name: $0) }
+    @Published var patterns: [Pattern] = Pattern.defaultSlots()
     var numTracks: Int { currentPattern.tracks.count }  // D3: computed — kein manuelles Sync nötig
     /// Höhe der Step-Buttons — fix auf L (54 px).
     let stepDisplaySize: Double = 54
@@ -114,6 +120,8 @@ class SequencerEngine: ObservableObject {
     /// Song (v1.14.0): Szenenfolge über allen Patterns; eigenes State-Objekt, nur die
     /// Song-Lane beobachtet es.
     let songState = SongState()
+    /// Zuletzt bediente Audio-Loop-Spur (Ziel der Taste R).
+    var lastAudioLoopTrack: UUID?
     var song: Song { songState.song }
 
     /// Horizontaler Scroll-Offset — in eigenem ScrollState-Objekt,
@@ -179,6 +187,8 @@ class SequencerEngine: ObservableObject {
     // Convenience-Accessors — Nicht-View-Code (Extensions, AppDelegate) kann
     // engine.hasUnsavedChanges etc. weiterhin direkt lesen/schreiben.
     // Kein @Published — feuern kein engine.objectWillChange.
+    /// Nicht-fataler Hinweis des letzten `loadData` (z. B. nicht wiederherstellbare Loops).
+    var loadWarning: String?
     var lastErrorMessage: String? {
         get { presetEditorState.lastErrorMessage }
         set { presetEditorState.lastErrorMessage = newValue }
@@ -204,103 +214,36 @@ class SequencerEngine: ObservableObject {
         set { presetEditorState.stepClipboard = newValue }
     }
 
-    var midi = MIDIManager()
+    let midi = MIDIManager()
 
     // Externe Clock: BPM-Schätzung aus Pulsabstand.
     // Nur vom MIDI-Read-Thread geschrieben — kein Sharing, kein Lock nötig.
     private var extPulseCount:  Int    = 0
     private var extBeatStart:   UInt64 = 0
 
-    // Externe Clock: prädiktiver Lookahead (T2 — Schritt 2).
-    // EMA über gemessene Tick-Intervalle → scheduledAt = now + EMA statt now.
-    // Ermöglicht CoreMIDI Future-Timestamps und macht den Overshoot-Fix auch
-    // im EXT-Modus wirksam. Nur vom MIDI-Read-Thread gelesen/geschrieben.
-    private var extLastTickMach:    UInt64 = 0
-    private var extTickIntervalEMA: Double = 0.0
-    private let extEMAAlpha:        Double = 0.2
+    // Externe Clock (v1.15.1, Codex T1): Zeitbezug ist der Paketzeitstempel des 0xF8, nicht
+    // die Ankunft des Callbacks; jeder Puls — auch der erste — wird um denselben festen
+    // Vorlauf `extLookaheadMach` später geplant. Früher: Callbackzeit + EMA eines Pulses,
+    // erster Puls ohne Vorlauf (Phasensprung nach dem Start, Bündelung verfälschte die EMA).
+    /// Vorlauf im EXT-Modus: 10 ms + ein Ausgabepuffer (Renderhorizont gehosteter
+    /// Instrumente/Loops, Codex T3). Main setzt, MIDI-Read-Thread liest.
+    private let extLookaheadMach = ManagedAtomic<UInt64>(0)
     /// Main bittet den MIDI-Read-Thread, seinen Messzustand (Pulszähler, EMA) zurückzusetzen.
     /// Die Variablen oben schreibt ausschließlich der MIDI-Read-Thread — Main setzt nur
     /// dieses Flag (früher schrieb Main sie direkt: Datenrennen).
     private let extResetRequested = ManagedAtomic<Bool>(false)
 
-    // MARK: - Playback Snapshot (E3 — Lock-Free Atomic Exchange, RT-3 — Hazard-Pointer, S01)
+    // MARK: - Playback Snapshot (E3, RT-3, S01)
     //
-    // Main-Thread publiziert einen neuen PlaybackBundleBox-Pointer atomar.
-    // Der Tick-Thread erwirbt ihn über `acquireSnapshot()` (Hazard-Pointer-Protokoll).
-    //
-    // Lifetime-Garantie (Single-Reader-Hazard-Pointer, RT-3 v1.12.5, S01 v1.12.11):
-    //   Der Tick-Thread hält den rohen Box-Pointer über den GESAMTEN Tick
-    //   (advanceSteps liest bundle.snapshot/bpm/swing durch die ganze Track-Schleife).
-    //
-    //   Protokoll (Annahme: genau EIN Reader — Durchsetzung ist Slice S02, B2):
-    //     Reader  R1  c = load(atomicBundleRaw)                       [acquiring]
-    //             R2  store(hazardBundleRaw, c)                       [seq_cst]
-    //             R3  v = load(atomicBundleRaw)                       [seq_cst]
-    //             R4  v == c  → c ist geschützt, erst JETZT Dereferenzierung;
-    //                 v != c  → c = v, zurück zu R2 (höchstens `snapshotAcquireMaxAttempts`
-    //                           Durchläufe; danach Erwerbsfehler, KEINE Dereferenzierung).
-    //             R5  Tick-Ende: store(hazardBundleRaw, 0)            [releasing]
-    //     Writer  W1  store(atomicBundleRaw, new)                     [seq_cst]
-    //             W2  h = load(hazardBundleRaw)                       [seq_cst]
-    //             W3  abgelöste Box nur freigeben, wenn rawOf(box) != h; sonst `bundleDeferred`.
-    //
-    //   Ordnungsbeweis (Dekker/Store-Buffering): R2→R3 und W1→W2 sind je ein
-    //   „store, dann load auf der ANDEREN Variable“. Release/Acquire erlaubt, dass
-    //   beide Loads die alten Werte sehen (Reader sieht den alten Pointer, Writer
-    //   sieht Hazard 0) → Writer gibt die Box frei, die der Reader gerade benutzt.
-    //   Mit seq_cst auf allen vier Operationen liegen sie in einer totalen Ordnung S:
-    //   steht R2 vor W1, sieht W2 (nach W1) den Hazard → Aufschub; steht W1 vor R2,
-    //   sieht R3 (nach R2) den neuen Pointer → Validierung scheitert, keine
-    //   Dereferenzierung. Auf ARM64 sind seq_cst-Store/Load stlr/ldar (RCsc, ohne
-    //   zusätzliche dmb); die Loads bleiben wartefrei. Sichtbarkeit des Box-Inhalts:
-    //   R3 (acquire-Anteil) liest den Wert aus W1 (release-Anteil) → happens-before
-    //   für die Initialisierung der Box. R5 (release) ordnet alle Reads der Box vor
-    //   das Löschen; W2 (acquire-Anteil) das Freigeben nach dem Lesen von R5.
-    //
-    //   ABA: Der Reader dereferenziert nie den bei R1 gelesenen Wert, sondern nur
-    //   das Objekt, das bei R3 ZUM VALIDIERUNGSZEITPUNKT publiziert ist. Eine
-    //   Wiederverwendung der Adresse durch eine neue Box ist deshalb harmlos: Passt
-    //   die Adresse zur aktuellen Publikation, ist genau diese lebende Box gemeint.
-    //   Auf Writer-Seite führt eine zufällig gleiche Adresse höchstens zu einem
-    //   überflüssigen Aufschub (konservativ). Eine aufgeschobene Box bleibt über
-    //   `bundleDeferred` am Leben, ihre Adresse kann nicht neu vergeben werden.
-    //
-    //   Deferred-Retention: höchstens EINE Box (nur ein Reader hat höchstens einen
-    //   Hazard). Sie wird beim nächsten publishSnapshot() freigegeben, sobald der
-    //   Hazard nicht mehr auf sie zeigt. Freigabe/Deinit laufen auf dem Publisher
-    //   (Main), nie auf dem Tick-Thread: der Reader hält keine Referenz (+0).
-    //
-    //   Beschränkte RT-Arbeit pro Erwerb: 1 Load + höchstens 9×(1 Store + 1 Load)
-    //   + 1 Clear; kein Lock, kein Alloc, kein Retain/Release, keine Schleife ohne
-    //   Obergrenze. Erschöpfung (≥ 9 Pointerwechsel während des Erwerbs) ist ein
-    //   definierter Erwerbsfehler: der Gesamttick wird abgebrochen (siehe advanceSteps).
-    //
-    private let atomicBundleRaw = ManagedAtomic<Int>(0)
-    /// RT-3: Box, die der Tick-Thread gerade dereferenziert (0 = keine). Vom
-    /// Tick-Thread mit .releasing geschrieben, vom Main-Thread in publishSnapshot
-    /// mit .acquiring gelesen, bevor er eine abgelöste Box freigibt. Wird NUR vom
-    /// Reader selbst geschrieben (RT-3a: stop() darf hazardBundleRaw nicht anfassen).
-    private let hazardBundleRaw = ManagedAtomic<Int>(0)
-    /// S01: Anzahl abgebrochener Gesamttick wegen erschöpftem Snapshot-Erwerb.
-    /// Einziger Schreiber ist der Reader (load+store ohne RMW — wartefrei); Main
-    /// liest im Display-Drain und spiegelt in `clockDiagnostics.snapshotAcquireFailures`.
-    private let snapshotAcquireFailures = ManagedAtomic<Int>(0)
-    /// S01: Obergrenze der Erwerbsdurchläufe (= bisherige Grenze „8 Retries“, nicht erhöht).
-    private static let snapshotAcquireMaxAttempts = 9
-    /// S01: Ergebnis des Snapshot-Erwerbs. Reiner Wertetyp, kein Heap.
-    private enum SnapshotAcquire {
-        /// Box mit diesem Raw-Pointer ist im Hazard gemeldet UND validiert → dereferenzierbar.
-        case protected(Int)
-        /// Es ist (noch/nicht mehr) kein Bundle publiziert (vor play(), nach stop()).
-        case noBundle
-        /// Mehr als `snapshotAcquireMaxAttempts` Publish-Wechsel während des Erwerbs.
-        case exhausted
-    }
+    // Publikation und Erwerb des Bundles besitzt `SnapshotPublisher` (Hazard-Pointer-
+    // Protokoll und Ordnungsbeweis dort). Die Engine baut Bundles und ruft publish/acquire.
+    let publisher = SnapshotPublisher()
+
     /// Exklusiver Tick-Zutritt (RT-3a, seit v1.12.19 als CAS — siehe `enterTick()`):
     /// true, solange ein Tick läuft — vom Zutritt bis nach dem letzten MIDI-Send dieses
     /// Ticks, gleich ob er vom internen Clock-Thread oder vom MIDI-Read-Thread kommt.
     /// stop() wartet auf false, bevor es Snapshot-Box oder Notenbuch anfasst.
-    private let activeTick = ManagedAtomic<Bool>(false)
+    @inline(__always) private var activeTick: ManagedAtomic<Bool> { kernel.activeTick }
     /// RT-3b: true zwischen „Sync-Spin-Backstop in stop() erreicht" und dem
     /// tatsächlichen Abschluss des aufgeschobenen RT-State-Teardowns. Nur
     /// Main-Thread (stop()/play()/startFromExternal() und der Async-Retry
@@ -310,11 +253,6 @@ class SequencerEngine: ObservableObject {
     /// Form). Jetzt gilt hart: activeTick == true ⇒ nie freigeben, auch nicht
     /// auf dem Timeout-Pfad — stattdessen aufschieben, bis wirklich quieszent.
     private var stopCleanupPending = false
-    /// Hält die aktuell veröffentlichte Box am Leben (Main-Thread-Ownership).
-    private var bundleCurrent:  PlaybackBundleBox? = nil
-    /// Aufgeschobene Freigabe: eine abgelöste Box, die der Tick-Thread laut Hazard
-    /// noch benutzt. Höchstens eine, da es genau einen Leser gibt.
-    private var bundleDeferred: PlaybackBundleBox? = nil
     // MARK: Runtime-Slots (v1.12.19 — Topologie reist im Snapshot)
     //
     // Fester Block von `runtimeSlotCount` TrackRuntimes, einmal in init alloziert und nie
@@ -325,16 +263,14 @@ class SequencerEngine: ObservableObject {
     // Abweichung frisch. Damit gibt es keinen Versatz mehr zwischen Snapshot-Topologie und
     // Runtime-Zuordnung (früher: getrennte Command-Mailbox, Befund B3) und keine
     // Strukturmutation eines Arrays im Tick-Pfad.
-    static let runtimeSlotCount = 256
+    static let runtimeSlotCount = TickKernel.runtimeSlotCount
     /// Obergrenze für neue Spuren je Pattern: aktuelles + vorgemerktes Pattern müssen
     /// zusammen in den Slot-Block passen, sonst blieben Spuren stumm.
     static let maxTracksPerPattern = runtimeSlotCount / 2
     private var canGrowTracks: Bool { patterns.allSatisfy { $0.tracks.count < Self.maxTracksPerPattern } }
-    private let rtRuntimes: UnsafeMutablePointer<TrackRuntime> = {
-        let p = UnsafeMutablePointer<TrackRuntime>.allocate(capacity: SequencerEngine.runtimeSlotCount)
-        p.initialize(repeating: TrackRuntime(), count: SequencerEngine.runtimeSlotCount)
-        return p
-    }()
+    #if DEBUG
+    private var rtRuntimes: UnsafeMutablePointer<TrackRuntime> { kernel.rtRuntimes }   // Test-Fenster
+    #endif
     /// Main-only: Slot-Vergabe je Track-UUID. Slots bleiben belegt, solange der Track im
     /// aktuellen oder im vorgemerkten Pattern liegt.
     private var slotByTrack: [UUID: (slot: Int, epoch: UInt32)] = [:]
@@ -342,90 +278,40 @@ class SequencerEngine: ObservableObject {
     private var nextSlotEpoch: UInt32 = 1
     /// Main-only: Aktivierungsnummer des aktuellen Patterns (siehe PlaybackStateBundle.serial).
     private var patternSerial = 1
-    /// Tick-Thread-only: Aktivierung, die der Tick-Thread gerade spielt.
-    private var rtActiveSerial = 0
-    /// Vom Tick-Thread publiziert, sobald er an der Patterngrenze selbst gewechselt hat
-    /// (= neue Aktivierungsnummer). Main gleicht damit `currentPatternIndex` ab. Zustellung
-    /// über dieses Atomic ist verlustfrei; das Ring-Event ist nur der Weckruf.
-    private let rtSwitchedSerial = ManagedAtomic<Int>(0)
-    /// Tick-Thread-only: Pulse seit Sitzungsbeginn (erster Tick = 0). Song-Wechsel und
-    /// Song-Ende sind als absolute Pulse im Bundle angegeben (v1.14.0).
-    private var rtPulse = 0
-    /// Puls, auf dem der Tick-Thread zuletzt gewechselt hat. Geschrieben VOR dem releasing-
-    /// Store von `rtSwitchedSerial`; Main liest ihn nach dessen acquiring-Load.
-    private let rtSwitchPulse = ManagedAtomic<Int>(0)
-    /// Vom Tick-Thread gesetzt, sobald das Songende (`stopAtPulse`) erreicht ist; Main hält an.
-    private let rtSongEnded = ManagedAtomic<Bool>(false)
+    /// Rückkanal des Tick-Pfads (Besitzer `TickKernel`): letzter Wechsel, Songende, Zähler.
+    private var rtSwitchStamp: ManagedAtomic<UInt64> { kernel.rtSwitchStamp }
+    private var rtLateTicks: ManagedAtomic<Int> { kernel.rtLateTicks }
+    private var rtHorizonUnderruns: ManagedAtomic<Int> { kernel.rtHorizonUnderruns }
+    private var rtPlanConflicts: ManagedAtomic<Int> { kernel.rtPlanConflicts }
+    private var rtSongEnded: ManagedAtomic<Bool> { kernel.rtSongEnded }
+    private var rtSongEndHost: ManagedAtomic<UInt64> { kernel.rtSongEndHost }
+    /// EXT-Start ohne Main-Umweg (v1.15.2): Main hat im Stopp eine Sitzung vorbereitet
+    /// (`armExternalStart`); der MIDI-Thread schaltet sie bei 0xFA/0xFB scharf.
+    private let extArmed     = ManagedAtomic<Bool>(false)
+    private let extStartedRT = ManagedAtomic<Bool>(false)
+    /// Main: vorgemerkter Stopp auf dem Endpuls (Host-Zeit, Sitzung).
+    private var pendingSongStop: (host: UInt64, session: UInt32)?
+    private var songStopScheduled = false
 
     // MARK: Song-Steuerung (Main-only, v1.14.0)
-    /// Szene, deren Lauf gerade spielt; nil = kein Song-Lauf.
-    private var songRunStart: Int? = nil
-    /// Puls, auf dem dieser Lauf begann.
-    private var songRunStartPulse = 0
-    /// Vorgemerkte nächste Szene (deren Pattern ist `queuedPatternIndex`).
-    private var songNextScene: Int? = nil
-    private var songSwitchAtPulse = -1
-    private var songStopAtPulse   = -1
+    /// Songplanung (Werttyp, Codex M6) und Plan-Linien/Sitzungen (R1/R6).
+    private var songPlanner = SongPlanner()
+    /// Vorgemerkte Taktarten je Pattern-Platz (E2): das Pattern lief beim Ändern. Main.
+    private var pendingMeters: [Int: TimeSignature] = [:]
+    private var planLedger  = PlanLedger()
+    typealias PlanEntry = PlanLedger.Entry
+    static var songHorizon: Int { SongPlanner.horizon }
+    private var songRunStart: Int? { songPlanner.runStart }
+    private var songNextScene: Int? { songPlanner.nextScene }
+    private var sessionCounter: UInt32 { planLedger.session }
 
-    // MARK: Notenbuch (v1.12.19; v1.12.22: Offs werden erst kurz vor ihrem Zeitpunkt gesendet)
-    //
-    // 16 Kanäle × 128 Noten. Je Note:
-    //   pendingOff — Zeitpunkt des noch NICHT an CoreMIDI übergebenen Note-Offs (0 = keins)
-    //   sentOff    — spätestes bereits übergebenes Off (kann noch in der Zukunft liegen)
-    //   lastOn     — spätestes übergebenes On (kann noch in der Zukunft liegen)
-    //
-    // Ein einmal übergebenes Off lässt sich nicht zurückholen. Würde es wie früher zusammen
-    // mit dem On geplant, schnitte es eine später begonnene gleiche Note ab (Gate > 100 %
-    // auf gleicher Tonhöhe, zwei Spuren auf demselben Kanal). Deshalb bleibt das Off im Buch,
-    // bis sein Zeitpunkt im Fenster des laufenden Ticks liegt (`flushDueNoteOffs`); ein
-    // neues On derselben Note verlängert es bis dahin (`sendNote`).
-    //
-    // Schreiber ist der Tick-Thread (innerhalb des Tick-Zutritts). Main fasst das Buch nur
-    // an, wenn kein Tick laufen kann: nach bewiesener Quieszenz (stop/teardown) oder als
-    // Inhaber des Tick-Zutritts (Off-Wächter bei ausbleibender externer Clock).
-    struct NoteBookEntry {
-        var pendingOff: UInt64 = 0
-        var sentOff:    UInt64 = 0
-        var lastOn:     UInt64 = 0
-    }
-    /// Ein Buchabschnitt je Ausgang: Abschnitt 0 = externe MIDI-Ausgabe, Abschnitt
-    /// `route + 1` = gehostetes Instrument. Dieselbe Tonhöhe auf verschiedenen Ausgängen
-    /// ist nicht dieselbe Note.
-    private static let notesPerPort = 16 * 128
-    private static let portCount    = 1 + InstrumentRack.maxChannels
-    private static let noteBookSize = portCount * notesPerPort
-    private let noteBook: UnsafeMutablePointer<NoteBookEntry> = {
-        let p = UnsafeMutablePointer<NoteBookEntry>.allocate(capacity: SequencerEngine.noteBookSize)
-        p.initialize(repeating: NoteBookEntry(), count: SequencerEngine.noteBookSize)
-        return p
-    }()
-    /// Je Ausgang: untere Schranke des frühesten `pendingOff` (.max = keins) — erspart den
-    /// Durchlauf von Abschnitten, in denen nichts fällig ist. Gehört wie das Buch dem
-    /// Inhaber des Tick-Zutritts.
-    private let earliestPendingOff: UnsafeMutablePointer<UInt64> = {
-        let p = UnsafeMutablePointer<UInt64>.allocate(capacity: SequencerEngine.portCount)
-        p.initialize(repeating: .max, count: SequencerEngine.portCount)
-        return p
-    }()
-    /// Je Ausgang: Belegungsepoche, zu der die Einträge des Buchabschnitts gehören
-    /// (v1.13.13). Gehört wie das Buch dem Inhaber des Tick-Zutritts.
-    private let portEpoch: UnsafeMutablePointer<UInt32> = {
-        let p = UnsafeMutablePointer<UInt32>.allocate(capacity: SequencerEngine.portCount)
-        p.initialize(repeating: 0, count: SequencerEngine.portCount)
-        return p
-    }()
-    /// Für den Off-Wächter (Main): gibt es ungesendete Offs, und wann lief der letzte
-    /// externe Tick? Beides vom Tick-Thread geschrieben.
-    private let hasPendingOffs  = ManagedAtomic<Bool>(false)
-    private let lastExtTickHost = ManagedAtomic<UInt64>(0)
+    // MARK: Notenbuch und Ausgabe (v1.16.0: eigener Besitzer `NoteOutput`, Codex M6)
+    /// In `init` angelegt (lazy nur wegen der Abhängigkeit von `midi`/`rack`).
+    private lazy var noteOut = NoteOutput(midi: midi, rack: rack)
+    /// Der Off-Wächter braucht noch den Zeitpunkt des letzten externen Ticks.
+    private var lastExtTickHost: ManagedAtomic<UInt64> { kernel.lastExtTickHost }
     /// Main-only: läuft während der Wiedergabe (siehe `startOffWatchdog`).
     private var offWatchdog: DispatchSourceTimer?
-    /// RT-4b: alloc-freier PRNG für den Tick-Pfad (Random-Direction,
-    /// Step-Probability-Gate). Seed wird einmalig bei Konstruktion auf dem
-    /// Main-Thread gezogen (nicht RT). Wie die Runtime-Slots gehört er dem
-    /// Tick-Thread: alle Nutzstellen liegen innerhalb des Tick-Zutritts
-    /// (`enterTick()`), kein Atomic nötig.
-    private var rtRandom = RTRandom(seed: UInt64.random(in: .min ... .max))
 
     // MARK: - TrackViewModel cache (Slice G)
     //
@@ -465,7 +351,13 @@ class SequencerEngine: ObservableObject {
     /// Engine-Event-Buffer für RT-sichere Main-Thread-Mutationen (A2+A3).
     /// Produzent: Tick-Thread (advanceSteps). Konsument: displaySignal handler.
     private let engineEventBuffer  = EngineEventBuffer()
-    private var displaySignal: DispatchSourceUserDataOr?
+    /// Gehört dem Tick-Kern (Weckruf aus dem Tick); Main legt ihn in init an.
+    private var displaySignal: DispatchSourceUserDataOr? {
+        get { kernel.displaySignal } set { kernel.displaySignal = newValue }
+    }
+    /// Tick-Pfad (v1.16.0, Codex M6). In `init` angelegt, bevor ein Tick laufen kann.
+    private lazy var kernel = TickKernel(publisher: publisher, noteOut: noteOut, outputs: rack.tickOutputs, midi: midi,
+                                         displayBuffer: displayBuffer, engineEventBuffer: engineEventBuffer)
 
     /// AU-Host (v1.13.0): Instrumentenkanäle, Effekte, Mixer. Main-eigen; der Tick-Pfad
     /// erreicht nur die festen Ereigniswarteschlangen (`rack.queues[route]`).
@@ -475,15 +367,9 @@ class SequencerEngine: ObservableObject {
     /// onTick → clockTick(at:) → advanceSteps(tickTime:).
     private let audioClock         = ClockSource()
 
-    // MARK: - Safety-Clamp + Clamp-Zähler
-    // safetyOffsetMach: 1 ms in mach_absolute_time-Einheiten.
-    // Stellt sicher, dass MIDI-Future-Timestamps nie in der Vergangenheit liegen.
-    private static let safetyOffsetMach: MIDITimeStamp = nanosToMachTime(1_000_000)
-    /// Anzahl geclampter Note/CC-Timestamps — kumulativ, kein Reset im Betrieb.
-    /// Nur diagnostisch.
-    private let clampCountNotes = ManagedAtomic<Int>(0)
-    /// Diagnostisch — ausgehender MIDI-Clock 0xF8.
-    private let clampCountClock = ManagedAtomic<Int>(0)
+    // MARK: - Clamp-Zähler (Besitzer `TickKernel`, nur diagnostisch)
+    private var clampCountNotes: ManagedAtomic<Int> { kernel.clampCountNotes }
+    private var clampCountClock: ManagedAtomic<Int> { kernel.clampCountClock }
     #if DEBUG
     /// Letzter vom Drain gelesener clampCountNotes-Wert — für Delta-Erkennung.
     /// Nur Main-Thread (Drain-Handler).
@@ -531,7 +417,7 @@ class SequencerEngine: ObservableObject {
     //
     // Thread-Safety: ManagedAtomic<Bool> — atomar von Main-Thread geschrieben (play/stop),
     // atomar vom Tick-Thread gelesen und gelöscht (clockTick).
-    private let midiStartPending = ManagedAtomic<Bool>(false)
+    private var midiStartPending: ManagedAtomic<Bool> { kernel.midiStartPending }
 
     // MARK: - RT-1: Playback-State-Ownership (v1.12.2)
     //
@@ -549,8 +435,9 @@ class SequencerEngine: ObservableObject {
     // `clockIsInternal`:     Spiegel von (clockMode == .internal); Default .internal → true.
     // `isPlayingRT`:         Spiegel von isPlaying; Default false.
     private let queuedPatternAtomic = ManagedAtomic<Int>(-1)
-    private let clockIsInternal     = ManagedAtomic<Bool>(true)
-    private let isPlayingRT         = ManagedAtomic<Bool>(false)
+    // Beide gehören dem Tick-Kern; die Engine-Namen sind Weiterleitungen.
+    @inline(__always) private var clockIsInternal: ManagedAtomic<Bool> { kernel.clockIsInternal }
+    @inline(__always) private var isPlayingRT: ManagedAtomic<Bool> { kernel.isPlayingRT }
 
     #if DEBUG
     // RT-1: Test-only-Fenster auf die atomaren Playback-Spiegel und den
@@ -558,9 +445,7 @@ class SequencerEngine: ObservableObject {
     // Bundle-Konsistenz- und Pattern-Queue-Tests ohne Zugriff auf die
     // privaten Atomics.
     func _rt1PublishedBundle() -> PlaybackStateBundle? {
-        let raw = atomicBundleRaw.load(ordering: .acquiring)
-        guard raw != 0, let ptr = UnsafeRawPointer(bitPattern: raw) else { return nil }
-        return Unmanaged<PlaybackBundleBox>.fromOpaque(ptr).takeUnretainedValue().bundle
+        publisher._publishedBundle
     }
     var _rt1QueuedPatternAtomic: Int  { queuedPatternAtomic.load(ordering: .acquiring) }
     var _rt1ClockIsInternal:     Bool { clockIsInternal.load(ordering: .acquiring) }
@@ -578,14 +463,14 @@ class SequencerEngine: ObservableObject {
     }
     /// Slot des Tracks an Position `track` im zuletzt publizierten Snapshot (−1 = keiner).
     private func _testSlot(track: Int) -> Int {
-        guard let b = bundleCurrent?.bundle, b.snapshot.tracks.indices.contains(track) else { return -1 }
+        guard let b = publisher.current?.bundle, b.snapshot.tracks.indices.contains(track) else { return -1 }
         return b.snapshot.tracks[track].slot
     }
     /// Aktueller Runtime-Step eines Tracks (Test-Fenster). −1 auch für „frisch": eine
     /// Runtime, deren Epoche noch nicht zur Slot-Vergabe passt, startet beim nächsten Tick neu.
     func _rt1CurrentStep(track: Int) -> Int {
         let slot = _testSlot(track: track)
-        guard slot >= 0, let b = bundleCurrent?.bundle else { return -999 }
+        guard slot >= 0, let b = publisher.current?.bundle else { return -999 }
         let rt = rtRuntimes[slot]
         return rt.epoch == b.snapshot.tracks[track].epoch ? rt.currentStep : -1
     }
@@ -596,7 +481,7 @@ class SequencerEngine: ObservableObject {
     /// aktuelle Slot-Epoche, als hätte der Track bereits gespielt.
     func _rt2SetCurrentStep(track: Int, to value: Int) {
         let slot = _testSlot(track: track)
-        guard slot >= 0, let b = bundleCurrent?.bundle else { return }
+        guard slot >= 0, let b = publisher.current?.bundle else { return }
         rtRuntimes[slot].epoch = b.snapshot.tracks[track].epoch
         rtRuntimes[slot].armed = false
         rtRuntimes[slot].currentStep = value
@@ -607,40 +492,42 @@ class SequencerEngine: ObservableObject {
         return slot >= 0 ? rtRuntimes[slot].pulseAccumulator : -1
     }
     /// Zahl der Tracks im zuletzt publizierten Snapshot (0 = kein Bundle publiziert).
-    func _rt2RuntimeCount() -> Int { bundleCurrent?.bundle.snapshot.tracks.count ?? 0 }
+    func _rt2RuntimeCount() -> Int { publisher.current?.bundle.snapshot.tracks.count ?? 0 }
+    /// Sitzung des aktuell publizierten Bundles (nil = keins).
+    var _publishedSession: UInt32? { publisher.current?.bundle.session }
     /// Zahl der aktuell vergebenen Runtime-Slots (Main-seitige Buchhaltung).
     var _slotsInUse: Int { slotByTrack.count }
     var _patternSerial: Int { patternSerial }
     /// Ticks, die abgewiesen wurden, weil bereits ein Tick lief (Tick-Zutritt).
-    var _rejectedTicks: Int { rejectedTicks.load(ordering: .relaxed) }
+    var _rejectedTicks: Int { kernel.rejectedTicks.load(ordering: .relaxed) }
     /// Spätester geplanter Off-Zeitpunkt einer Note im Notenbuch (0 = keiner).
     /// Spätestes bekanntes Off der Note (ungesendet oder gesendet); 0 = Buch leer.
     func _noteBookEntry(channel: Int, note: Int, route: Int = -1) -> UInt64 {
-        let e = noteBook[(route + 1) * Self.notesPerPort + (channel - 1) * 128 + note]
+        let e = noteOut._entry(channel: channel, note: note, route: route)
         return max(e.pendingOff, e.sentOff)
     }
     func _noteBookPendingOff(channel: Int, note: Int, route: Int = -1) -> UInt64 {
-        noteBook[(route + 1) * Self.notesPerPort + (channel - 1) * 128 + note].pendingOff
+        noteOut._entry(channel: channel, note: note, route: route).pendingOff
     }
     /// Treibt den Off-Wächter synchron, als stünde die externe Clock schon lange genug still.
     func _runOffWatchdogForTest() { flushOverdueOffsIfClockStalled(stallMach: 0) }
 
     // RT-3: Test-Fenster auf die Hazard-Pointer-Lebensdauer-Sicherung.
-    var _rt3HazardRaw:     Int { hazardBundleRaw.load(ordering: .acquiring) }
-    var _rt3AtomicRaw:     Int { atomicBundleRaw.load(ordering: .acquiring) }
-    var _rt3CurrentBoxRaw: Int { bundleCurrent.map  { Self.rawOf($0) } ?? 0 }
-    var _rt3DeferredBoxRaw: Int { bundleDeferred.map { Self.rawOf($0) } ?? 0 }
+    var _rt3HazardRaw:     Int { publisher._hazardRaw }
+    var _rt3AtomicRaw:     Int { publisher._publishedRaw }
+    var _rt3CurrentBoxRaw: Int { publisher.current.map  { SnapshotPublisher.rawOf($0) } ?? 0 }
+    var _rt3DeferredBoxRaw: Int { publisher._deferredRaw }
     /// Simuliert einen Audio-Leser mitten im Tick: Hazard auf die aktuell
     /// publizierte Box setzen.
     func _rt3AnnounceCurrentHazard() {
-        hazardBundleRaw.store(atomicBundleRaw.load(ordering: .acquiring), ordering: .releasing)
+        publisher._announceCurrentHazard()
     }
-    func _rt3ClearHazard() { hazardBundleRaw.store(0, ordering: .releasing) }
+    func _rt3ClearHazard() { publisher.release() }
     /// Welche Box der letzte Tick tatsächlich dereferenziert hat.
-    private(set) var _rt3LastTickBoxRaw: Int = 0
+    var _rt3LastTickBoxRaw: Int { kernel._rt3LastTickBoxRaw }
     /// Weak-Sonde auf die aktuelle Box — beweist Deallozierung/Am-Leben-Bleiben.
     weak var _rt3WeakProbe: PlaybackBundleBox?
-    func _rt3SetWeakProbeToCurrent() { _rt3WeakProbe = bundleCurrent }
+    func _rt3SetWeakProbeToCurrent() { _rt3WeakProbe = publisher.current }
     var _rt3WeakProbeAlive: Bool { _rt3WeakProbe != nil }
     func _rt3DriveOneTick(at ts: UInt64) { clockTick(at: ts) }
 
@@ -648,33 +535,51 @@ class SequencerEngine: ObservableObject {
     // synchron auf dem Reader-Thread; ein Test, der darin publishSnapshot() aufruft,
     // erzwingt Pointerwechsel deterministisch (kein Allocator-Zufall). Nur DEBUG —
     // der Produktionsbuild enthält weder Hook noch Aufruf.
-    enum _S01Stage { case loaded, announced, validated, released }
-    var _s01AcquireHook: ((_S01Stage, Int) -> Void)?
-    let _s01ForceExhaustion = ManagedAtomic<Bool>(false)
+    typealias _S01Stage = SnapshotPublisher.Stage
+    var _s01AcquireHook: ((_S01Stage, Int) -> Void)? {
+        get { publisher._acquireHook } set { publisher._acquireHook = newValue }
+    }
+    var _s01ForceExhaustion: ManagedAtomic<Bool> { publisher._forceExhaustion }
     /// Anzahl publishSnapshot()-Aufrufe (nur Main schreibt) — Diagnose für Swing-/Main-Hop-Tests.
     private(set) var _s01PublishCount = 0
     /// Anzahl abgebrochener Gesamttick wegen erschöpftem Erwerb (Atomic-Spiegel).
-    var _s01AcquireFailures: Int { snapshotAcquireFailures.load(ordering: .acquiring) }
+    var _s01AcquireFailures: Int { publisher.acquireFailures }
     /// Entscheidungsstellen der Clock-Ausgabe in clockTick (Aufruf von sendClock/sendStartRT).
     /// Zählt nur den Sendeentschluss, keine CoreMIDI-Bytes (Beobachtungsnaht: Slice S04).
-    private(set) var _s01ClockSendCount = 0
-    private(set) var _s01StartSendCount = 0
+    var _s01ClockSendCount: Int { kernel._s01ClockSendCount }
+    var _s01StartSendCount: Int { kernel._s01StartSendCount }
     var _s01MidiStartPending: Bool { midiStartPending.load(ordering: .acquiring) }
     func _s01ArmMidiStart() { midiStartPending.store(true, ordering: .releasing) }
     func _s01PulseAccumulator(track: Int) -> Double { _rt2PulseAccumulator(track: track) }
     /// Deinit-Sonde an der aktuell publizierten Box (feuert auf dem Thread, der die letzte Referenz löst).
-    func _s01SetDeinitProbeOnCurrent(_ probe: @escaping () -> Void) { bundleCurrent?._deinitProbe = probe }
+    func _s01SetDeinitProbeOnCurrent(_ probe: @escaping () -> Void) { publisher.current?._deinitProbe = probe }
+    /// Sonde (Deinit + Weak) auf die Box, die der Reader gerade hält (`_rt3LastTickBoxRaw`).
+    /// Nur aufrufen, während der Reader geparkt ist — sein Hazard hält die Box am Leben.
+    func _s01ProbeHeldBox(_ probe: @escaping () -> Void) {
+        guard let p = UnsafeRawPointer(bitPattern: _rt3LastTickBoxRaw) else { return }
+        let box = Unmanaged<PlaybackBundleBox>.fromOpaque(p).takeUnretainedValue()
+        box._deinitProbe = probe
+        _rt3WeakProbe = box
+    }
 
     // RT-3a: Test-Fenster auf die Stop-/External-Clock-Quieszenz.
     /// Einmaliger Pause-Hook mitten in advanceSteps() (nach Snapshot-Erwerb +
     /// Hazard-Announce, vor MIDI-Emission) — Test-Fenster, um einen externen
     /// Tick deterministisch mitten im Lauf zu parken. No-op wenn nil; feuert
     /// höchstens einmal (selbst-löschend), kein Folge-Tick pausiert versehentlich.
-    var _rt3aPausePoint: (() -> Void)?
+    var _rt3aPausePoint: (() -> Void)? {
+        get { kernel._rt3aPausePoint } set { kernel._rt3aPausePoint = newValue }
+    }
     var _rt3aActiveTick: Bool { activeTick.load(ordering: .acquiring) }
     /// Treibt den EXTERNEN Clock-Pfad direkt (tick(scheduledAt:) ist private) —
     /// exakt der Aufrufpfad von midi.onClockPulse auf dem MIDI-Read-Thread.
     func _rt3aDriveOneExternalTick(at ts: UInt64) { tick(scheduledAt: ts) }
+    var _extLookaheadMach: UInt64 { extLookaheadMach.load(ordering: .relaxed) }
+    var _skipReconcileOnce = false
+    var _horizonUnderruns: Int { rtHorizonUnderruns.load(ordering: .relaxed) }
+    var _planConflicts: Int { rtPlanConflicts.load(ordering: .relaxed) }
+    var _clockExtraLeadNs: Double { audioClock.extraLeadNs }
+    var _lateTicks: Int { rtLateTicks.load(ordering: .relaxed) }
 
     // RT-3b: Test-Fenster auf den Fail-Safe Deferred Cleanup.
     var _rt3bCleanupPending: Bool { stopCleanupPending }
@@ -687,34 +592,21 @@ class SequencerEngine: ObservableObject {
 
     // RT-4b: Test-Fenster auf den RT-sicheren PRNG — deterministischer Seed
     // für reproduzierbare Zufalls-Assertions (Random-Direction, Probability-Gate).
-    func _rt4bSetRandomSeedForTest(_ seed: UInt64) { rtRandom = RTRandom(seed: seed) }
+    func _rt4bSetRandomSeedForTest(_ seed: UInt64) { kernel.rtRandom = RTRandom(seed: seed) }
     #endif
 
-    // Konvertiert Nanosekunden in Mach-Zeiteinheiten (plattformspezifisch).
-    private static let machTimebase: mach_timebase_info_data_t = {
-        var info = mach_timebase_info_data_t()
-        mach_timebase_info(&info)
-        return info
-    }()
-    private static func nanosToMachTime(_ ns: UInt64) -> UInt64 {
-        let tb = machTimebase
-        // nanoseconds = mach_time × numer / denom
-        // → mach_time  = ns × denom / numer
-        // Overflow-Schutz: multipliziere zuerst, wenn denom ≤ numer (kleinerer Faktor vorn).
-        return (tb.denom <= tb.numer)
-            ? ns * UInt64(tb.denom) / UInt64(tb.numer)
-            : ns / UInt64(tb.numer) * UInt64(tb.denom)
-    }
+    // Zeitumrechnung: `HostTime` (v1.16.1). Die Engine-Namen bleiben als Weiterleitung.
+    private static var machTimebase: mach_timebase_info_data_t { HostTime.timebase }
+    @inline(__always)
+    static func shifted(_ t: UInt64, bySeconds seconds: Double) -> UInt64 { HostTime.shifted(t, bySeconds: seconds) }
+    static func machToNanos(_ t: UInt64) -> UInt64 { HostTime.machToNanos(t) }
+    static func nanosToMachTime(_ ns: UInt64) -> UInt64 { HostTime.nanosToMachTime(ns) }
 
     /// RT-SAFE: Klemmt einen MIDITimeStamp auf ≥ jetzt + 1 ms.
     /// Identische Logik wie der Safety-Clamp in advanceSteps() — als shared Helper extrahiert,
     /// damit clockTick() denselben Clamp-Boden verwenden kann.
     /// @inline(__always): Keine Call-Overhead im Tick-Thread-Pfad.
     @inline(__always)
-    private func clampToFuture(_ t: MIDITimeStamp) -> MIDITimeStamp {
-        let nowSafe = mach_absolute_time() + Self.safetyOffsetMach
-        return t < nowSafe ? nowSafe : t
-    }
     private var cancellables:      Set<AnyCancellable> = []
     /// Per-Track-Mutations subscribing bag — rebuilt automatically whenever the
     /// pattern / track structure changes. Cleared at the start of every
@@ -736,9 +628,13 @@ class SequencerEngine: ObservableObject {
     private var snapshotPending = false
     /// Main-only: true, während die EXT-Clock-BPM-Schätzung `bpm` schreibt (kein Dirty-Flag).
     private var applyingExternalBPMEstimate = false
+    /// Main-only: ein asynchroner Speichervorgang läuft (v1.16.1).
+    var saveInFlight = false
     var currentPattern: Pattern { patterns[currentPatternIndex] }
 
     init() {
+        _ = kernel    // jetzt (Main) anlegen, samt `noteOut` — der Tick-Pfad darf nie eine
+                      // lazy-Initialisierung auslösen
         midi.setup()
         loadRecentFiles()
         startDisplaySignal()
@@ -746,13 +642,13 @@ class SequencerEngine: ObservableObject {
         // in den Playback-Snapshot. Ein entfernter Kanal stellt seine Spuren auf externe
         // MIDI-Ausgabe zurück (sonst blieben sie an einer toten ID hängen).
         rack.onProjectChange = { [weak self] in
-            guard let self, !self.hasUnsavedChanges else { return }
-            self.hasUnsavedChanges = true
+            self?.presetEditorState.markChanged()
         }
         rack.onRoutingChange = { [weak self] in
             guard let self, self.transportState.isPlaying else { return }
             self.publishSnapshot()
         }
+        rack.onOutputConfigChange = { [weak self] in self?.updateExtLookahead() }
         rack.onChannelRemoved = { [weak self] id in
             guard let self else { return }
             for pattern in self.patterns {
@@ -763,20 +659,19 @@ class SequencerEngine: ObservableObject {
             }
         }
         // onTick einmalig vor start() setzen — Lebenszyklus-Pflicht (ClockSource).
-        audioClock.onTick = { [weak self] timestamp in
-            self?.clockTick(at: timestamp)
+        // Der Clock-Thread erreicht nur den Tick-Kern (kein Engine-Zugriff, kein weak-Load).
+        audioClock.onTick = { [kernel] timestamp in
+            kernel.clockTick(at: timestamp)
         }
-        midi.onClockPulse = { [weak self] in
+        midi.onClockPulse = { [weak self] packetTime in
             // Guard: nur im EXT-Modus verarbeiten.
             // Verhindert Doppel-Tick wenn ClockSource (INT) und eingehende
             // 0xF8-Nachrichten (z.B. aus Logic) gleichzeitig aktiv sind → vorher: 2× Tempo-Bug.
             // RT-1: atomarer Read statt @Published (läuft auf dem MIDI-Read-Thread).
             guard let self, !self.clockIsInternal.load(ordering: .acquiring) else { return }
-            let now = mach_absolute_time()
+            let now = packetTime
             if self.extResetRequested.exchange(false, ordering: .acquiringAndReleasing) {
-                self.extPulseCount      = 0
-                self.extLastTickMach    = 0
-                self.extTickIntervalEMA = 0.0
+                self.extPulseCount = 0
             }
             // BPM-Schätzung aus Pulsabstand: alle 24 Pulse (= 1 Beat) neu berechnen.
             // Aktualisiert die BPM-Anzeige im Takt des externen Masters.
@@ -801,22 +696,9 @@ class SequencerEngine: ObservableObject {
                 self.extPulseCount = 1
                 self.extBeatStart  = now
             }
-            // Prädiktiver Lookahead: EMA über gemessene Tick-Intervalle.
-            // scheduledAt = now + EMA ≈ vorhergesagter Zeitpunkt des nächsten Ticks.
-            // → CoreMIDI erhält Future-Timestamps; Overshoot-Fix wirkt auch im EXT-Modus.
-            // Erster Puls (extLastTickMach == 0): kein Intervall messbar → Fallback auf now.
-            if self.extLastTickMach > 0 {
-                let measured = Double(now - self.extLastTickMach)
-                self.extTickIntervalEMA = self.extTickIntervalEMA > 0
-                    ? (1.0 - self.extEMAAlpha) * self.extTickIntervalEMA + self.extEMAAlpha * measured
-                    : measured
-            }
-            self.extLastTickMach = now
-
-            let scheduledAt = self.extTickIntervalEMA > 0
-                ? now + UInt64(self.extTickIntervalEMA)
-                : now
-            self.tick(scheduledAt: scheduledAt)
+            // Fester Vorlauf ab der Paketzeit: konstante Phase zum Master, Future-Timestamps
+            // für CoreMIDI, AU-Warteschlangen und Taktanker.
+            self.tick(scheduledAt: packetTime &+ self.extLookaheadMach.load(ordering: .relaxed))
         }
         midi.onStart      = { [weak self] in self?.startFromExternal(isContinue: false) }
         midi.onStop       = { [weak self] in
@@ -827,6 +709,15 @@ class SequencerEngine: ObservableObject {
             self.stop()
         }
         midi.onContinue   = { [weak self] in self?.startFromExternal(isContinue: true) }
+        // 0xFA/0xFB direkt auf dem MIDI-Read-Thread (v1.15.2): eine im Stopp vorbereitete
+        // Sitzung wird sofort scharf — der nächste 0xF8 ist Puls 0, auch wenn Main noch
+        // beschäftigt ist. Main zieht Anzeige und Transportzustand danach nach.
+        midi.onStartRT    = { [weak self] in
+            guard let self, !self.clockIsInternal.load(ordering: .acquiring),
+                  self.extArmed.exchange(false, ordering: .acquiringAndReleasing) else { return }
+            self.extStartedRT.store(true, ordering: .releasing)
+            self.isPlayingRT.store(true, ordering: .sequentiallyConsistent)
+        }
         midi.onCC         = { [weak self] _, num, val in self?.handleIncomingCC(num, val) }
         midi.onNoteOn     = { [weak self] _, note, _ in self?.handleLearnNoteOn(note) }
         // C1: MIDI Device Disconnect — läuft auf dem Main-Thread (via refreshPorts).
@@ -851,10 +742,6 @@ class SequencerEngine: ObservableObject {
         // Arch-Slice-12a: discovered by WorkflowEngineTests.PlaybackTransportTests.
         // Without this, ARC deinit of a test-scope SequencerEngine crashes with:
         //   BUG IN CLIENT OF LIBDISPATCH: Release of an inactive object
-        rtRuntimes.deinitialize(count: Self.runtimeSlotCount); rtRuntimes.deallocate()
-        noteBook.deinitialize(count: Self.noteBookSize);       noteBook.deallocate()
-        earliestPendingOff.deinitialize(count: Self.portCount); earliestPendingOff.deallocate()
-        portEpoch.deinitialize(count: Self.portCount); portEpoch.deallocate()
         offWatchdog?.cancel()
         displaySignal?.cancel()
         if !isPlaying {
@@ -911,6 +798,9 @@ class SequencerEngine: ObservableObject {
     ///     modify `patterns` or `pattern.tracks` themselves → no re-trigger. ✓
     private func rebuildAllTrackSubs(for patterns: [Pattern],
                                      pending: (pattern: Pattern, tracks: [TrackData])? = nil) {
+        #if DEBUG
+        _subscriptionRebuilds += 1
+        #endif
         trackChangeSubs      = []
         patternStructureSubs = []
 
@@ -925,6 +815,8 @@ class SequencerEngine: ObservableObject {
                 .dropFirst()
                 .sink { [weak self, weak pattern] newTracks in
                     guard let self, let pattern else { return }
+                    // In einer Strukturtransaktion genau ein Neuaufbau am Ende (Codex A17-07).
+                    if self.structureTransactionDepth > 0 { self.structureRebuildPending = true; return }
                     self.rebuildAllTrackSubs(for: self.patterns, pending: (pattern, newTracks))
                 }
                 .store(in: &patternStructureSubs)
@@ -1118,9 +1010,8 @@ class SequencerEngine: ObservableObject {
             // Falls das Weck-Event bei vollem Ring verworfen wurde: hier nachziehen.
             if self.reconcilePatternSwitch() { self.publishSnapshot() }
             // Songende erreicht (Tick-Thread spielt nichts mehr an): anhalten.
-            if self.rtSongEnded.exchange(false, ordering: .acquiringAndReleasing), self.isPlaying {
-                self.stop()
-            }
+            self.stopIfSongEnded()
+            self.reportPlanDiagnostics()
 
             // --- 4. S01: abgebrochene Gesamttick sichtbar machen (StatusBar) ---
             self.syncSnapshotAcquireDisplay()
@@ -1160,7 +1051,7 @@ class SequencerEngine: ObservableObject {
 
     /// Setzt die Anzeige für eine neue Sitzung zurück (play()/EXT-Start). Main.
     private func resetSnapshotAcquireDisplay() {
-        snapshotAcquireBaseline = snapshotAcquireFailures.load(ordering: .acquiring)
+        snapshotAcquireBaseline = publisher.acquireFailures
         acquireDisplayLastPublish = 0
         if clockDiagnostics.snapshotAcquireFailures != 0 { clockDiagnostics.snapshotAcquireFailures = 0 }
     }
@@ -1170,7 +1061,7 @@ class SequencerEngine: ObservableObject {
     /// höchstens ein Update pro Sekunde koalesziert (kein Invalidierungssturm pro Tick), ein
     /// nachlaufender Abgleich stellt den Endstand sicher. Main.
     private func syncSnapshotAcquireDisplay() {
-        let total = snapshotAcquireFailures.load(ordering: .acquiring) - snapshotAcquireBaseline
+        let total = publisher.acquireFailures - snapshotAcquireBaseline
         let shown = clockDiagnostics.snapshotAcquireFailures
         guard total != shown else { return }
         let now = CACurrentMediaTime()
@@ -1193,9 +1084,17 @@ class SequencerEngine: ObservableObject {
     /// Darf ausschließlich auf dem Main-Thread aufgerufen werden.
     /// Der Tick-Thread vertraut blind auf die gelieferten Werte — keine ungültigen
     /// Werte dürfen den Snapshot verlassen.
-    private func buildPatternSnapshot(for pattern: Pattern) -> PatternSnapshot {
+    private func buildPatternSnapshot(for pattern: Pattern, index: Int) -> PatternSnapshot {
+        let meter = pattern.timeSignature
         let tracks = pattern.tracks.map { track -> TrackSnapshot in
             let lane = track.lane
+            // Steplänge „Gruppe" (v1.18.30): Längen je Step aus der Gruppierung des Patterns;
+            // ohne Gruppierung ein Takt.
+            let grouped: (pps: Double?, groups: StepGroups) = {
+                guard lane.stepGroup else { return (nil, StepGroups()) }
+                let g = lane.groupSixteenths(meter).map { 6.0 * Double($0) }
+                return g.count > 1 ? (g[0], StepGroups(g)) : (g[0], StepGroups())
+            }()
 
             // Exhaustiveness-Anker (Lane Slice 3):
             // Der einzige Ort, an dem `LaneKind` zum Dispatch wird. Künftige
@@ -1213,7 +1112,7 @@ class SequencerEngine: ObservableObject {
 
                 let steps = (0..<stepCount).map { i -> StepSnapshot in
                     let s = lane.steps[i]
-                    let notes = lane.fixedNote.map { [max(0, min(127, $0))] }
+                    let notes = lane.fixedNotes.map { $0.map { max(0, min(127, $0)) } }
                         ?? (s.notes.isEmpty ? [60] : s.notes.map { max(0, min(127, $0)) })
                     return StepSnapshot(
                         isActive:    s.isActive,
@@ -1232,8 +1131,9 @@ class SequencerEngine: ObservableObject {
                     kind:          .step,
                     stepCount:     stepCount,
                     direction:     lane.direction,
-                    pulsesPerStep: pps,
-                    payload:       .step(steps: steps)
+                    pulsesPerStep: grouped.pps ?? pps,
+                    payload:       .step(steps: steps),
+                    groups:        grouped.groups
                 )
             case .cc:
                 let stepCount = max(1, min(64, lane.stepCount))
@@ -1249,17 +1149,18 @@ class SequencerEngine: ObservableObject {
                     kind:          .cc,
                     stepCount:     stepCount,
                     direction:     lane.direction,
-                    pulsesPerStep: pps,
+                    pulsesPerStep: grouped.pps ?? pps,
                     payload:       .cc(values:  ccs,
                                        number:  max(0, min(127, lane.ccNumber)),
-                                       isMuted: lane.ccIsMuted)
+                                       isMuted: lane.ccIsMuted),
+                    groups:        grouped.groups
                 )
             }
 
             let binding = runtimeBinding(for: track.id)
             // CC-Lane mit Instrument-Parameter: Bereich jetzt (Main) auflösen. Fehlt der
             // Parameter oder lädt das Instrument noch, bleibt es bei MIDI-CC.
-            let route = rack.route(for: track.instrumentID)
+            let route = rack.route(for: track.output)
             var parameter: ParameterTarget?
             var ccUnresolved = false
             if lane.kind == .cc, let ref = lane.ccParameter, route >= 0, let ch = track.instrumentID {
@@ -1275,14 +1176,15 @@ class SequencerEngine: ObservableObject {
                 slot:          binding.slot,
                 epoch:         binding.epoch,
                 route:         route,
-                routeEpoch:    rack.routeEpoch(for: track.instrumentID),
+                routeEpoch:    rack.routeEpoch(for: track.output),
                 parameter:     parameter,
-                ccUnresolved:  ccUnresolved
+                ccUnresolved:  ccUnresolved,
+                isAudioLoop:   track.isAudioLoop && route >= 0
             )
         }
 
         let hasSolo = tracks.contains { $0.isSolo }
-        return PatternSnapshot(tracks: tracks, hasSolo: hasSolo)
+        return PatternSnapshot(tracks: tracks, hasSolo: hasSolo, meter: pattern.timeSignature, pattern: index)
     }
 
     // MARK: Runtime-Slot-Vergabe (Main-Thread only)
@@ -1317,6 +1219,7 @@ class SequencerEngine: ObservableObject {
         slotByTrack.removeAll(keepingCapacity: true)
         freeSlots = Array((0..<Self.runtimeSlotCount).reversed())
         patternSerial += 1
+        planLedger.beginSession()
     }
 
     /// Zieht einen vom Tick-Thread vollzogenen Patternwechsel auf Main nach
@@ -1324,8 +1227,22 @@ class SequencerEngine: ObservableObject {
     /// der Aufrufer publiziert danach einen Snapshot mit der neuen Aktivierung.
     @discardableResult
     private func reconcilePatternSwitch() -> Bool {
-        guard let idx = queuedPatternIndex, patterns.indices.contains(idx),
-              rtSwitchedSerial.load(ordering: .acquiring) == patternSerial + 1 else { return false }
+        // Der Tick-Thread kann seit dem letzten Publish mehrere geplante Wechsel vollzogen
+        // haben (Song, v1.15.1): k = Anzahl, maßgeblich ist der zuletzt vollzogene.
+        // Zuordnung über Sitzung und Plan-Linie des Stempels (v1.15.2): nur so lässt sich ein
+        // Wechsel unter einer inzwischen ersetzten Vormerkung richtig benennen (Codex R6).
+        let stamp = rtSwitchStamp.load(ordering: .acquiring)
+        guard planLedger.matchesSession(stampByte: UInt32(stamp >> 56)) else { return false }
+        let plan = UInt32((stamp >> 44) & 0xFFF)
+        let low = UInt32((stamp >> 32) & 0xFFF)
+        let k = Int((low &- UInt32(truncatingIfNeeded: patternSerial)) & 0xFFF)
+        let lastPulse = Int(UInt32(truncatingIfNeeded: stamp))
+        guard k >= 1, k < 0x800,
+              let line = planLedger.line(stampPlan: plan),
+              let step = line.steps[patternSerial + k] else { return false }
+        let fromCurrentLine = line.id == planLedger.currentID
+        let idx = step.pattern
+        guard patterns.indices.contains(idx) else { return false }
         for td in currentPattern.tracks {
             if let vm = vmCache[td.id] {
                 vm.lastFiredNotes.forEach { sendImmediateNoteOff(td, note: $0) }
@@ -1333,17 +1250,23 @@ class SequencerEngine: ObservableObject {
             }
         }
         cancelInteractionSession()   // die Lanes des alten Patterns verschwinden
-        patternSerial += 1
-        queuedPatternIndex  = nil
+        patternSerial += k
+        // Eine Vormerkung, die erst nach dem Wechsel unter der alten Linie kam, bleibt stehen.
+        if fromCurrentLine || queuedPatternIndex == idx { queuedPatternIndex = nil }
         currentPatternIndex = idx
         playbackDisplay.steps = Array(repeating: -1, count: patterns[idx].tracks.count)
-        // Das abgelöste Pattern gibt seine Runtime-Slots ab: der Tick-Thread spielt bereits
-        // die Vormerkung, und kehrt das Pattern später zurück (Song), beginnt es frisch.
-        releaseUnusedSlots(keeping: Set(patterns[idx].tracks.map(\.id)))
-        if let next = songNextScene {
-            // Song: der Wechsel lag auf `rtSwitchPulse` — dort beginnt der neue Lauf.
-            songRunStart      = next
-            songRunStartPulse = rtSwitchPulse.load(ordering: .relaxed)
+        // Das abgelöste Pattern gibt seine Runtime-Slots ab, sofern es nicht im verbleibenden
+        // Plan liegt: der Tick-Thread kann ihn schon weiter abspielen (Song, mehrere Wechsel
+        // ohne Main) — dessen Slots und Epochen müssen bis zum nächsten Publish stehen bleiben.
+        // Kehrt ein Pattern zurück, setzt der Tick-Thread seine Runtimes beim Wechsel zurück.
+        var keep = Set(patterns[idx].tracks.map(\.id))
+        for p in planLedger.plannedPatterns(after: patternSerial) where patterns.indices.contains(p) {
+            keep.formUnion(patterns[p].tracks.map(\.id))
+        }
+        releaseUnusedSlots(keeping: keep)
+        if let scene = step.scene {
+            // Song: der letzte Wechsel lag auf `rtSwitchPulse` — dort beginnt der neue Lauf.
+            songPlanner.beginRun(scene: scene, pulse: lastPulse)
             scheduleSongNext()
         }
         return true
@@ -1359,47 +1282,34 @@ class SequencerEngine: ObservableObject {
         guard song.isActive else { return }
         let first = song.scenes[0].pattern
         if patterns.indices.contains(first), first != currentPatternIndex { applyPatternSwitch(first) }
-        songRunStart      = 0
-        songRunStartPulse = 0
+        songPlanner.beginRun(scene: 0, pulse: 0)
         scheduleSongNext()
     }
 
     /// Merkt aus dem laufenden Lauf den nächsten Wechsel (Pattern + absoluter Puls) oder das
     /// Songende vor. Publiziert nicht — der Aufrufer tut das (bzw. publishSnapshot baut danach).
+    ///
+    /// v1.15.1 (Codex H3): bis zu `songHorizon` Wechsel im Voraus, begrenzt durch die
+    /// Runtime-Slots (jedes verschiedene Pattern im Plan belegt einen Slot je Spur). Der
+    /// Tick-Thread geht den Plan allein durch; Main füllt beim Nachziehen auf.
     private func scheduleSongNext() {
-        guard let start = songRunStart, song.isActive, song.scenes.indices.contains(start) else {
+        let perPattern = max(1, currentPattern.tracks.count)
+        guard songPlanner.schedule(song: song, playing: currentPatternIndex, patternCount: patterns.count,
+                                   maxDistinct: max(2, Self.runtimeSlotCount / perPattern),
+                                   pulsesPerBar: { [patterns] p in
+                                       patterns.indices.contains(p) ? patterns[p].timeSignature.pulsesPerBar : Song.pulsesPerBar
+                                   }) else {
             clearSongSchedule(); return
         }
-        let run = song.run(from: start, playing: currentPatternIndex)
-        let end = songRunStartPulse + run.bars * Song.pulsesPerBar
-        songState.playingScene = start
-        switch run.then {
-        case .scene(let i) where patterns.indices.contains(song.scenes[i].pattern):
-            songNextScene      = i
-            songSwitchAtPulse  = end
-            songStopAtPulse    = -1
-            queuedPatternIndex = song.scenes[i].pattern
-        case .scene, .end:
-            songNextScene      = nil
-            songSwitchAtPulse  = -1
-            songStopAtPulse    = end
-            queuedPatternIndex = nil
-        case .never:
-            songNextScene      = nil
-            songSwitchAtPulse  = -1
-            songStopAtPulse    = -1
-            queuedPatternIndex = nil
-        }
+        songState.playingScene = songPlanner.runStart
+        queuedPatternIndex = songPlanner.plan.first?.pattern
     }
 
     /// Hebt jede Song-Vormerkung auf (Stop, Song aus). Lässt `queuedPatternIndex` nur dann
     /// stehen, wenn er nicht vom Song stammt.
     private func clearSongSchedule() {
         if songNextScene != nil { queuedPatternIndex = nil }
-        songRunStart      = nil
-        songNextScene     = nil
-        songSwitchAtPulse = -1
-        songStopAtPulse   = -1
+        songPlanner.clear()
         if songState.playingScene != nil { songState.playingScene = nil }
     }
 
@@ -1420,14 +1330,128 @@ class SequencerEngine: ObservableObject {
         s.clamp(patternCount: patterns.count)
         songState.song = s
         hasUnsavedChanges = true
-        guard isPlaying, songRunStart != nil else { return }
+        if !isPlaying { armExternalStart(); return }
+        guard songRunStart != nil else { return }
         reconcilePatternSwitch()
         if !song.isActive {
             clearSongSchedule()
         } else {
-            songRunStart = min(songRunStart ?? 0, song.scenes.count - 1)
+            songPlanner.clampRun(sceneCount: song.scenes.count)
             scheduleSongNext()
         }
+        publishSnapshot()
+    }
+
+    // MARK: - Taktart je Pattern (v1.18.12, je Pattern seit v1.18.24)
+
+    /// Taktart des aktuellen Patterns (Raster, Pad-Längen, Anzeige).
+    var timeSignature: TimeSignature { transportState.timeSignature }
+    var switchOnBar: Bool { transportState.switchOnBar }
+
+    /// Taktart des aktuellen Patterns ändern, mit Undo. Läuft dieses Pattern gerade, wird sie
+    /// vorgemerkt und gilt, sobald es nicht mehr läuft (Entscheidung E2) — so bleiben Taktraster
+    /// und Pad-Längen eines laufenden Abschnitts zueinander passend (Codex KT-02).
+    func setTimeSignatureUndoable(_ requested: TimeSignature, actionName: String) {
+        requestMeter(requested.clamped, pattern: currentPatternIndex, actionName: actionName)
+    }
+
+    private func requestMeter(_ m: TimeSignature, pattern i: Int, actionName: String, publish: Bool = true) {
+        guard patterns.indices.contains(i) else { return }
+        if isPlaying, i == currentPatternIndex {
+            pendingMeters[i] = m == patterns[i].timeSignature ? nil : m
+            syncMeter()
+            return
+        }
+        pendingMeters[i] = nil
+        let old = patterns[i].timeSignature
+        guard m != old else { syncMeter(); return }
+        var pads: [(LaneData, old: Int, new: Int)] = []
+        // Lange Steps jeder Spur (v1.18.29; vorher nur Pad-Spuren).
+        for t in patterns[i].tracks where t.lane.stepGroup || (t.lane.isLongStep && t.lane.stepLengthDenominator == 1) {
+            // „Gruppe" (v1.18.30): Ersatzlänge = erste Gruppe in der neuen Taktart.
+            let n = t.lane.stepLengthNumerator
+            let k = t.lane.stepGroup ? t.lane.groupSixteenths(m)[0] : old.convert(sixteenths: n, to: m)
+            if k != n { pads.append((t.lane, n, k)) }
+        }
+        let pattern = patterns[i]
+        applyMeter(m, to: pattern, pads: pads.map { ($0.0, $0.new) }, publish: publish)
+        guard let um = undoManager else { return }
+        // Identitätsgebunden an Pattern und Lanes; Undo/Redo folgen derselben Vormerkregel.
+        registerReversibleUndo(um: um, target: self, actionName: actionName,
+                               forward:  { $0.restoreMeter(m, of: pattern, pads: pads.map { ($0.0, $0.new) }, actionName: actionName) },
+                               backward: { $0.restoreMeter(old, of: pattern, pads: pads.map { ($0.0, $0.old) }, actionName: actionName) })
+    }
+
+    private func restoreMeter(_ m: TimeSignature, of pattern: Pattern, pads: [(LaneData, Int)], actionName: String) {
+        guard let i = patterns.firstIndex(where: { $0 === pattern }) else { return }
+        if isPlaying, i == currentPatternIndex { pendingMeters[i] = m; syncMeter(); return }
+        applyMeter(m, to: pattern, pads: pads)
+    }
+
+    private func applyMeter(_ m: TimeSignature, to pattern: Pattern, pads: [(LaneData, Int)], publish: Bool = true) {
+        for (lane, n) in pads where lane.stepLengthNumerator != n {
+            lane.stepLengthNumerator = n; lane.changed.send()
+        }
+        pattern.timeSignature = m
+        hasUnsavedChanges = true
+        syncMeter()
+        if publish { publishSnapshot() }
+    }
+
+    /// Vorgemerkte Taktarten übernehmen, deren Pattern nicht mehr läuft (Main; aus
+    /// `publishSnapshot` und Stop). Je Übernahme ein Undo-Schritt.
+    private func applyPendingMeters() {
+        guard !pendingMeters.isEmpty else { return }
+        for (i, m) in pendingMeters where !isPlaying || i != currentPatternIndex {
+            pendingMeters[i] = nil
+            // Aus `publishSnapshot`: nicht selbst veröffentlichen, der Aufrufer baut danach.
+            requestMeter(m, pattern: i, actionName: Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en").undoTimeSignature,
+                         publish: false)
+        }
+    }
+
+    /// Anzeige, Raster und Plug-in-Takt im Stillstand auf die Taktart des aktuellen Patterns.
+    func syncMeter() {
+        let m = currentPattern.timeSignature
+        if transportState.timeSignature != m {
+            objectWillChange.send()               // Taktart: Transportereignis (Raster, Pad-Längen)
+            transportState.timeSignature = m
+        }
+        rack.hostSync.setMeter(m)
+        let pending = pendingMeters[currentPatternIndex]
+        if transportState.pendingTimeSignature != pending { transportState.pendingTimeSignature = pending }
+    }
+
+    /// Laden: Vormerkungen gehören zum abgelösten Projekt.
+    func pendingMetersReset() {
+        pendingMeters = [:]
+        syncMeter()
+        publishSnapshot()
+    }
+
+    /// Ohne Undo (Laden/Neu, Tests): alle Patterns auf `m`.
+    func replaceTimeSignature(_ m: TimeSignature) {
+        let m = m.clamped
+        pendingMeters = [:]
+        for p in patterns { p.timeSignature = m }
+        syncMeter()
+        publishSnapshot()
+    }
+
+    /// Patternwechsel ohne Song: nächster Taktstrich oder Ende Spur 1 (E3), mit Undo.
+    func setSwitchOnBarUndoable(_ on: Bool, actionName: String) {
+        let old = switchOnBar
+        guard on != old else { return }
+        replaceSwitchOnBar(on)
+        hasUnsavedChanges = true
+        guard let um = undoManager else { return }
+        registerReversibleUndo(um: um, target: self, actionName: actionName,
+                               forward: { $0.replaceSwitchOnBar(on) }, backward: { $0.replaceSwitchOnBar(old) })
+    }
+
+    func replaceSwitchOnBar(_ on: Bool) {
+        guard on != transportState.switchOnBar else { return }
+        transportState.switchOnBar = on
         publishSnapshot()
     }
 
@@ -1436,6 +1460,7 @@ class SequencerEngine: ObservableObject {
         var s = new
         s.clamp(patternCount: patterns.count)
         songState.song = s
+        if !isPlaying { armExternalStart() }
     }
 
     /// Veröffentlicht einen neuen PlaybackStateBundle atomar — kein Lock, kein Blocking.
@@ -1455,55 +1480,75 @@ class SequencerEngine: ObservableObject {
         #if DEBUG
         _s01PublishCount &+= 1
         #endif
+        rack.hostSync.setIdleTempo(bpmOverride ?? bpm)   // Plug-ins sehen das Tempo auch im Stillstand
         // Ein bereits vollzogener Wechsel muss VOR dem Bauen übernommen sein — sonst trüge
         // der neue Bundle noch die alte Aktivierung.
+        #if DEBUG
+        // Test: simuliert einen Tick-Wechsel genau zwischen Abgleich und Veröffentlichung.
+        if _skipReconcileOnce { _skipReconcileOnce = false } else { reconcilePatternSwitch() }
+        #else
         reconcilePatternSwitch()
-        let snap   = buildPatternSnapshot(for: currentPattern)
+        #endif
+        // Vorgemerkte Taktarten (E2), sobald ihr Pattern nicht mehr läuft; danach Anzeige/Raster.
+        applyPendingMeters()
+        syncMeter()
+        rack.loops.setStretchTarget(bpm: bpmOverride ?? bpm, quartersPerBar: timeSignature.quartersPerBar)
+        let snap   = buildPatternSnapshot(for: currentPattern, index: currentPatternIndex)
         var live   = Set(currentPattern.tracks.map(\.id))
+        // Negative Spuroffsets brauchen Vorlauf (Codex T8): größten über alle Patterns führen.
+        let reserve = min(TrackData.maxTimingOffset,
+                          max(0, -(patterns.lazy.flatMap(\.tracks).map(\.timingOffset).min() ?? 0)))
+        if reserve != negativeOffsetReserve {
+            negativeOffsetReserve = reserve
+            updateExtLookahead(refreshDevice: false)
+        }
         var queued: PatternSnapshot?
+        var later: [PlaybackStateBundle.PlanStep] = []
+        var entries: [PlanEntry] = []
         if let q = queuedPatternIndex, patterns.indices.contains(q), q != currentPatternIndex {
-            queued = buildPatternSnapshot(for: patterns[q])
-            live.formUnion(patterns[q].tracks.map(\.id))
+            // Song: der ganze Plan (je Pattern ein Snapshot, Wiederholungen teilen ihn);
+            // sonst nur die manuelle Vormerkung.
+            var built: [Int: PatternSnapshot] = [currentPatternIndex: snap]
+            func snapshot(_ p: Int) -> PatternSnapshot {
+                if let s = built[p] { return s }
+                let s = buildPatternSnapshot(for: patterns[p], index: p); built[p] = s
+                live.formUnion(patterns[p].tracks.map(\.id))
+                return s
+            }
+            queued = snapshot(q)
+            if let first = songPlanner.plan.first, first.pattern == q {
+                entries = songPlanner.plan.map { ($0.pattern, $0.scene, $0.pulse) }
+                later = songPlanner.plan.dropFirst().map {
+                    PlaybackStateBundle.PlanStep(snapshot: snapshot($0.pattern), switchAtPulse: $0.pulse)
+                }
+            } else {
+                entries = [(q, nil, -1)]
+            }
         }
         releaseUnusedSlots(keeping: live)
         let songQueued = queued != nil && songNextScene != nil
+        // Plan-Linie: Fortschreibung, solange jeder schon geplante künftige Schritt gleich
+        // bleibt; sonst neue Linie mit dem bisherigen Plan als Vorgänger.
+        let steps = Dictionary(uniqueKeysWithValues: entries.enumerated().map { (patternSerial + $0.offset + 1, $0.element) })
+        let previous = publisher.current?.bundle
+        var prevID: UInt32 = 0, prevBase = 0, prevSteps: [PatternSnapshot] = []
+        if planLedger.record(steps, serial: patternSerial),
+           let prev = previous, prev.session == sessionCounter {
+            prevID = prev.planID; prevBase = prev.serial; prevSteps = prev.plannedSnapshots
+        }
         let bundle = PlaybackStateBundle(snapshot: snap, bpm: bpmOverride ?? bpm, swing: swing,
+                                         meter: timeSignature, switchOnBar: switchOnBar,
                                          serial: patternSerial, queued: queued,
-                                         switchAtPulse: songQueued ? songSwitchAtPulse : -1,
-                                         stopAtPulse: songStopAtPulse)
+                                         switchAtPulse: songQueued ? songPlanner.switchAtPulse : -1,
+                                         stopAtPulse: songPlanner.stopAtPulse, later: later,
+                                         session: sessionCounter, planID: planLedger.currentID,
+                                         prevPlanID: prevID, prevBase: prevBase, prevSteps: prevSteps,
+                                         planEndPulse: songQueued ? songPlanner.planEndPulse : -1)
         let newBox = PlaybackBundleBox(bundle)
 
-        let superseded = bundleCurrent   // bisher aktuelle Box — wird jetzt abgelöst
-        bundleCurrent  = newBox          // neue Box am Leben halten, BEVOR publiziert wird
-
-        // S01 — Memory Ordering: seq_cst store (W1) + seq_cst hazard load (W2).
-        //
-        // Der Store ist zugleich Release-Publikation: alle Writes davor (bundleCurrent =
-        // newBox, Initialisierung des Box-Inhalts) sind für jeden Reader sichtbar, der den
-        // Pointer mit einem acquire-Anteil lädt (R3). Release/Acquire allein genügt für die
-        // FREIGABE aber nicht (Store-Buffering, siehe Protokollbeweis oben): erst die
-        // gemeinsame Totalordnung von W1, W2, R2, R3 garantiert, dass entweder W2 den
-        // Hazard sieht oder R3 den neuen Pointer.
-        let rawPtr = Self.rawOf(newBox)
-        atomicBundleRaw.store(rawPtr, ordering: .sequentiallyConsistent)
-
-        // Freigabe der abgelösten Box gegen den Hazard-Pointer prüfen (W2/W3).
-        let hz = hazardBundleRaw.load(ordering: .sequentiallyConsistent)
-        // Eine früher aufgeschobene Box freigeben, sobald der Leser nicht mehr darauf steht.
-        if let d = bundleDeferred, Self.rawOf(d) != hz { bundleDeferred = nil }
-        // Die gerade abgelöste Box: hält der Leser sie noch, aufschieben; sonst fällt sie hier.
-        if let s = superseded, Self.rawOf(s) == hz { bundleDeferred = s }
-        // `superseded` darf nicht vor W1/W2 freigegeben werden (ARC verkürzt Lebensdauern
-        // bis zur letzten Verwendung); das Halten über den ganzen Ablauf macht die
-        // Reihenfolge „publizieren → Hazard lesen → freigeben“ explizit.
-        withExtendedLifetime(superseded) {}
+        publisher.publish(newBox)
     }
 
-    /// RT-3: roher Opaque-Pointer einer Box als Int (identisch zur Publish-Kodierung).
-    @inline(__always)
-    private static func rawOf(_ box: PlaybackBundleBox) -> Int {
-        Int(bitPattern: Unmanaged.passUnretained(box).toOpaque())
-    }
 
     // MARK: - Transport-Sink-Setup (Arch-Slice-19)
 
@@ -1532,7 +1577,7 @@ class SequencerEngine: ObservableObject {
                 // Guard: @Published feuert objectWillChange auch bei true=true.
                 // Nur beim ersten Wechsel false→true zuweisen, sonst engine.OWC-Flood
                 // bei jedem BPM-Tick → StepGrid-Rebuilds trotz TransportState-Isolation.
-                if !self.hasUnsavedChanges { self.hasUnsavedChanges = true }
+                self.presetEditorState.markChanged()
             }
             .store(in: &cancellables)
 
@@ -1628,7 +1673,62 @@ class SequencerEngine: ObservableObject {
     /// Setzt ClockMode über TransportState — einziger von Views verwendeter Schreibpfad.
     func setClockMode(_ mode: ClockMode) {
         clockMode = mode
+        updateExtLookahead()
+        armExternalStart()
     }
+
+    /// Bereitet im Stopp (EXT-Modus) die nächste Sitzung vor: Song-Beginn, frische Runtimes,
+    /// Snapshot veröffentlicht. Danach genügt dem MIDI-Thread ein atomarer Schalter, um bei
+    /// 0xFA/0xFB zu starten (Codex T1: Start/Continue gingen bisher über Main, ein 0xF8 vor
+    /// der Startverarbeitung fiel aus). Erneut aufgerufen, wenn sich der Song-Beginn ändert.
+    func armExternalStart() {
+        extArmed.store(false, ordering: .releasing)
+        guard clockMode == .external, !isPlaying, !stopCleanupPending,
+              !extStartedRT.load(ordering: .acquiring) else { return }
+        queuedPatternIndex = nil
+        beginSongIfActive()
+        beginRuntimeSession()
+        noteOut.clear()
+        playbackDisplay.steps = Array(repeating: -1, count: currentPattern.tracks.count)
+        resetSnapshotAcquireDisplay()
+        publishSnapshot()
+        extResetRequested.store(true, ordering: .releasing)
+        updateExtLookahead()
+        extArmed.store(true, ordering: .releasing)
+    }
+    #if DEBUG
+    var _extArmed: Bool { extArmed.load(ordering: .acquiring) }
+    #endif
+
+    /// Vorläufe beider Clock-Quellen (v1.15.2, Codex T3/R8/T8) aus Renderhorizont, Overshoot
+    /// und negativen Spuroffsets:
+    ///   - INT: die ClockSource ruft jeden Tick ein Intervall + 10 ms + ein Ausgabepuffer +
+    ///     größter negativer Spuroffset vor seinem Zeitpunkt auf. Ändert nur den Aufrufzeitpunkt,
+    ///     nie das Raster — keine Phasenänderung.
+    ///   - EXT: Tick-Zeit = Paketzeit + ein Pulsintervall (Overshoot) + 10 ms + ein
+    ///     Ausgabepuffer + größter negativer Spuroffset (v1.16.1, Codex V16-3). Konstante Phase
+    ///     zum Master, solange Tempo, Gerät und Offsetreserve gleich bleiben; ändert sich eines
+    ///     davon, wird der Vorlauf neu gesetzt (einmaliger Phasenschritt).
+    ///   Zulässiger Spuroffset in beiden Modi: ±50 ms (`TrackData.maxTimingOffset`); er liegt
+    ///   damit bei fristgerechten Ticks immer vor der Frist und wird nicht begrenzt.
+    /// `refreshDevice`: Puffergröße neu abfragen (Gerätewechsel); sonst Zwischenwert.
+    func updateExtLookahead(refreshDevice: Bool = true) {
+        if refreshDevice || outputBufferSeconds == 0 {
+            outputBufferSeconds = rack.outputBufferSeconds
+        }
+        let pulse = 60.0 / (max(20, bpm) * 24.0)
+        // Auf volle ms aufgerundet: kleine Schwankungen der Tempo-Schätzung bewegen ihn nicht.
+        // Routenlatenz (Codex T7): AU-Ereignisse gehen um sie früher in den Renderweg — der
+        // Vorlauf muss sie mit abdecken.
+        let route = rack.maxRouteLatency
+        let ext = ((pulse + 0.010 + outputBufferSeconds + negativeOffsetReserve + route) * 1000).rounded(.up) / 1000
+        extLookaheadMach.store(Self.nanosToMachTime(UInt64(ext * 1_000_000_000)), ordering: .relaxed)
+        audioClock.extraLeadNs = (outputBufferSeconds + negativeOffsetReserve + route) * 1_000_000_000
+    }
+    /// Puffer des Ausgabegeräts in Sekunden (zwischengespeichert, Main).
+    private var outputBufferSeconds: Double = 0
+    /// Größter negativer Spuroffset des laufenden Projekts in Sekunden (≥ 0).
+    private var negativeOffsetReserve: Double = 0
 
     // MARK: - Transport
 
@@ -1648,7 +1748,7 @@ class SequencerEngine: ObservableObject {
                 return
             }
             teardownRTState()
-            sendPendingNoteOffs()
+            noteOut.sendPendingNoteOffs()
         }
         // Runtime und Snapshot aufbauen, bevor die Clock startet.
         // Song-Modus: erstes Szenen-Pattern aktivieren und den ersten Wechsel vormerken.
@@ -1657,7 +1757,7 @@ class SequencerEngine: ObservableObject {
         // Neue Sitzung: frische Slot-Epochen → jeder Track startet mit frischer Runtime.
         // Quieszent — die Clock läuft noch nicht, isPlayingRT ist false.
         beginRuntimeSession()
-        clearNoteBook()
+        noteOut.clear()
         // Arch-Slice-17: -1 statt 0 — kein vorzeitiges Highlight.
         // Mit 0 zeigte die UI Step 0 sofort beim play()-Aufruf.
         // Der erste echte Tick lieferte ebenfalls Step 0 → Drain erkannte
@@ -1683,6 +1783,7 @@ class SequencerEngine: ObservableObject {
             // clockTick() sendet es auf dem Tick-Thread mit demselben Future-Timestamp
             // wie den ersten 0xF8 → Start und Clock kommen gleichzeitig beim Gerät an.
             audioClock.bpm = bpm
+            updateExtLookahead()   // INT-Vorlauf: Ausgabepuffer + negative Offsets
             audioClock.start()
             midiStartPending.store(true, ordering: .releasing)
         } else {
@@ -1691,7 +1792,53 @@ class SequencerEngine: ObservableObject {
         }
     }
 
-    func stop() {
+    func stop() { stop(loopsEndAt: nil) }
+
+    /// Songende erreicht (Tick-Thread spielt nichts mehr an). Den Abschluss aller Wege hat der
+    /// Tick schon auf den geplanten Endpuls gelegt — Offs (MIDI und Instrumente), 0xFC,
+    /// Loop-Fenster, Plug-in-Transport (v1.16.1/v1.17.6). Main ist nur Nachbereitung: zum
+    /// Zeitpunkt des Endpulses Anzeige und Transportzustand anhalten, ohne Flush und ohne
+    /// zweites 0xFC. Gilt nur für dieselbe Sitzung; Benutzer-Stop bleibt sofort.
+    private func stopIfSongEnded(now: UInt64 = mach_absolute_time()) {
+        if rtSongEnded.exchange(false, ordering: .acquiringAndReleasing), isPlaying {
+            pendingSongStop = (rtSongEndHost.load(ordering: .relaxed), sessionCounter)
+        }
+        guard let pending = pendingSongStop, isPlaying, pending.session == sessionCounter else {
+            pendingSongStop = nil; return
+        }
+        if now >= pending.host {
+            pendingSongStop = nil
+            stop(loopsEndAt: pending.host)
+        } else if !songStopScheduled {
+            songStopScheduled = true
+            let wait = Double(Self.machToNanos(pending.host - now)) / 1_000_000_000
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                guard let self else { return }
+                self.songStopScheduled = false
+                self.stopIfSongEnded()
+            }
+        }
+    }
+    /// Erschöpften Song-Horizont und Planabweichungen melden (Diagnose-Ereignis).
+    private func reportPlanDiagnostics() {
+        let u = rtHorizonUnderruns.load(ordering: .relaxed), c = rtPlanConflicts.load(ordering: .relaxed)
+        if u != reportedUnderruns || c != reportedConflicts {
+            rack.diagnostics.event("songPlan", ["horizonUnderruns": u, "planConflicts": c])
+            reportedUnderruns = u; reportedConflicts = c
+        }
+    }
+    private var reportedUnderruns = 0, reportedConflicts = 0
+
+    #if DEBUG
+    func _stopIfSongEnded(now: UInt64 = mach_absolute_time()) { stopIfSongEnded(now: now) }
+    var _pendingSongStopHost: UInt64? { pendingSongStop?.host }
+    var _songEndStopCount: Int { kernel._songEndStopCount }
+    var _clampCountNotes: Int { clampCountNotes.load(ordering: .relaxed) }
+    #endif
+
+    /// `loopsEndAt`: Host-Zeit, ab der Audio-Loops schweigen (Songende: der geplante Endpuls).
+    /// nil = jetzt.
+    private func stop(loopsEndAt: UInt64?) {
         guard isPlaying else { return }   // D4: idempotent — verhindert Double-Suspend des displaySignal.
         rack.diagnostics.event("stop")
         isPlaying = false
@@ -1727,13 +1874,21 @@ class SequencerEngine: ObservableObject {
         playbackDisplay.steps = Array(repeating: -1, count: currentPattern.tracks.count)
         // Ausstehende Future-Timestamp-Events aus der CoreMIDI-Queue löschen,
         // damit geplante Note-Offs nicht nach dem Stopp noch auslösen.
-        midi.flushOutput()
-        midi.stop()
+        // Songende (v1.16.1, Codex V16-1): Offs und 0xFC hat der Tick schon auf den Endpuls
+        // geplant — kein Flush (er könnte genau diese Offs verwerfen), kein zweites 0xFC.
+        if loopsEndAt == nil {
+            midi.flushOutput()
+            midi.stop()
+        }
         // Der Flush hat auch geplante Note-Offs verworfen: jede Note, deren Off noch
         // aussteht, bekommt jetzt ein sofortiges Off (Notenbuch). Im Deferred-Pfad
         // läuft das erst nach bewiesener Quieszenz (scheduleDeferredRTStateCleanup).
-        if !stopCleanupPending { sendPendingNoteOffs() }
+        if !stopCleanupPending { noteOut.sendPendingNoteOffs() }
         clearSongSchedule()
+        // Plug-in-Transport: Songende hat der Tick gesetzt; Benutzer-Stop wirkt nur auf die
+        // laufende Sitzung (eine neuere bleibt unberührt).
+        rack.transportStopped(at: loopsEndAt ?? mach_absolute_time(), session: sessionCounter)
+        defer { armExternalStart() }   // nächster externer Start ohne Main-Umweg
         queuedPatternIndex  = nil
         extResetRequested.store(true, ordering: .releasing)   // EXT-Messzustand: MIDI-Thread setzt selbst zurück
         for td in currentPattern.tracks {
@@ -1742,7 +1897,7 @@ class SequencerEngine: ObservableObject {
                 vm.lastFiredNotes = []
             }
             // Gehostete Instrumente hat sendPendingNoteOffs/silenceAll bereits beruhigt.
-            if td.instrumentID == nil || rack.route(for: td.instrumentID) < 0 {
+            if td.instrumentID == nil || rack.route(for: td.output) < 0 {
                 midi.allNotesOff(channel: td.midiChannel)
             }
         }
@@ -1768,19 +1923,20 @@ class SequencerEngine: ObservableObject {
 
     /// Tatsächlicher RT-State-Teardown. Aufrufer MUSS activeTick == false bereits
     /// bewiesen haben (sync über awaitActiveTickQuiescence(), oder async über
-    /// scheduleDeferredRTStateCleanup()). hazardBundleRaw wird nie von Main
+    /// scheduleDeferredRTStateCleanup()). Den Hazard schreibt nie Main
     /// geschrieben — nur der Reader selbst löscht seinen eigenen Hazard; hier wird
     /// nur die Invariante geprüft.
     private func teardownRTState() {
         #if DEBUG
-        assert(!activeTick.load(ordering: .acquiring),
+        // Ein Tick, der nach isPlayingRT = false eintritt, setzt activeTick nur kurz und
+        // bricht in enterTick ab, ohne die Box zu berühren (Dekker-Paar). Dieses Fenster
+        // abwarten, statt es als Verletzung zu melden (Falschalarm im Volllauf).
+        assert(awaitActiveTickQuiescence(timeoutNs: 50_000_000),
                "RT-3b: Teardown nur nach bewiesener Quieszenz")
-        assert(hazardBundleRaw.load(ordering: .acquiring) == 0,
-               "RT-3b: hazardBundleRaw sollte nach bewiesener Quieszenz bereits 0 sein")
+        assert(publisher.hazardIsClear,
+               "RT-3b: Hazard sollte nach bewiesener Quieszenz bereits 0 sein")
         #endif
-        atomicBundleRaw.store(0, ordering: .releasing)
-        bundleCurrent  = nil
-        bundleDeferred = nil
+        publisher.teardown()
         // Die Runtime-Slots bleiben alloziert (Tick-Thread-Eigentum); die nächste Sitzung
         // vergibt neue Epochen und startet damit frisch.
         stopCleanupPending = false
@@ -1800,49 +1956,11 @@ class SequencerEngine: ObservableObject {
     // frühere Belegung); false = Warteschlange voll. CoreMIDI meldet keine Ablehnung.
     // `epoch`: Belegung des Slots, für die geplant wurde (`TrackSnapshot.routeEpoch`).
 
-    @inline(__always) @discardableResult
-    private func outNoteOn(route: Int, epoch: UInt32, channel: Int, note: Int, velocity: Int,
-                           at t: MIDITimeStamp) -> Bool {
-        if route < 0 {
-            midi.noteOn(channel: channel, note: note, velocity: velocity, at: t)
-            return true
-        }
-        return rack.queues[route]._withUnsafeGuaranteedRef {
-            $0.pushFromTick(UInt8(0x90 | (channel - 1) & 0x0F), UInt8(note & 0x7F),
-                            UInt8(velocity & 0x7F), at: t, epoch: epoch)
-        }
-    }
-
-    @inline(__always) @discardableResult
-    private func outNoteOff(route: Int, epoch: UInt32, channel: Int, note: Int,
-                            at t: MIDITimeStamp) -> Bool {
-        if route < 0 {
-            midi.noteOff(channel: channel, note: note, at: t)
-            return true
-        }
-        return rack.queues[route]._withUnsafeGuaranteedRef {
-            $0.pushFromTick(UInt8(0x80 | (channel - 1) & 0x0F), UInt8(note & 0x7F), 0,
-                            at: t, epoch: epoch)
-        }
-    }
-
-    @inline(__always) @discardableResult
-    private func outCC(route: Int, epoch: UInt32, channel: Int, number: Int, value: Int,
-                       at t: MIDITimeStamp) -> Bool {
-        if route < 0 {
-            midi.cc(channel: channel, number: number, value: value, at: t)
-            return true
-        }
-        return rack.queues[route]._withUnsafeGuaranteedRef {
-            $0.pushFromTick(UInt8(0xB0 | (channel - 1) & 0x0F), UInt8(number & 0x7F),
-                            UInt8(value & 0x7F), at: t, epoch: epoch)
-        }
-    }
 
     /// Sofortiges Note-Off von Main an den Ausgang einer Spur (Spur entfernt,
     /// Patternwechsel, Stop).
     func sendImmediateNoteOff(_ td: TrackData, note: Int) {
-        let route = rack.route(for: td.instrumentID)
+        let route = rack.route(for: td.output)
         if route < 0 {
             midi.noteOff(channel: td.midiChannel, note: note)
         } else {
@@ -1879,8 +1997,8 @@ class SequencerEngine: ObservableObject {
 
     /// Kurzes Vorhören eines Tons am Ausgang der Spur (Klaviatur, Drum-Auswahl).
     func previewNote(_ note: Int, on td: TrackData, velocity: Int = 90, duration: Double = 0.35) {
-        let route = rack.route(for: td.instrumentID)
-        let epoch = rack.routeEpoch(for: td.instrumentID)   // Off nur an dieselbe Belegung
+        let route = rack.route(for: td.output)
+        let epoch = rack.routeEpoch(for: td.output)   // Off nur an dieselbe Belegung
         let ch    = td.midiChannel
         if route < 0 {
             midi.noteOn(channel: ch, note: note, velocity: velocity)
@@ -1900,145 +2018,6 @@ class SequencerEngine: ObservableObject {
         }
     }
 
-    /// Tick-Pfad: gibt ein Note-On aus und trägt sein Off ins Buch ein.
-    ///
-    /// Steht für dieselbe Note noch ein ungesendetes Off aus, wird es aufgelöst:
-    ///   - es läge NACH diesem On (Überlappung) → Off genau auf dem neuen On (Neuanschlag);
-    ///     die Note klingt bis zum späteren der beiden Enden.
-    ///   - es liegt davor oder gleich → jetzt mit seinem eigenen Zeitpunkt senden.
-    ///
-    /// `tie` (Drone): klingt die Note noch (ihr Off steht nicht vor diesem On aus), wird nur
-    /// ihr Ende hinausgeschoben — kein Off, kein neues On.
-    ///
-    /// **Ablehnung (v1.13.13).** Weist die Warteschlange eines Instruments ein Ereignis ab
-    /// (voll), bleibt das Buch ehrlich: ein abgewiesenes Off gilt nicht als gesendet — die
-    /// alte Note klingt weiter, es gibt keinen Neuanschlag, ihr Ende wird bis `off`
-    /// verlängert. Ein abgewiesenes On hinterlässt keinen Off-Auftrag.
-    ///
-    /// **Belegung.** Wechselt die Belegung eines Instrument-Slots (anderes Instrument), gehören
-    /// die offenen Offs dieses Buchabschnitts der vorigen Belegung; sie werden verworfen.
-    @inline(__always)
-    private func sendNote(route: Int, epoch: UInt32, channel: Int, note: Int, velocity: Int,
-                          on: MIDITimeStamp, off: MIDITimeStamp, tie: Bool = false) {
-        let port = route + 1                                   // Snapshot-Werte sind geclampt
-        if route >= 0, portEpoch[port] != epoch { resetPort(port, epoch: epoch) }
-        let e = noteBook + (port * Self.notesPerPort + (channel - 1) * 128 + note)
-        let pending = e.pointee.pendingOff
-        if tie, pending >= on, pending != 0 {
-            // `earliestPendingOff` darf zu früh stehen: der nächste Durchlauf der Off-Ausgabe
-            // rechnet es neu.
-            if off > pending { e.pointee.pendingOff = off }
-            return
-        }
-        if pending == 0 {
-            guard outNoteOn(route: route, epoch: epoch, channel: channel, note: note,
-                            velocity: velocity, at: on) else { return }
-            e.pointee.pendingOff = off
-        } else {
-            let offAt = pending > on ? on : pending
-            guard outNoteOff(route: route, epoch: epoch, channel: channel, note: note, at: offAt) else {
-                // Off abgewiesen: alte Note klingt weiter, Ende verlängern, kein Neuanschlag.
-                e.pointee.pendingOff = max(pending, off)
-                if e.pointee.pendingOff < earliestPendingOff[port] { earliestPendingOff[port] = e.pointee.pendingOff }
-                return
-            }
-            if pending <= on { e.pointee.sentOff = pending }
-            if outNoteOn(route: route, epoch: epoch, channel: channel, note: note,
-                         velocity: velocity, at: on) {
-                e.pointee.pendingOff = pending > on ? max(pending, off) : off
-            } else {
-                e.pointee.sentOff    = offAt              // Note ist mit dem Off beendet
-                e.pointee.pendingOff = 0
-                return
-            }
-        }
-        if on > e.pointee.lastOn { e.pointee.lastOn = on }
-        if e.pointee.pendingOff < earliestPendingOff[port] { earliestPendingOff[port] = e.pointee.pendingOff }
-    }
-
-    /// Belegung eines Instrument-Slots hat gewechselt: offene Offs der vorigen Belegung
-    /// verwerfen (ihr Instrument gibt es nicht mehr). Tick-Zutritt. Fest begrenzt
-    /// (ein Buchabschnitt), nur bei einem Wechsel.
-    @inline(__always)
-    private func resetPort(_ port: Int, epoch: UInt32) {
-        (noteBook + port * Self.notesPerPort).update(repeating: NoteBookEntry(), count: Self.notesPerPort)
-        earliestPendingOff[port] = .max
-        portEpoch[port] = epoch
-    }
-
-    /// Übergibt alle Offs bis einschließlich `horizon` an ihren Ausgang, jedes mit seinem
-    /// eigenen Zeitpunkt. Nur als Inhaber des Tick-Zutritts aufrufen.
-    ///
-    /// Horizont im Tick-Pfad ist der Tick-Zeitpunkt T(k): der nächste Tick wird erst kurz vor
-    /// T(k) ausgegeben und erzeugt nur Ons nach T(k) — ein hier gesendetes Off kann also
-    /// keine später begonnene Note mehr treffen.
-    @inline(__always)
-    private func flushDueNoteOffs(upTo horizon: UInt64) {
-        var anyPending = false
-        for port in 0..<Self.portCount {
-            let first = earliestPendingOff[port]
-            if first == .max { continue }
-            if first > horizon { anyPending = true; continue }
-            let base  = port * Self.notesPerPort
-            let route = port - 1
-            var earliest = UInt64.max
-            for i in 0..<Self.notesPerPort {
-                let due = noteBook[base + i].pendingOff
-                if due == 0 { continue }
-                if due <= horizon,
-                   outNoteOff(route: route, epoch: portEpoch[port], channel: i / 128 + 1,
-                              note: i % 128, at: due) {
-                    noteBook[base + i].sentOff    = due
-                    noteBook[base + i].pendingOff = 0
-                } else if due < earliest {
-                    // Noch nicht fällig — oder abgewiesen: bleibt im Buch, nächster Tick
-                    // versucht es erneut (verspätet, aber nicht verloren).
-                    earliest = due
-                }
-            }
-            earliestPendingOff[port] = earliest
-            if earliest != .max { anyPending = true }
-        }
-        // Der Off-Wächter muss wissen, ob etwas aussteht.
-        hasPendingOffs.store(anyPending, ordering: .relaxed)
-    }
-
-    /// Beendet jede Note, deren Off noch aussteht — ungesendet oder gesendet, aber noch in der
-    /// Zukunft (MIDIFlushOutput kann es verworfen haben) — und leert das Buch. Nur aufrufen,
-    /// wenn kein Tick läuft (activeTick == false und isPlayingRT == false).
-    ///
-    /// Externe MIDI-Ausgabe: Liegt das letzte On der Note selbst noch in der Zukunft
-    /// (Ratchet/Swing/Offset planen Ons bis knapp einen Step voraus), bekommt das Off dessen
-    /// Zeitpunkt + 1 ms: Der gewählte Ausgang hat das On per Flush bereits verworfen, die
-    /// virtuelle Quelle liefert es aber noch aus (für `MIDIReceived` gibt es keinen Flush,
-    /// Befund B5) — das Off muss danach kommen.
-    ///
-    /// Gehostete Instrumente: Zuerst wird alles Geplante verworfen (`silenceAll`, inklusive
-    /// All Notes Off); danach genügt ein sofortiges Off je offener Note.
-    private func sendPendingNoteOffs() {
-        rack.silenceAll()
-        let now = mach_absolute_time()
-        for i in 0..<Self.noteBookSize {
-            let e = noteBook[i]
-            guard e.pendingOff != 0 || e.sentOff > now else { continue }
-            let route = i / Self.notesPerPort - 1
-            let key   = i % Self.notesPerPort
-            if route < 0 {
-                midi.noteOff(channel: key / 128 + 1, note: key % 128,
-                             at: e.lastOn > now ? e.lastOn + Self.safetyOffsetMach : 0)
-            } else {
-                rack.sendFromMain(route: route, epoch: portEpoch[route + 1],
-                                  UInt8(0x80 | (key / 128) & 0x0F), UInt8(key % 128), 0)
-            }
-        }
-        clearNoteBook()
-    }
-
-    private func clearNoteBook() {
-        noteBook.update(repeating: NoteBookEntry(), count: Self.noteBookSize)
-        earliestPendingOff.update(repeating: .max, count: Self.portCount)
-        hasPendingOffs.store(false, ordering: .relaxed)
-    }
 
     // MARK: - Off-Wächter (Main)
     //
@@ -2070,13 +2049,13 @@ class SequencerEngine: ObservableObject {
 
     private func flushOverdueOffsIfClockStalled(stallMach: UInt64) {
         guard !clockIsInternal.load(ordering: .acquiring),
-              hasPendingOffs.load(ordering: .relaxed) else { return }
+              noteOut.hasPendingOffs.load(ordering: .relaxed) else { return }
         let now = mach_absolute_time()
         let last = lastExtTickHost.load(ordering: .relaxed)
         guard now >= last, now - last >= stallMach else { return }
         guard enterTick() else { return }
         defer { exitTick() }
-        flushDueNoteOffs(upTo: mach_absolute_time())
+        noteOut.flushDueNoteOffs(upTo: mach_absolute_time())
     }
 
     /// Fail-Safe-Pfad (Codex-Befund H3): Sync-Spin-Backstop in stop() erreicht,
@@ -2091,7 +2070,8 @@ class SequencerEngine: ObservableObject {
                 self.scheduleDeferredRTStateCleanup()
             } else {
                 self.teardownRTState()
-                self.sendPendingNoteOffs()
+                self.noteOut.sendPendingNoteOffs()
+                self.armExternalStart()
             }
         }
     }
@@ -2113,6 +2093,7 @@ class SequencerEngine: ObservableObject {
             publishSnapshot()
         } else {
             applyPatternSwitch(idx)
+            armExternalStart()
         }
     }
 
@@ -2132,6 +2113,14 @@ class SequencerEngine: ObservableObject {
     /// MIDI Start/Continue vom externen Master (Main-Thread, via MIDIManager-Dispatch).
     private func startFromExternal(isContinue: Bool) {
         guard clockMode == .external else { return }
+        // Vom MIDI-Thread bereits gestartete, vorbereitete Sitzung: nur noch nachziehen.
+        if !isPlaying, extStartedRT.exchange(false, ordering: .acquiringAndReleasing) {
+            isPlaying = true
+            displaySignal?.resume()
+            startOffWatchdog()
+            return
+        }
+        extArmed.store(false, ordering: .releasing)
         if isPlaying {
             // Continue bei laufender Wiedergabe: nichts zu tun. Start bei laufender
             // Wiedergabe: von vorn beginnen — neue Sitzung, ohne den Transport-/Display-
@@ -2155,11 +2144,16 @@ class SequencerEngine: ObservableObject {
                 return
             }
             teardownRTState()
-            sendPendingNoteOffs()
+            noteOut.sendPendingNoteOffs()
         }
         extResetRequested.store(true, ordering: .releasing)   // sauberer Messbeginn
+        updateExtLookahead()
+        // Derselbe Sitzungsbeginn wie play() (Codex H4): Song ab Szene 1; die Taktanker setzt
+        // der Tick-Thread mit der neuen Aktivierung selbst zurück.
+        queuedPatternIndex = nil
+        beginSongIfActive()
         beginRuntimeSession()
-        clearNoteBook()
+        noteOut.clear()
         playbackDisplay.steps = Array(repeating: -1, count: currentPattern.tracks.count)   // Arch-Slice-17
         resetSnapshotAcquireDisplay()   // S01: Fehleranzeige gilt je Sitzung
         publishSnapshot()
@@ -2171,92 +2165,20 @@ class SequencerEngine: ObservableObject {
         startOffWatchdog()
     }
 
-    // MARK: - Tick-Zutritt (v1.12.19 — ein Tick zur Zeit, nur während Wiedergabe)
+    // MARK: - Tick (v1.16.0: eigener Besitzer `TickKernel`, Codex M6)
     //
-    // `activeTick` ist der exklusive Zutritt zum gesamten Tick-Pfad (Runtime-Slots, PRNG,
-    // Notenbuch, Hazard-Fenster, alle MIDI-Sends eines Ticks):
-    //   - CAS false→true: höchstens EIN Thread ist im Tick-Pfad. Das setzt die Single-
-    //     Reader-Annahme des Hazard-Protokolls durch (S02) — auch wenn sich ein verspäteter
-    //     Clock-Thread-Tick und ein externer Puls überlappen sollten. Der Verlierer verwirft
-    //     seinen Tick (gezählt), er wartet nie.
-    //   - Danach `isPlayingRT` prüfen. Mit stop() bildet das ein Dekker-Paar
-    //     (Tick: store activeTick → load isPlayingRT; stop: store isPlayingRT → load
-    //     activeTick; alle vier seq_cst): entweder sieht der Tick das Stop und kehrt um,
-    //     oder stop() sieht den laufenden Tick und wartet. Ein Tick, der „zwischen Guard
-    //     und Eintritt" hängen bleibt (Befund B2), kann nicht mehr entstehen.
-    private let rejectedTicks = ManagedAtomic<Int>(0)
+    // Zutritt, Tick-eigener Zustand und `advanceSteps` liegen in `TickKernel`. Main nutzt den
+    // Zutritt nur für den Off-Wächter und wartet in stop() auf `activeTick`.
+    @inline(__always) private func enterTick() -> Bool { kernel.enterTick() }
+    @inline(__always) private func exitTick() { kernel.exitTick() }
+    /// Externer Clock-Puls (MIDI-Read-Thread).
+    private func tick(scheduledAt: MIDITimeStamp) { kernel.tick(scheduledAt: scheduledAt) }
 
-    @inline(__always)
-    private func enterTick() -> Bool {
-        guard activeTick.compareExchange(expected: false, desired: true,
-                                         ordering: .sequentiallyConsistent).exchanged else {
-            rejectedTicks.store(rejectedTicks.load(ordering: .relaxed) &+ 1, ordering: .relaxed)
-            return false
-        }
-        guard isPlayingRT.load(ordering: .sequentiallyConsistent) else {
-            activeTick.store(false, ordering: .sequentiallyConsistent)
-            return false
-        }
-        return true
+    /// Rückt einen TrackRuntime-Step weiter (Testschnittstelle `AdvanceRuntimeSource`).
+    func advanceRuntime(_ runtime: inout TrackRuntime, snap: TrackSnapshot) -> Int {
+        kernel.advanceRuntime(&runtime, snap: snap)
     }
 
-    @inline(__always)
-    private func exitTick() {
-        activeTick.store(false, ordering: .sequentiallyConsistent)
-    }
-
-    /// Externer Clock-Puls (MIDI-Read-Thread). Im EXT-Modus erzeugen wir keine ausgehende Clock.
-    private func tick(scheduledAt: MIDITimeStamp) {
-        guard enterTick() else { return }
-        defer { exitTick() }
-        lastExtTickHost.store(mach_absolute_time(), ordering: .relaxed)
-        advanceSteps(tickTime: scheduledAt)
-    }
-
-    // MARK: - Step sequencing
-
-    /// Rückt einen TrackRuntime-Step entsprechend der Playback-Richtung weiter.
-    /// Arbeitet ausschließlich auf TrackRuntime + TrackSnapshot — kein Track-Zugriff.
-    func advanceRuntime(_ runtime: inout TrackRuntime,
-                        snap: TrackSnapshot) -> Int {
-        Self.advance(&runtime, snap: snap, rng: &rtRandom)
-    }
-
-    /// Reine Fortschreibung (ohne Engine-Zustand außer dem übergebenen PRNG) — erlaubt
-    /// dem Tick-Pfad, den nächsten Step von Track 0 auf einer Kopie vorauszuberechnen.
-    @inline(__always)
-    private static func advance(_ runtime: inout TrackRuntime,
-                                snap: TrackSnapshot,
-                                rng: inout RTRandom) -> Int {
-        let n = snap.lane.stepCount   // geclampt ≥ 1, kein % 0 möglich
-        switch snap.lane.direction {
-        case .forward:
-            runtime.currentStep = (runtime.currentStep + 1) % n
-        case .reverse:
-            // <= 0 fängt auch den Startzustand -1 ab: erster Step = n-1 (B2).
-            runtime.currentStep = runtime.currentStep <= 0 ? n - 1 : runtime.currentStep - 1
-        case .pingPong:
-            if runtime.pingPongForward {
-                if runtime.currentStep >= n - 1 {
-                    runtime.pingPongForward = false
-                    runtime.currentStep     = max(0, n - 2)
-                } else {
-                    runtime.currentStep += 1
-                }
-            } else {
-                if runtime.currentStep <= 0 {
-                    runtime.pingPongForward = true
-                    runtime.currentStep     = min(1, n - 1)
-                } else {
-                    runtime.currentStep -= 1
-                }
-            }
-        case .random:
-            // RT-4b: RT-sicherer PRNG statt Int.random (SystemRandomNumberGenerator).
-            runtime.currentStep = rng.nextInt(bound: n)
-        }
-        return runtime.currentStep
-    }
 
     /// Anzahl der aktiven Halte-Steps direkt nach `index` (Vorwärtsrichtung, zyklisch,
     /// höchstens bis vor `index` selbst). Ein Halte-Step selbst hat Spanne 0.
@@ -2269,361 +2191,6 @@ class SequencerEngine: ObservableObject {
             j = (j + 1) % count
         }
         return span
-    }
-
-    /// Würde Track 0 des Patterns `snap` auf DIESEM Tick auf Step 0 zurückspringen?
-    /// Rechnet auf Kopien von Runtime und PRNG — verändert nichts. Der spätere echte
-    /// Advance liefert denselben Wert (gleicher Ausgangszustand, deterministisch).
-    @inline(__always)
-    private func track0WillWrap(in snap: PatternSnapshot) -> Bool {
-        guard let t0 = snap.tracks.first, t0.slot >= 0 else { return false }
-        var rt = rtRuntimes[t0.slot]
-        // Frische Runtime (prevStep == -1): erster Step, kein Wrap (B2).
-        guard rt.epoch == t0.epoch, !rt.armed, rt.currentStep >= 0 else { return false }
-        guard rt.pulseAccumulator + 1.0 >= t0.lane.pulsesPerStep else { return false }
-        var rng = rtRandom
-        return Self.advance(&rt, snap: t0, rng: &rng) == 0
-    }
-
-    /// S01: beschränkter Hazard-Pointer-Erwerb (Protokoll R1–R4 am `atomicBundleRaw`).
-    ///
-    /// RT-Pflicht: nur Atomics, kein Lock/Alloc/ARC; höchstens
-    /// 1 + 2·`snapshotAcquireMaxAttempts` + 1 atomare Operationen. `@inline(never)`,
-    /// damit der Nachweis „keine Aufrufe außer Atomics“ am Symbol möglich ist.
-    /// Zustand beim Verlassen: `.protected` → Hazard zeigt auf die validierte Box
-    /// (der Aufrufer gibt ihn am Tick-Ende frei); `.noBundle`/`.exhausted` → Hazard 0.
-    @inline(never)
-    private func acquireSnapshot() -> SnapshotAcquire {
-        var candidate = atomicBundleRaw.load(ordering: .acquiring)          // R1
-        var attempt = 0
-        while candidate != 0 {
-            #if DEBUG
-            _s01AcquireHook?(.loaded, attempt)
-            #endif
-            hazardBundleRaw.store(candidate, ordering: .sequentiallyConsistent)   // R2
-            #if DEBUG
-            _s01AcquireHook?(.announced, attempt)
-            #endif
-            var current = atomicBundleRaw.load(ordering: .sequentiallyConsistent) // R3
-            #if DEBUG
-            // Test-Injektion: erzwingt „Pointer hat gewechselt“ bei jedem Durchlauf, ohne
-            // zweiten Writer. Protokoll, Obergrenze und Abbruchpfad bleiben unverändert.
-            if _s01ForceExhaustion.load(ordering: .relaxed) { current = candidate &+ 8 }
-            #endif
-            if current == candidate {                                         // R4
-                #if DEBUG
-                _s01AcquireHook?(.validated, attempt)
-                #endif
-                return .protected(candidate)
-            }
-            attempt &+= 1
-            if attempt >= Self.snapshotAcquireMaxAttempts {
-                // `current` ist NICHT gemeldet → nie dereferenzieren. Hazard räumen.
-                hazardBundleRaw.store(0, ordering: .releasing)
-                return .exhausted
-            }
-            candidate = current
-        }
-        hazardBundleRaw.store(0, ordering: .releasing)   // candidate == 0: nichts publiziert
-        return .noBundle
-    }
-
-    /// Rückgabe `true` = Tick vollständig verarbeitet. `false` = Gesamttick-Abbruch
-    /// vor jedem Runtime-Fortschritt (kein Snapshot erwerbbar, S01) — der Aufrufer
-    /// darf dann keine Clock-/Start-Bytes allein senden.
-    ///
-    /// Vorbedingung: der Aufrufer hält den Tick-Zutritt (`enterTick()` erfolgreich);
-    /// stop() wartet darauf, bevor es Snapshot-Box oder Notenbuch anfasst.
-    @discardableResult
-    private func advanceSteps(tickTime: MIDITimeStamp) -> Bool {
-        // E3/S01 — Lock-freier, beschränkter Snapshot-Erwerb (Protokoll und Ordnungs-
-        // beweis: siehe Kommentar an `atomicBundleRaw`).
-        //
-        // Dereferenziert wird AUSSCHLIESSLICH eine Box, die im Hazard gemeldet und
-        // anschließend gegen die aktuelle Publikation validiert wurde (`.protected`).
-        // Es gibt keinen Fall-through: bei erschöpftem Erwerb oder fehlendem Bundle
-        // endet advanceSteps hier mit `false` — bevor Runtime-Fortschritt (pulse-
-        // Accumulator, currentStep, PRNG), Display-Events oder MIDI entstehen.
-        //
-        // Gesamttick-Abbruch (S01, Kriterium 4): Der Aufrufer (`clockTick`) sendet bei
-        // `false` weder 0xF8 noch 0xFA (midiStartPending bleibt gesetzt und wird vom
-        // nächsten erfolgreichen Tick konsumiert). Steps und Clock verlieren damit
-        // denselben Puls statt sich zu entkoppeln. Der Erwerb liegt vor jeder Runtime-Arbeit:
-        // ein Abbruch hinterlässt weder Runtime-Mutation noch Pulse-/PRNG-Fortschritt.
-        let acquired = acquireSnapshot()
-        guard case let .protected(raw) = acquired,
-              let ptr = UnsafeRawPointer(bitPattern: raw)
-        else {
-            if case .exhausted = acquired {
-                // Sichtbarer Fehlerpfad: wartefreier Zähler (einziger Schreiber) + Wecken
-                // des Display-Drains; Main spiegelt ihn in clockDiagnostics.
-                snapshotAcquireFailures.store(
-                    snapshotAcquireFailures.load(ordering: .relaxed) &+ 1, ordering: .releasing)
-                displaySignal?.or(data: 1)
-            }
-            return false
-        }
-        // Hazard am Tick-Ende freigeben — deckt alle weiteren Rückkehrpfade ab.
-        // Reihenfolge: `bundle`/`snap` (lexikalisch später deklariert) enden vor diesem defer;
-        // die Reader-Kopien der Arrays sind damit vor dem Hazard-Clear freigegeben.
-        defer {
-            hazardBundleRaw.store(0, ordering: .releasing)
-            #if DEBUG
-            _s01AcquireHook?(.released, 0)
-            #endif
-        }
-        #if DEBUG
-        _rt3LastTickBoxRaw = raw   // Test-Fenster: welche Box dieser Tick dereferenziert
-        #endif
-        let bundle = Unmanaged<PlaybackBundleBox>.fromOpaque(ptr).takeUnretainedValue().bundle
-        #if DEBUG
-        // RT-3a: Test-Fenster, um einen Tick deterministisch mitten im Lauf zu
-        // parken (Hazard bereits gemeldet, vor
-        // MIDI-Emission). Einmalig, selbst-löschend.
-        if let pause = _rt3aPausePoint { _rt3aPausePoint = nil; pause() }
-        #endif
-        // Aktives Pattern bestimmen (Patternwechsel im Tick-Thread, Befund N3/S09b).
-        //
-        //   rtActiveSerial == bundle.serial      → `snapshot` spielen; liegt ein vorgemerktes
-        //                                           Pattern vor und Track 0 springt auf DIESEM
-        //                                           Tick auf Step 0, wird jetzt gewechselt.
-        //   rtActiveSerial == bundle.serial + 1  → der Wechsel ist schon vollzogen, Main hat
-        //                                           noch nicht nachgezogen → weiter `queued`.
-        //   sonst                                → neue Sitzung/Aktivierung übernehmen.
-        //
-        // Die Runtimes des neuen Patterns haben eigene Slots/Epochen und sind frisch
-        // (armed): ihr erster Step feuert auf diesem Tick — exakt auf der Grenze.
-        var snap = bundle.snapshot
-        if rtActiveSerial != bundle.serial {
-            if let q = bundle.queued, rtActiveSerial == bundle.serial &+ 1 {
-                snap = q
-            } else {
-                // Höhere Aktivierung ohne Vormerkung = neue Sitzung: Pulszähler von vorn.
-                if bundle.serial > rtActiveSerial { rtPulse = 0 }
-                rtActiveSerial = bundle.serial
-            }
-        }
-        let pulse = rtPulse
-        rtPulse &+= 1
-        // Songende (v1.14.0): ab `stopAtPulse` kein neuer Anschlag mehr; Main hält an.
-        // Fällige Offs laufen weiter aus.
-        if bundle.stopAtPulse >= 0, pulse >= bundle.stopAtPulse {
-            rtSongEnded.store(true, ordering: .releasing)
-            displaySignal?.or(data: 1)
-            flushDueNoteOffs(upTo: tickTime)
-            return true
-        }
-        // Wechselgrenze: im Song der vorgegebene Takt-Puls, sonst das Ende von Track 0. Liegt
-        // der Puls schon zurück (Song während des Laufs gekürzt), an der nächsten Taktgrenze.
-        let atBoundary = bundle.switchAtPulse >= 0
-            ? pulse >= bundle.switchAtPulse
-              && (pulse &- bundle.switchAtPulse) % Song.pulsesPerBar == 0
-            : track0WillWrap(in: snap)
-        if rtActiveSerial == bundle.serial, let q = bundle.queued, atBoundary {
-            rtActiveSerial = bundle.serial &+ 1
-            rtSwitchPulse.store(pulse, ordering: .relaxed)
-            rtSwitchedSerial.store(rtActiveSerial, ordering: .releasing)
-            engineEventBuffer.pushPatternSwitch(patternIdx: 0)   // Weckruf für Main
-            displaySignal?.or(data: 1)
-            snap = q
-        }
-        let pulseDuration = 60.0 / (bundle.bpm * 24.0)
-        // Safety-Clamp-Boden: alle MIDI-Timestamps müssen ≥ jetzt + 1 ms sein.
-        // Im INT-Modus liefert die ClockSource tickTime mit einem Tick-Intervall + Marge
-        // Vorlauf — der Clamp greift dort nur nach einem Aussetzer des Clock-Threads.
-        let nowSafe = mach_absolute_time() + Self.safetyOffsetMach
-
-        for trackIdx in snap.tracks.indices {
-            let trackSnap = snap.tracks[trackIdx]
-            guard trackSnap.slot >= 0 else { continue }       // kein Runtime-Slot → stumm
-            let runtime = rtRuntimes + trackSnap.slot
-
-            // Slot wurde (neu) an diesen Track gebunden → frische Runtime.
-            if runtime.pointee.epoch != trackSnap.epoch {
-                runtime.pointee = TrackRuntime(epoch: trackSnap.epoch)
-            }
-            if runtime.pointee.armed {
-                // Erster Tick einer frischen Runtime: Step sofort auslösen (Akkumulator 0).
-                runtime.pointee.armed = false
-            } else {
-                runtime.pointee.pulseAccumulator += 1.0
-                guard runtime.pointee.pulseAccumulator >= trackSnap.lane.pulsesPerStep else { continue }
-                runtime.pointee.pulseAccumulator -= trackSnap.lane.pulsesPerStep
-            }
-
-            // T2 — Overshoot-Korrektur: exakter Schritt-Timestamp statt Tick-Timestamp.
-            //
-            // Nach der Subtraktion enthält pulseAccumulator den Überschuss in [0, 1) Ticks:
-            // wie viele Bruchteile eines Ticks der ideale Schrittzeitpunkt VOR tickTime lag.
-            // Ohne Korrektur landen alle MIDI-Events auf dem nächsten ganzzahligen Tick,
-            // was bei nicht-ganzzahligen pulsesPerStep (z.B. 4:5 → pps=4.8) ein hörbares
-            // Muster erzeugt (5,5,5,5,4 Ticks statt gleichmäßig 4.8).
-            //
-            // Für ganzzahlige Verhältnisse (pps = 6.0, 4.0 …) ist der Überschuss immer 0.0
-            // → exactStepTime == tickTime → kein Behavior-Change.
-            //
-            // Vorlauf-Vertrag: Overshoot < 1 Tick-Intervall. Die ClockSource gibt jeden Tick
-            // ein volles Intervall + emitMargin vor seinem Zeitpunkt aus — exactStepTime liegt
-            // damit immer mindestens emitMargin in der Zukunft. Externer Clock: Safety-Clamp
-            // greift falls nötig.
-            let overshootNS    = runtime.pointee.pulseAccumulator * pulseDuration * 1_000_000_000
-            let overshootMach  = Self.nanosToMachTime(UInt64(overshootNS))
-            let exactStepTime  = tickTime > overshootMach ? tickTime - overshootMach : tickTime
-
-            let stepIdx  = Self.advance(&runtime.pointee, snap: trackSnap, rng: &rtRandom)
-
-            // displayStep: Feedback an UI via Ring-Buffer → displaySignal (Main-Thread).
-            // Kein DispatchQueue.main.async mehr — kein Alloc, kein Dispatch-Overhead.
-            // Arch-Slice-18: hostTime = tickTime (MIDITimeStamp, future-scheduled).
-            // tickTime liegt auf dem additiven Raster der Clock-Quelle — mathematisch uniform.
-            // Der Drain plant asyncAfter(deadline: tickTime) → Step-Cursor wechselt exakt
-            // zum musikalischen Zeitpunkt statt zur nächsten Callback-Grenze.
-            if trackIdx <= 255, stepIdx <= 255 {
-                displayBuffer.push(trackIdx: UInt8(trackIdx), stepIdx: UInt8(stepIdx),
-                                   hostTime: tickTime)
-                displaySignal?.or(data: 1)  // Event-basierter Trigger → Main-Thread drain
-            }
-
-            let effectiveMute = trackSnap.isMuted || (snap.hasSolo && !trackSnap.isSolo)
-            guard !effectiveMute else { continue }
-
-            // Lane-Kind-Dispatch (CC-Lane Slice 1): Step-Zweig bleibt strukturell
-            // unverändert; CC-Zweig ist ein eigener, kleinerer Pfad.
-            // Lane Slice 6: Switch auf typsichere Payload-Union statt auf `kind`.
-            // Sentinel-Guards gegen leere Step-/CC-Arrays entfallen — der Compiler
-            // garantiert, dass jeder Zweig nur die ihm zustehenden Felder sieht.
-            switch trackSnap.lane.payload {
-            case let .cc(ccValues, ccNumber, ccIsMuted):
-                guard !ccIsMuted else { continue }
-                guard stepIdx < ccValues.count else { continue }
-
-                let stepDuration = trackSnap.lane.pulsesPerStep * pulseDuration
-                let isOddStep    = (stepIdx % 2 == 1)
-                let swingDelay   = isOddStep
-                    ? stepDuration * ((bundle.swing / 100.0) - 0.5) * 0.66
-                    : 0.0
-                let offset = trackSnap.timingOffset
-
-                let ccDelayNS  = UInt64(max(0.0, swingDelay + offset) * 1_000_000_000)
-                let ccTimeRaw  = exactStepTime + Self.nanosToMachTime(ccDelayNS)
-                let ccTime: MIDITimeStamp
-                if ccTimeRaw < nowSafe {
-                    ccTime = nowSafe
-                    clampCountNotes.store(clampCountNotes.load(ordering: .relaxed) &+ 1, ordering: .relaxed)
-                } else {
-                    ccTime = ccTimeRaw
-                }
-                if trackSnap.ccUnresolved {
-                    // Gewähltes Parameterziel nicht verfügbar: nichts senden (kein Ersatz-CC).
-                } else if trackSnap.route >= 0, let p = trackSnap.parameter {
-                    let v = p.min + (p.max - p.min) * Float(ccValues[stepIdx]) / 127
-                    rack.queues[trackSnap.route]._withUnsafeGuaranteedRef {
-                        _ = $0.pushParameterFromTick(address: p.address, value: v, at: ccTime,
-                                                     epoch: trackSnap.routeEpoch)
-                    }
-                } else {
-                    outCC(route:   trackSnap.route,
-                          epoch:   trackSnap.routeEpoch,
-                          channel: trackSnap.midiChannel,
-                          number:  ccNumber,
-                          value:   ccValues[stepIdx],
-                          at:      ccTime)
-                }
-                continue   // CC-Lane feuert keine Notes / Ratchets
-
-            case .step:
-                break   // Step-Pfad nachstehend
-            }
-
-            // Step-Payload auspacken für den nachstehenden, strukturell unveränderten
-            // Step-Pfad. `guard case let` ist minimal-invasiv: nur 2 Identifier-
-            // Ersetzungen (`trackSnap.lane.steps` → `laneSteps`), sonst keine
-            // Änderung an der bestehenden Step-Logik.
-            guard case let .step(laneSteps) = trackSnap.lane.payload else { continue }
-            guard stepIdx < laneSteps.count else { continue }
-
-            let step = laneSteps[stepIdx]
-            guard step.isActive else { continue }
-            // Halten: kein Anschlag; der vorherige Step hat seine Dauer schon um diesen
-            // Step verlängert (holdSpan).
-            guard !step.isHold else { continue }
-            // RT-4b: RT-sicherer PRNG statt Double.random (SystemRandomNumberGenerator).
-            guard rtRandom.nextUnitDouble() <= step.probability else { continue }
-
-            let stepDuration = trackSnap.lane.pulsesPerStep * pulseDuration
-            let isOddStep    = (stepIdx % 2 == 1)
-            let swingDelay   = isOddStep
-                ? stepDuration * ((bundle.swing / 100.0) - 0.5) * 0.66
-                : 0.0
-            let offset = trackSnap.timingOffset
-
-            // Step-Lane-Purify (P2/P3): Step-Lanes senden keine CCs — CC-Verläufe
-            // laufen ausschließlich über CC-Lanes (LaneKind.cc). Track/Step
-            // tragen seit P3 (v1.11.0) keine Legacy-CC-Felder mehr.
-
-            // Drone: ein Anschlag, kein Ratchet; die Note hält einen ganzen Durchlauf.
-            let isDrone       = step.isDrone
-            let holdSteps     = Double(step.holdSpan)
-            let ratchets      = (isDrone || step.holdSpan > 0) ? 1 : step.ratchet.rawValue
-            let rInterval     = stepDuration / Double(ratchets)
-            let capturedNotes = step.notes
-            let capturedVel   = step.velocity
-            let capturedCh    = trackSnap.midiChannel
-            let capturedGate  = step.gate
-
-            for r in 0..<ratchets {
-                let onDelay  = max(0.0, swingDelay + offset + Double(r) * rInterval)
-                let isChord  = capturedNotes.count > 1
-                let effectiveGate = ratchets > 1 ? min(capturedGate, 1.0) :
-                                    isChord      ? max(capturedGate, 0.5)  : capturedGate
-                // Gehaltene Steps: volle eigene Länge plus jede Halte-Step-Länge, der letzte
-                // Abschnitt mit dem Gate dieses Steps (höchstens legato).
-                let heldGate = holdSteps > 0 ? holdSteps + min(effectiveGate, 1.0) : effectiveGate
-                let offDelay = onDelay + (isDrone ? stepDuration * Double(trackSnap.lane.stepCount)
-                                                  : max(0.010, rInterval * heldGate))
-
-                let onTimeRaw = exactStepTime + Self.nanosToMachTime(UInt64(onDelay * 1_000_000_000))
-                let onTime: MIDITimeStamp
-                let offTime: MIDITimeStamp
-                if onTimeRaw < nowSafe {
-                    onTime = nowSafe
-                    clampCountNotes.store(clampCountNotes.load(ordering: .relaxed) &+ 1, ordering: .relaxed)
-                } else {
-                    onTime = onTimeRaw
-                }
-                // offTime: Gate-Dauer relativ zu onTime (nach Clamp), nicht zu tickTime.
-                // Garantiert korrekte Gate-Länge auch wenn der Safety-Clamp greift.
-                // Drone: Dauer = ganzer Durchlauf der Spur + ein halber Step. Der Überhang hält
-                // das Off im Buch, bis derselbe Step wieder fällig ist — `sendNote(tie:)`
-                // verlängert dann, statt neu anzuschlagen. Bleibt der Step aus (deaktiviert,
-                // Wahrscheinlichkeit, andere Richtung), endet der Ton einen halben Step später.
-                let gateSeconds = isDrone
-                    ? stepDuration * (Double(trackSnap.lane.stepCount) + 0.5)
-                    : max(0.010, rInterval * heldGate)
-                let gateDurationMach = Self.nanosToMachTime(UInt64(gateSeconds * 1_000_000_000))
-                offTime = onTime + gateDurationMach
-
-                for note in capturedNotes {
-                    sendNote(route: trackSnap.route, epoch: trackSnap.routeEpoch,
-                             channel: capturedCh, note: note,
-                             velocity: capturedVel, on: onTime, off: offTime, tie: isDrone)
-                }
-
-                if r == ratchets - 1 {
-                    // A2: RT-sicher über EngineEventBuffer statt DispatchQueue.main.async.
-                    // offDelay in ms klemmen auf UInt16 (max ~65 s, deutlich über jeder Gate-Dauer).
-                    let offDelayMs = UInt16(min(offDelay * 1000, Double(UInt16.max)))
-                    engineEventBuffer.pushNotesFired(
-                        trackIdx:   UInt8(clamping: trackIdx),
-                        notes:      capturedNotes,
-                        offDelayMs: offDelayMs)
-                }
-            }
-        }
-
-        // Nach allen Ons dieses Ticks: Offs ausgeben, die bis zum Tick-Zeitpunkt fällig sind.
-        flushDueNoteOffs(upTo: tickTime)
-        return true
     }
 
     // MARK: - Track management
@@ -2662,74 +2229,158 @@ class SequencerEngine: ObservableObject {
         let index:   Int
     }
 
-    private func makeTrack(for pattern: Pattern, kind: LaneKind, pad: Bool = false,
-                           strings s: Str) -> TrackData {
+    private func makeTrack(for pattern: Pattern, kind: LaneKind,
+                           audioLoopChannel: UUID? = nil, row: UUID, strings s: Str) -> TrackData {
         // v1.9.1 (Slice A): monotoner Ordnungszähler statt count+1 —
         // verhindert doppelte „Track N"-Namen nach Löschungen.
         let n = pattern.nextTrackOrdinal
         pattern.nextTrackOrdinal += 1
-        let lane = LaneData(stepCount: pad ? 4 : 16, kind: kind)
-        if pad, kind == .step {
-            // Pad-Lane (v1.13.16): 4 Steps à 1 Takt, legato.
-            lane.isPad = true
-            lane.padWidth = 2
-            lane.stepLengthNumerator = 16
-            lane.stepLengthDenominator = 1
-            for i in lane.steps.indices { lane.steps[i].gate = 1.0 }
-        }
-        return TrackData(name: pad ? s.padTrackName(n) : s.trackName(n),
-                         midiChannel: min(n, 16),
-                         colorIndex: firstFreeColorIndex(in: pattern.tracks),
-                         lane: lane)
+        let lane = LaneData(stepCount: 16, kind: kind)
+        let td = TrackData(name: audioLoopChannel != nil ? s.audioLoopTrackName(n)
+                                 : s.trackName(n),
+                           midiChannel: min(n, 16),
+                           row: row,
+                           colorIndex: firstFreeColorIndex(in: pattern.tracks),
+                           lane: lane)
+        if let ch = audioLoopChannel { td.output = .audioLoop(ch) }
+        return td
     }
 
-    /// Hängt in allen Patterns einen neuen leeren Track an.
+    /// Neue Audio-Loop-Spur in allen Patterns mit eigenem Audio-Loop-Kanal (v1.15.0). Der
+    /// Kanal gehört der Zeile: alle Patterns spielen denselben Loop; Mute je Pattern.
     @discardableResult
-    func addTrack(kind: LaneKind = .step, pad: Bool = false) -> [TrackPlacement] {
+    func addAudioLoopTrack() -> [TrackPlacement] {
         guard canGrowTracks else { return [] }
         let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
+        let n = currentPattern.nextTrackOrdinal
+        guard let channel = rack.addAudioLoopChannel(name: s.audioLoopTrackName(n)) else { return [] }
+        let row = UUID()
         let set = patterns.map { p in
-            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, pad: pad, strings: s),
+            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: .step, audioLoopChannel: channel,
+                                                        row: row, strings: s),
                            index: p.tracks.count)
         }
         insertPlacements(set)
         return set
     }
 
-    /// Inserts a new empty track directly after `index` in all patterns.
+    /// Mit Undo: Spuren UND der eigens angelegte Kanal werden gemeinsam entfernt bzw.
+    /// wiederhergestellt (Codex M3) — Identität und Material bleiben im Undo-Eintrag erhalten.
+    func addAudioLoopTrackUndoable(actionName: String) {
+        let set = addAudioLoopTrack()
+        guard let um = undoManager, let channel = set.first?.track.instrumentID else { return }
+        final class Taken { var value: (data: InstrumentChannelData, index: Int, storage: AudioLoopStorage?)? }
+        let taken = Taken()
+        registerReversibleUndo(um: um, target: self, actionName: actionName,
+                               forward: { e in
+                                   if let t = taken.value {
+                                       e.rack.putAudioLoopChannel(t.data, index: t.index, storage: t.storage)
+                                       taken.value = nil
+                                   }
+                                   e.insertPlacements(set)
+                               },
+                               backward: { e in
+                                   e.removePlacements(set)
+                                   taken.value = e.rack.takeAudioLoopChannel(channel)
+                               })
+    }
+
+    // MARK: Loop-Material als Dokumentbefehl (v1.15.2, Codex M2)
+    //
+    // Vertrag: Kanal-Einstellungen eines Loops (Länge, Eingang, Mithören, Gate, Ausgleich)
+    // folgen dem Kanalvertrag wie Fader/Panorama — kein Dokument-Undo. Material-Operationen
+    // (Löschen, letzten Durchlauf zurücknehmen) laufen über den Dokument-UndoManager und sind
+    // versionsgebunden: Undo/Redo greift nur, solange der Kanal noch genau den Speicher trägt,
+    // den der Befehl hinterlassen hat. Aufnahme selbst ist Transport, kein Dokumentbefehl.
+
+    func clearAudioLoopUndoable(_ channel: UUID, actionName: String) {
+        guard let old = rack.clearLoop(channel) else { return }
+        registerLoopExchange(channel, before: old, after: nil, keepUndo: false, actionName: actionName)
+    }
+
+    func undoAudioLoopPassUndoable(_ channel: UUID, actionName: String) {
+        guard let swap = rack.undoLoop(channel) else { return }
+        registerLoopExchange(channel, before: swap.old, after: swap.new, keepUndo: true, actionName: actionName)
+    }
+
+    private func registerLoopExchange(_ channel: UUID, before: AudioLoopStorage?, after: AudioLoopStorage?,
+                                      keepUndo: Bool, actionName: String) {
+        hasUnsavedChanges = true
+        guard let um = undoManager else { return }
+        registerReversibleUndo(um: um, target: self, actionName: actionName,
+                               forward: { e in e.rack.exchangeLoop(channel, expected: before, with: after, keepUndo: keepUndo) },
+                               backward: { e in e.rack.exchangeLoop(channel, expected: after, with: before, keepUndo: keepUndo) })
+    }
+
+    /// Audio-Loop-Spur scharf schalten bzw. Aufnahme beenden (Klick oder Taste R). Ohne
+    /// Angabe: die zuletzt bediente Audio-Loop-Spur, sonst die erste im aktuellen Pattern.
+    func toggleAudioLoopRecording(_ td: TrackData? = nil) {
+        guard let track = td ?? lastAudioLoopTrack.flatMap({ id in currentPattern.tracks.first { $0.id == id } })
+                ?? currentPattern.tracks.first(where: { $0.isAudioLoop }),
+              let ch = track.instrumentID, let core = rack.loopCore(for: ch) else { return }
+        lastAudioLoopTrack = track.id
+        let active = core.isRecordRequested || core.state == .recording
+        rack.setLoopRecording(!active, for: ch, bpm: bpm, quartersPerBar: timeSignature.quartersPerBar)
+    }
+
+
+    /// Hängt in allen Patterns einen neuen leeren Track an.
     @discardableResult
-    func insertTrack(after index: Int, kind: LaneKind = .step, pad: Bool = false) -> [TrackPlacement] {
+    func addTrack(kind: LaneKind = .step) -> [TrackPlacement] {
         guard canGrowTracks else { return [] }
         let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
+        let row = UUID()
         let set = patterns.map { p in
-            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, pad: pad, strings: s),
-                           index: min(index + 1, p.tracks.count))
+            TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, row: row, strings: s),
+                           index: p.tracks.count)
         }
         insertPlacements(set)
         return set
     }
 
+    /// Neue leere Spur direkt nach der Zeile der Spur `index` (aktuelles Pattern), in allen
+    /// Patterns; ein Pattern ohne diese Zeile bekommt sie an derselben Nummer.
+    @discardableResult
+    func insertTrack(after index: Int, kind: LaneKind = .step) -> [TrackPlacement] {
+        guard canGrowTracks else { return [] }
+        let s = Str(UserDefaults.standard.string(forKey: "appLanguage") ?? "en")
+        let anchor = currentPattern.tracks.indices.contains(index) ? currentPattern.tracks[index].row : nil
+        let row = UUID()
+        let set = patterns.map { p in
+            let at = anchor.flatMap { a in p.tracks.firstIndex { $0.row == a } }.map { $0 + 1 }
+                ?? min(index + 1, p.tracks.count)
+            return TrackPlacement(pattern: p, track: makeTrack(for: p, kind: kind, row: row, strings: s),
+                                  index: at)
+        }
+        insertPlacements(set)
+        return set
+    }
+
+    /// Dupliziert die Zeile der Spur `index` (aktuelles Pattern) in allen Patterns, die sie
+    /// haben; die Kopien bilden eine neue Zeile direkt darunter.
     @discardableResult
     func duplicateTrack(at index: Int) -> [TrackPlacement] {
-        guard canGrowTracks else { return [] }
+        guard canGrowTracks, let row = row(at: index) else { return [] }
+        let newRow = UUID()
         let set = patterns.compactMap { p -> TrackPlacement? in
-            guard index >= 0, index < p.tracks.count else { return nil }
-            let copy = p.tracks[index].freshCopy()
-            copy.name = p.tracks[index].name + " 2"
-            return TrackPlacement(pattern: p, track: copy, index: index + 1)
+            guard let i = p.tracks.firstIndex(where: { $0.row == row }) else { return nil }
+            let copy = p.tracks[i].freshCopy()
+            copy.row = newRow
+            copy.name = p.tracks[i].name + " 2"
+            return TrackPlacement(pattern: p, track: copy, index: i + 1)
         }
         insertPlacements(set)
         return set
     }
 
-    /// Entfernt den Track bei `index` aus allen Patterns, die ihn haben und danach
-    /// nicht leer wären. Rückgabe: die entfernten Instanzen samt Position (für Undo).
+    /// Entfernt die Zeile der Spur `index` (aktuelles Pattern) aus allen Patterns, die sie
+    /// haben und danach nicht leer wären. Rückgabe: die entfernten Instanzen samt Position.
     @discardableResult
     func removeTrack(at index: Int) -> [TrackPlacement] {
-        guard currentPattern.tracks.count > 1 else { return [] }
+        guard currentPattern.tracks.count > 1, let row = row(at: index) else { return [] }
         let set = patterns.compactMap { p -> TrackPlacement? in
-            guard index >= 0, index < p.tracks.count, p.tracks.count > 1 else { return nil }
-            return TrackPlacement(pattern: p, track: p.tracks[index], index: index)
+            guard p.tracks.count > 1, let i = p.tracks.firstIndex(where: { $0.row == row }) else { return nil }
+            return TrackPlacement(pattern: p, track: p.tracks[i], index: i)
         }
         removePlacements(set)
         return set
@@ -2738,11 +2389,13 @@ class SequencerEngine: ObservableObject {
     /// Setzt Tracks an ihrer Position ein (Add/Insert/Duplicate und Undo von Remove).
     func insertPlacements(_ set: [TrackPlacement]) {
         var currentIdx: Int?
-        for p in set where patterns.contains(where: { $0 === p.pattern }) {
-            guard !p.pattern.tracks.contains(where: { $0 === p.track }) else { continue }
-            let at = max(0, min(p.index, p.pattern.tracks.count))
-            p.pattern.tracks.insert(p.track, at: at)
-            if p.pattern === currentPattern { currentIdx = at }
+        withStructureTransaction {
+            for p in set where patterns.contains(where: { $0 === p.pattern }) {
+                guard !p.pattern.tracks.contains(where: { $0 === p.track }) else { continue }
+                let at = max(0, min(p.index, p.pattern.tracks.count))
+                p.pattern.tracks.insert(p.track, at: at)
+                if p.pattern === currentPattern { currentIdx = at }
+            }
         }
         structureDidChange(affectsCurrentPattern: currentIdx != nil)
     }
@@ -2750,18 +2403,30 @@ class SequencerEngine: ObservableObject {
     /// Entfernt Tracks per Identität (Remove und Undo von Add/Insert/Duplicate).
     func removePlacements(_ set: [TrackPlacement]) {
         var currentIdx: Int?
-        for p in set where patterns.contains(where: { $0 === p.pattern }) {
-            guard p.pattern.tracks.count > 1,
-                  let at = p.pattern.tracks.firstIndex(where: { $0 === p.track }) else { continue }
-            if let vm = vmCache[p.track.id] {
-                vm.lastFiredNotes.forEach { sendImmediateNoteOff(p.track, note: $0) }
-                vm.lastFiredNotes = []
+        withStructureTransaction {
+            for p in set where patterns.contains(where: { $0 === p.pattern }) {
+                guard p.pattern.tracks.count > 1,
+                      let at = p.pattern.tracks.firstIndex(where: { $0 === p.track }) else { continue }
+                if let vm = vmCache[p.track.id] {
+                    vm.lastFiredNotes.forEach { sendImmediateNoteOff(p.track, note: $0) }
+                    vm.lastFiredNotes = []
+                }
+                p.pattern.tracks.remove(at: at)
+                if p.pattern === currentPattern { currentIdx = at }
             }
-            p.pattern.tracks.remove(at: at)
-            if p.pattern === currentPattern { currentIdx = at }
         }
         pruneVMCache(keeping: Set(patterns.flatMap { $0.tracks.map(\.id) }))
         structureDidChange(affectsCurrentPattern: currentIdx != nil)
+    }
+
+    /// Zeile der Spur `index` im aktuellen Pattern.
+    func row(at index: Int) -> UUID? {
+        currentPattern.tracks.indices.contains(index) ? currentPattern.tracks[index].row : nil
+    }
+
+    /// Alle Spuren einer Zeile über alle Patterns.
+    func tracks(inRow row: UUID) -> [TrackData] {
+        patterns.compactMap { p in p.tracks.first { $0.row == row } }
     }
 
     /// Sucht eine Spur per UUID über alle Patterns.
@@ -2808,11 +2473,11 @@ class SequencerEngine: ObservableObject {
                                backward: inserted ? remove : insert)
     }
 
-    func addTrackUndoable(kind: LaneKind, pad: Bool = false, actionName: String) {
-        registerStructureUndo(addTrack(kind: kind, pad: pad), inserted: true, actionName: actionName)
+    func addTrackUndoable(kind: LaneKind, actionName: String) {
+        registerStructureUndo(addTrack(kind: kind), inserted: true, actionName: actionName)
     }
-    func insertTrackUndoable(after index: Int, kind: LaneKind, pad: Bool = false, actionName: String) {
-        registerStructureUndo(insertTrack(after: index, kind: kind, pad: pad), inserted: true,
+    func insertTrackUndoable(after index: Int, kind: LaneKind, actionName: String) {
+        registerStructureUndo(insertTrack(after: index, kind: kind), inserted: true,
                               actionName: actionName)
     }
     func duplicateTrackUndoable(at index: Int, actionName: String) {
@@ -2820,6 +2485,152 @@ class SequencerEngine: ObservableObject {
     }
     func removeTrackUndoable(at index: Int, actionName: String) {
         registerStructureUndo(removeTrack(at: index), inserted: false, actionName: actionName)
+    }
+
+    // MARK: Strukturtransaktion (v1.17.7, Codex A17-07)
+
+    /// Tiefe laufender Strukturtransaktionen; währenddessen bauen die `$tracks`-Senken die
+    /// Abos nicht je Pattern neu auf, sondern einmal am Ende.
+    private var structureTransactionDepth = 0
+    private var structureRebuildPending = false
+
+    /// Führt mehrere Strukturänderungen aus und baut die Abos danach genau einmal neu auf.
+    private func withStructureTransaction(_ body: () -> Void) {
+        structureTransactionDepth += 1
+        body()
+        structureTransactionDepth -= 1
+        guard structureTransactionDepth == 0, structureRebuildPending else { return }
+        structureRebuildPending = false
+        rebuildAllTrackSubs(for: patterns)
+    }
+
+    #if DEBUG
+    /// Tests: Abo-Neuaufbauten seit Erzeugung.
+    private(set) var _subscriptionRebuilds = 0
+    #endif
+
+    // MARK: Zeilen verschieben und einklappen (v1.17.3, Identität v1.17.7)
+
+    /// Reihenfolge der Spuren eines Patterns (Instanzen). Verschieben wird als Vorher/Nachher
+    /// je Pattern erfasst und identitätsgebunden angewendet; Undo setzt den Vorher-Stand
+    /// ein — exakt invers, auch bei unterschiedlich langen Patterns (Codex A17-05).
+    struct TrackOrder {
+        let pattern: Pattern
+        let tracks: [TrackData]
+    }
+
+    /// Setzt die Reihenfolgen in einer Transaktion (nur Patterns des Dokuments).
+    func applyTrackOrders(_ orders: [TrackOrder]) {
+        withStructureTransaction {
+            for o in orders where patterns.contains(where: { $0 === o.pattern })
+                && !o.pattern.tracks.elementsEqual(o.tracks, by: ===) {
+                o.pattern.tracks = o.tracks
+            }
+        }
+        structureDidChange(affectsCurrentPattern: true)
+    }
+
+    /// Vorher/Nachher für „Spur `from` nach `to`" (Nummern im aktuellen Pattern), über die
+    /// Zeile (v1.18.6): in jedem Pattern, das die Zeile hat, kommt sie vor die erste Zeile, die
+    /// im aktuellen Pattern nach dem Verschieben unter ihr liegt und dort vorkommt — sonst
+    /// ans Ende. Andere Patterns bleiben unberührt. nil = keine Bewegung.
+    /// Hinweis: die neue Zeile 0 bestimmt die Länge eines Patterns ohne Song.
+    func trackMovePlan(from: Int, to: Int) -> (before: [TrackOrder], after: [TrackOrder])? {
+        let n = currentPattern.tracks.count
+        guard from != to, from >= 0, from < n, to >= 0, to < n else { return nil }
+        var order = currentPattern.tracks.map(\.row)
+        let row = order.remove(at: from)
+        order.insert(row, at: to)
+        let below = Array(order[(to + 1)...])
+        var before: [TrackOrder] = [], after: [TrackOrder] = []
+        for p in patterns {
+            guard let i = p.tracks.firstIndex(where: { $0.row == row }) else { continue }
+            var t = p.tracks
+            let moved = t.remove(at: i)
+            let at = below.lazy.compactMap { r in t.firstIndex { $0.row == r } }.first ?? t.count
+            t.insert(moved, at: at)
+            guard !t.elementsEqual(p.tracks, by: ===) else { continue }
+            before.append(TrackOrder(pattern: p, tracks: p.tracks))
+            after.append(TrackOrder(pattern: p, tracks: t))
+        }
+        return (before, after)
+    }
+
+    /// Verschieben ohne Undo (Tests, interne Aufrufer).
+    @discardableResult
+    func moveTrack(from: Int, to: Int) -> Bool {
+        guard let plan = trackMovePlan(from: from, to: to) else { return false }
+        applyTrackOrders(plan.after)
+        return true
+    }
+
+    func moveTrackUndoable(from: Int, to: Int, actionName: String) {
+        guard let plan = trackMovePlan(from: from, to: to) else { return }
+        applyTrackOrders(plan.after)
+        guard let um = undoManager else { return }
+        let before = plan.before, after = plan.after
+        registerReversibleUndo(um: um, target: self, actionName: actionName,
+                               forward:  { $0.applyTrackOrders(after) },
+                               backward: { $0.applyTrackOrders(before) })
+    }
+
+    /// Verschiebt die Spur mit `id` (aktuelles Pattern) an die Position von `targetID`.
+    func moveTrackUndoable(id: UUID, onto targetID: UUID, actionName: String) {
+        guard let from = currentPattern.tracks.firstIndex(where: { $0.id == id }),
+              let to = currentPattern.tracks.firstIndex(where: { $0.id == targetID }) else { return }
+        moveTrackUndoable(from: from, to: to, actionName: actionName)
+    }
+
+    /// Zielzeile, wenn die Zeile `from` in die Lücke `gap` kommt (0 = über der ersten Zeile,
+    /// `count` = unter der letzten); nil, wenn sich nichts bewegt.
+    static func moveDestination(from: Int, gap: Int, count: Int) -> Int? {
+        guard from >= 0, from < count, gap >= 0, gap <= count else { return nil }
+        let to = gap > from ? gap - 1 : gap
+        return to == from ? nil : to
+    }
+
+    /// Ziehen im Spurkopf: die Spur `id` kommt in die Lücke `gap`.
+    func moveTrackUndoable(id: UUID, toGap gap: Int, actionName: String) {
+        guard let from = currentPattern.tracks.firstIndex(where: { $0.id == id }),
+              let to = Self.moveDestination(from: from, gap: gap, count: currentPattern.tracks.count)
+        else { return }
+        moveTrackUndoable(from: from, to: to, actionName: actionName)
+    }
+
+    /// Ein- oder Ausklappen einer Spur-Instanz (Ansicht, kein Playback-Snapshot, A17-08).
+    struct CollapseChange {
+        let track: TrackData
+        let collapsed: Bool
+    }
+
+    /// Setzt die Ansichtszustände je Instanz. Nur Ansichtssignal (`viewChanged`) — die
+    /// Senken der Engine (Snapshot bei Playback) reagieren darauf nicht.
+    func applyCollapse(_ changes: [CollapseChange]) {
+        for c in changes where c.track.isCollapsed != c.collapsed {
+            c.track.isCollapsed = c.collapsed
+            c.track.viewChanged.send()
+        }
+        hasUnsavedChanges = true       // Teil des Presets
+    }
+
+    /// Klappt die Zeile der Spur `index` ein oder aus — in allen Patterns (ohne Undo).
+    func setTrackCollapsed(at index: Int, _ collapsed: Bool) {
+        guard let row = row(at: index) else { return }
+        applyCollapse(tracks(inRow: row).map { CollapseChange(track: $0, collapsed: collapsed) })
+    }
+
+    /// Mit Undo: der alte Zustand jeder betroffenen Instanz wird gemerkt (Codex A17-06).
+    func setTrackCollapsedUndoable(at index: Int, _ collapsed: Bool, actionName: String) {
+        guard index >= 0, index < currentPattern.tracks.count,
+              currentPattern.tracks[index].isCollapsed != collapsed else { return }
+        let tracks = tracks(inRow: currentPattern.tracks[index].row)
+        let before = tracks.map { CollapseChange(track: $0, collapsed: $0.isCollapsed) }
+        let after = tracks.map { CollapseChange(track: $0, collapsed: collapsed) }
+        applyCollapse(after)
+        guard let um = undoManager else { return }
+        registerReversibleUndo(um: um, target: self, actionName: actionName,
+                               forward:  { $0.applyCollapse(after) },
+                               backward: { $0.applyCollapse(before) })
     }
 
     /// Ersetzt das Pattern bei `idx` (Pattern-Paste und dessen Undo). Die abgelöste
@@ -2888,82 +2699,6 @@ extension SequencerEngine: AdvanceRuntimeSource {
 // MARK: - Interner Clock-Tick
 
 extension SequencerEngine {
-
-    /// Empfängt jeden 24-PPQ-Tick der ClockSource.
-    ///
-    /// ⚠️ RT-Pflicht: Diese Methode läuft auf dem Clock-Thread (Echtzeit).
-    ///   — keine Heap-Allokationen
-    ///   — kein blockierender Lock
-    ///   — kein DispatchQueue.main.async
-    func clockTick(at timestamp: MIDITimeStamp) {
-        // RT-1a: INT-Guard VOR advanceSteps (Befund H1). Ein verspäteter Tick
-        // nach INT→EXT (audioClock.stop() wartet nicht auf den Clock-Thread) darf
-        // weder den internen Step fortschreiben NOCH 0xF8 senden — sonst
-        // entkoppeln interner Step-Zähler und ausgehende Clock: Der Sequencer
-        // liefe einen Puls weiter, den das externe Gerät nie erhält.
-        // clockIsInternal wird im Setter vor dem ClockSource-Start publiziert,
-        // der erste Tick sieht also bereits den konsistenten Modus.
-        //    RT-1: atomarer Read statt @Published (Tick-Thread).
-        guard clockIsInternal.load(ordering: .acquiring) else { return }
-        // Tick-Zutritt umschließt Step-Advance UND die Clock-/Start-Sends dieses Ticks:
-        // stop() kann nicht zwischen beidem durchgreifen.
-        guard enterTick() else { return }
-        defer { exitTick() }
-        // 1. Step-Advance. S01: ohne erwerbbaren Snapshot ist der Gesamttick
-        //    abgebrochen — dann auch KEIN 0xF8/0xFA (kein alleiniger Clock-Send,
-        //    Steps und Clock verlieren denselben Puls). midiStartPending bleibt
-        //    gesetzt und geht mit dem nächsten vollständigen Tick raus.
-        guard advanceSteps(tickTime: timestamp) else { return }
-        // 2. Ausgehende MIDI-Clock 0xF8 (nur INT — hier garantiert, s. Guard oben).
-        let safeTickTime = clampToFuture(timestamp)
-        guard safeTickTime == timestamp else {
-            // Arch-Slice-15: Geclamped-Clock-Pulses NICHT senden.
-            //
-            // Ursache: der Clock-Thread kam weit zu spät (mehr als sein Vorlauf), der
-            // Tick-Zeitpunkt liegt in der Vergangenheit. Bis zu zwei Intervalle Rückstand
-            // holt die ClockSource nach, darüber verankert sie das Raster neu.
-            // Diagnose-Wert: 🔴 MIDI-CLAMP ΔClock=N im Debug-Output.
-            //
-            // Problem: werden diese geclamped Pulse als 0xF8 gesendet, kommen beim
-            // Empfänger-Gerät N Takte-Pulse quasi gleichzeitig an → sein interner
-            // Arp-/LFO-/Delay-Takt rastet auf falsche Frequenz ein → hörbarer "Haken".
-            //
-            // Fix: geclamped Pulse still verwerfen. Das Empfänger-Gerät sieht statt
-            // eines Bursts einen kurzen Aussetzer (~100ms) → synct sich nach wenigen
-            // Pulsen neu ein. Klanglich unauffälliger als der Burst.
-            //
-            // Keine Auswirkung auf Note-Timing: advanceSteps() hat die geclamped
-            // tickTime bereits intern verarbeitet (pulseAccumulator-Fortschritt,
-            // ohne Step-Advance, da pulsesPerStep noch nicht erreicht). ✓
-            clampCountClock.store(clampCountClock.load(ordering: .relaxed) &+ 1, ordering: .relaxed)
-            return
-        }
-        // Arch-Slice-16b: 0xFA (MIDI Start) mit dem ersten 0xF8 senden.
-        //
-        // Hintergrund: play() sendet 0xFA traditionell sofort. Der erste 0xF8 kommt
-        // aber erst um den Tick-Vorlauf später. Das externe Gerät resettet seinen
-        // Arp/Clock bei 0xFA (Beat 1 = jetzt) → beim ersten 0xF8 "resync-ruckeln".
-        //
-        // Fix: midiStartPending wird in play() auf true gesetzt (statt midi.start()).
-        // Beim ersten non-clamped clockTick() wird 0xFA atomar gelesen und mit
-        // demselben Future-Timestamp wie 0xF8 gesendet.
-        //
-        // 0xFA wird 1 ns vor 0xF8 eingeplant, damit CoreMIDI die Reihenfolge einhält.
-        // Musikalisch absolut irrelevant; stellt sicher, dass der Empfänger zuerst
-        // den Start-Befehl sieht, bevor der erste Clock-Puls ankommt.
-        //
-        // RT-sicher: midiStartPending.exchange ist ein einzelner atomarer Read+Clear.
-        // midi.sendStartRT nutzt sendRTSafe (stack-only, keine Allokation).
-        if midiStartPending.exchange(false, ordering: .acquiringAndReleasing) {
-            let startTS = safeTickTime > 0 ? safeTickTime - 1 : safeTickTime
-            #if DEBUG
-            _s01StartSendCount &+= 1
-            #endif
-            midi.sendStartRT(at: startTS)
-        }
-        #if DEBUG
-        _s01ClockSendCount &+= 1
-        #endif
-        midi.sendClock(at: safeTickTime)
-    }
+    /// Ein 24-PPQ-Tick der ClockSource (Clock-Thread). Ausführung: `TickKernel.clockTick`.
+    func clockTick(at timestamp: MIDITimeStamp) { kernel.clockTick(at: timestamp) }
 }

@@ -74,8 +74,10 @@ struct ModelWriter {
             assert(td.id == trackID,
                    "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
             let lane = td.lane
+            let oldGroup = lane.stepGroup              // „Gruppe" endet mit jeder festen Länge
             lane.stepLengthNumerator   = newNum
             lane.stepLengthDenominator = newDen
+            lane.stepGroup = false
             lane.changed.send()
             if let um = undoManager {
                 registerReversibleUndo(
@@ -85,11 +87,13 @@ struct ModelWriter {
                     forward: { l in
                         l.stepLengthNumerator   = newNum
                         l.stepLengthDenominator = newDen
+                        l.stepGroup = false
                         l.changed.send()
                     },
                     backward: { l in
                         l.stepLengthNumerator   = oldNum
                         l.stepLengthDenominator = oldDen
+                        l.stepGroup = oldGroup
                         l.changed.send()
                     }
                 )
@@ -247,6 +251,21 @@ struct ModelWriter {
                 )
             }
 
+        case let .setTrackColor(trackID, oldIndex, oldCustom, newIndex, newCustom):
+            assert(td.id == trackID,
+                   "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
+            td.colorIndex = newIndex; td.customColor = newCustom
+            td.changed.send()
+            if let um = undoManager {
+                registerReversibleUndo(
+                    um: um,
+                    target: td,
+                    actionName: command.undoActionName,
+                    forward:  { t in t.colorIndex = newIndex; t.customColor = newCustom; t.changed.send() },
+                    backward: { t in t.colorIndex = oldIndex; t.customColor = oldCustom; t.changed.send() }
+                )
+            }
+
         // MARK: - CC-Lane commands → LaneData (CC-Lane Slice 1)
 
         case let .setCCLaneValue(trackID, index, old, new):
@@ -339,33 +358,63 @@ struct ModelWriter {
             lane.changed.send()
             // No undo — Mute-Commands tragen heute kein Undo.
 
-        case let .setFixedNote(trackID, old, new):
+        case let .setFixedNotes(trackID, old, new):
             assert(td.id == trackID,
                    "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
             let lane = td.lane
-            lane.fixedNote = new
+            lane.fixedNotes = new
             lane.changed.send()
             if let um = undoManager {
                 registerReversibleUndo(
                     um: um, target: lane,
                     actionName: command.undoActionName,
-                    forward:  { l in l.fixedNote = new; l.changed.send() },
-                    backward: { l in l.fixedNote = old; l.changed.send() }
+                    forward:  { l in l.fixedNotes = new; l.changed.send() },
+                    backward: { l in l.fixedNotes = old; l.changed.send() }
                 )
             }
 
-        case let .setPadWidth(trackID, old, new):
+        case let .setLength(trackID, old, new):
             assert(td.id == trackID,
                    "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
             let lane = td.lane
-            lane.padWidth = new
+            lane.lengthState = new
             lane.changed.send()
             if let um = undoManager {
                 registerReversibleUndo(
                     um: um, target: lane,
                     actionName: command.undoActionName,
-                    forward:  { l in l.padWidth = new; l.changed.send() },
-                    backward: { l in l.padWidth = old; l.changed.send() }
+                    forward:  { l in l.lengthState = new; l.changed.send() },
+                    backward: { l in l.lengthState = old; l.changed.send() }
+                )
+            }
+
+        case let .setStepWidth(trackID, old, new):
+            assert(td.id == trackID,
+                   "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
+            let lane = td.lane
+            lane.stepWidth = new
+            lane.changed.send()
+            if let um = undoManager {
+                registerReversibleUndo(
+                    um: um, target: lane,
+                    actionName: command.undoActionName,
+                    forward:  { l in l.stepWidth = new; l.changed.send() },
+                    backward: { l in l.stepWidth = old; l.changed.send() }
+                )
+            }
+
+        case let .setRndMode(trackID, old, new):
+            assert(td.id == trackID,
+                   "ModelWriter: trackID mismatch — command targets \(trackID), got \(td.id)")
+            let lane = td.lane
+            lane.rndMode = new
+            lane.changed.send()
+            if let um = undoManager {
+                registerReversibleUndo(
+                    um: um, target: lane,
+                    actionName: command.undoActionName,
+                    forward:  { l in l.rndMode = new; l.changed.send() },
+                    backward: { l in l.rndMode = old; l.changed.send() }
                 )
             }
         }

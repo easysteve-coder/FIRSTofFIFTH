@@ -38,10 +38,12 @@ struct StepDetailView: View {
                      undoManager: dragging ? nil : undoManager)
     }
 
-    /// Fester Ton der Spur setzen/lösen (v1.13.16) — eigener Befehl mit Undo.
-    private func setFixedNote(_ note: Int?) {
-        guard note != track.lane.fixedNote else { return }
-        writer.apply(.setFixedNote(trackID: track.id, old: track.lane.fixedNote, new: note),
+    /// Festen Ton/Akkord der Spur setzen/lösen (v1.13.16, Akkord v1.16.2) — eigener Befehl
+    /// mit Undo. Leere Liste gilt als `nil`.
+    private func setFixedNotes(_ notes: [Int]?) {
+        let new = notes.flatMap { LaneData.normalizedNotes($0) }
+        guard new != track.lane.fixedNotes else { return }
+        writer.apply(.setFixedNotes(trackID: track.id, old: track.lane.fixedNotes, new: new),
                      to: track.data, undoManager: undoManager)
     }
 
@@ -118,7 +120,8 @@ struct StepDetailView: View {
                 GateKnobView(gate: Binding(
                     get: { step.gate },
                     set: { v in modify { $0.gate = v } }),
-                    accentColor: accentColor)
+                    accentColor: accentColor,
+                    stepSixteenths: track.lane.stepSixteenths)
 
                 KnobView(label: "PROB%",
                          value: Binding(get: { step.probability * 100 },
@@ -147,10 +150,12 @@ struct StepDetailView: View {
                     Text(s.fixedNoteLabel)
                         .font(VintageTheme.monoSmall)
                         .foregroundColor(VintageTheme.textSecondary)
-                    Button(track.lane.fixedNote != nil ? "ON" : "OFF") {
-                        setFixedNote(track.lane.fixedNote == nil ? step.note : nil)
+                    // Einschalten übernimmt die Töne dieses Steps (Einzelton oder Akkord).
+                    Button(track.lane.fixedNotes != nil ? "ON" : "OFF") {
+                        setFixedNotes(track.lane.fixedNotes == nil
+                                      ? (track.isDrum ? [step.note] : step.notes) : nil)
                     }
-                        .buttonStyle(VintageSmallButtonStyle(isActive: track.lane.fixedNote != nil,
+                        .buttonStyle(VintageSmallButtonStyle(isActive: track.lane.fixedNotes != nil,
                                                              accent: accentColor))
                         .help(s.fixedNoteHelp)
                 }
@@ -192,9 +197,9 @@ struct StepDetailView: View {
                         .font(VintageTheme.monoSmall)
                         .foregroundColor(VintageTheme.textSecondary)
                     DrumPickerGrid(
-                        note: Binding(get: { track.lane.fixedNote ?? step.note },
+                        note: Binding(get: { track.lane.fixedNotes?.first ?? step.note },
                                       set: { v in
-                                          if track.lane.fixedNote != nil { setFixedNote(v) }
+                                          if track.lane.fixedNotes != nil { setFixedNotes([v]) }
                                           else { modify { $0.note = v } }
                                       }),
                         accentColor: accentColor,
@@ -203,20 +208,20 @@ struct StepDetailView: View {
             } else {
                 PianoKeyboardView(
                     notes: Binding(
-                        get: { track.lane.fixedNote.map { [$0] } ?? step.notes },
+                        get: { track.lane.fixedNotes ?? step.notes },
                         set: { v in
-                            if track.lane.fixedNote != nil {
-                                // Fester Ton: zuletzt gewählte Taste gilt für die ganze Spur.
-                                if let n = v.first(where: { $0 != track.lane.fixedNote }) ?? v.first {
-                                    setFixedNote(n)
-                                }
+                            if track.lane.fixedNotes != nil {
+                                // Fester Ton/Akkord: die Klaviatur bearbeitet ihn für die ganze
+                                // Spur (Einzelton ersetzt, Akkordmodus fügt hinzu/entfernt).
+                                if !v.isEmpty { setFixedNotes(v) }
                             } else {
                                 modify { $0.notes = v.isEmpty ? [60] : v }
                             }
                         }),
                     accentColor: accentColor,
                     track: track,
-                    onUnison: step.notes.count > 1 ? { modify { $0.notes = [$0.note] } } : nil)
+                    onUnison: track.lane.fixedNotes.map { f in f.count > 1 ? { setFixedNotes([f[0]]) } : nil }
+                        ?? (step.notes.count > 1 ? { modify { $0.notes = [$0.note] } } : nil))
             }
         }
         .padding(16)
@@ -246,6 +251,8 @@ struct MultiStepEditView: View {
 
     // Local override values
     @State private var noteVal:       Double = 64
+    /// Töne für alle markierten Steps (Einzelton oder Akkord, v1.16.2); Startwert = erster Step.
+    @State private var bulkNotes:     [Int] = [64]
     @State private var velVal:        Double = 100
     @State private var gateVal:       Double = 0.5
     @State private var probVal:       Double = 100
@@ -302,10 +309,19 @@ struct MultiStepEditView: View {
                         accentColor: accentColor,
                         track: track)
                 } else {
-                    NotePickerRow(
-                        note: Binding(get: { noteVal },
-                                      set: { v in noteVal = v; applyAll { $0.note = Int(v) } }),
-                        accentColor: accentColor)
+                    // Setzt die ganzen Töne aller markierten Steps; Transponieren gilt danach
+                    // relativ zu diesem Stand.
+                    PianoKeyboardView(
+                        notes: Binding(get: { bulkNotes },
+                                       set: { v in
+                                           let notes = v.isEmpty ? bulkNotes : v
+                                           bulkNotes = notes
+                                           applyAll { $0.notes = notes }
+                                           for i in indices { transposeBase[i] = notes }
+                                           transposeOffset = 0
+                                       }),
+                        accentColor: accentColor,
+                        track: track)
                 }
             }
 
@@ -322,7 +338,8 @@ struct MultiStepEditView: View {
                 GateKnobView(gate: Binding(
                     get: { gateVal },
                     set: { v in gateVal = v; applyAll { $0.gate = v } }),
-                    accentColor: accentColor)
+                    accentColor: accentColor,
+                    stepSixteenths: track.lane.stepSixteenths)
                 VStack(spacing: 2) {
                     KnobView(label: "PROB%",
                              value: Binding(get: { probVal },
@@ -405,12 +422,17 @@ struct MultiStepEditView: View {
         }
         .padding(16)
         .background(VintageTheme.panelDark)
-        .frame(width: track.isDrum ? 460 : 400)
+        .frame(width: track.isDrum ? 460 : 660)
         .preferredColorScheme(.dark)
         .onAppear {
             // Snapshot der aktuellen Noten für Transpose-Referenz
             for i in indices where track.lane.steps.indices.contains(i) {
                 transposeBase[i] = track.lane.steps[i].notes
+            }
+            if let first = indices.first, track.lane.steps.indices.contains(first) {
+                bulkNotes = track.lane.steps[first].notes
+                noteVal   = Double(track.lane.steps[first].note)
+                gateVal   = track.lane.steps[first].gate       // Anzeige zeigt den echten Stand
             }
             session.baseline = track.lane.steps
             session.dirty    = false
@@ -606,9 +628,10 @@ private struct PianoKeyboardView: View {
                             }
                         }
                     }
-                    // Manuelle Hit-Test-Geste (schwarze Tasten haben Priorität)
+                    // Manuelle Hit-Test-Geste (schwarze Tasten haben Priorität). Klick mit Ort
+                    // als Ziehen ohne Mindestweg (SpatialTapGesture gibt es erst ab macOS 13).
                     .gesture(
-                        SpatialTapGesture()
+                        DragGesture(minimumDistance: 0)
                             .onEnded { val in
                                 guard let midi = hitTest(val.location,
                                                          wkW: wkW, gap: gap, wkH: wkH,
@@ -672,53 +695,6 @@ private struct PianoKeyboardView: View {
             if notes.count > 1 { notes.removeAll { $0 == snapped } }
         } else {
             notes.append(snapped); notes.sort()
-        }
-    }
-}
-
-// MARK: - Quick note picker (Single-Note, für Bulk-Edit)
-
-private struct NotePickerRow: View {
-    @Binding var note: Double
-    var accentColor: Color
-    var track: TrackViewModel? = nil
-    @AppStorage("appLanguage") private var lang: String = "en"
-    private var s: Str { Str(lang) }
-    private let noteNames = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 3) {
-                let octave = (Int(note) / 12) - 1
-                Button("-") { note = max(0, note - 12) }
-                    .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: accentColor))
-                Text("C\(octave)")
-                    .font(VintageTheme.monoSmall).foregroundColor(VintageTheme.textAmber).frame(width: 24)
-                Button("+") { note = min(127, note + 12) }
-                    .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: accentColor))
-                Spacer().frame(width: 8)
-                ForEach(0..<12, id: \.self) { semitone in
-                    let candidate = (Int(note) / 12) * 12 + semitone
-                    let inScale   = track?.noteInScale(candidate) ?? true
-                    Button(noteNames[semitone]) {
-                        let oct     = Int(note) / 12
-                        let raw     = min(127, oct * 12 + semitone)
-                        let snapped = track?.quantizedNote(raw) ?? raw
-                        note = Double(snapped)
-                    }
-                    .buttonStyle(VintageSmallButtonStyle(
-                        isActive: Int(note) % 12 == semitone,
-                        accent: accentColor))
-                    .opacity(inScale ? (noteNames[semitone].contains("#") ? 0.75 : 1.0) : 0.22)
-                }
-            }
-            if let t = track, t.scaleIndex > 0 {
-                let rootName  = TrackData.noteNames[t.scaleRoot]
-                let scaleName = TrackData.scales[t.scaleIndex].name
-                Text(s.scaleHint(rootName, scaleName))
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundColor(VintageTheme.textSecondary)
-            }
         }
     }
 }

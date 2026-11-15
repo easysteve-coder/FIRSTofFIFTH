@@ -1,9 +1,955 @@
 # FIRSTofFIFTH — Engineering
 
-Basis: v1.0.19 · Stand: 15. Juli 2026 (Slices A–G, Lane 1–6, CC-Lane 1.x, Identity-Slice A v1.9.1, Step-Lane-Purify P1–P3 v1.10.0/1.10.1/1.11.0, Track-Farben-Slice v1.12.0, **RT-1 Playback-State-Ownership v1.12.2**, **RT-1a Atomare Modusumschaltung v1.12.3**, **RT-2 trackRuntimes-Ownership v1.12.4**, **RT-3 Snapshot-Lebensdauer/Hazard-Pointer v1.12.5**, **RT-3a Stop-/External-Clock-Quieszenz v1.12.6**, **RT-3b Fail-Safe Deferred Cleanup v1.12.7**, **RT-4a Catch-up-/Resync-Strategie v1.12.8**, **RT-4b RT-sicherer PRNG v1.12.9**, **RT-4c sendRTSafe Atomic-Snapshot v1.12.10**)
-Prinzip: Evolutionär, kein Big Bang. RT-Pfad bleibt unberührt.
+Stand: v1.18.32 (15. November 2026). Aktuelle Verträge stehen oben, je Abschnitt mit der
+Version, ab der sie gelten; ältere Abschnitte sind historische Nachweise ihrer Version.
+Prinzip: evolutionär, kein Big Bang. Für neue Echtzeitpfade gilt keine pauschale Freigabe aus
+früheren Läufen — jeder Pfad braucht seinen eigenen Nachweis (Test bzw. Messung).
 
 ---
+
+## Plug-in-Wiederanlauf (ab v1.18.32)
+
+- Out-of-process geladene Plug-ins teilen sich einen AU-Host-Prozess. Stirbt er, meldet macOS
+  jede Instanz einzeln (`kAudioComponentInstanceInvalidationNotification`, Beobachter ohne
+  Main-Warten seit v1.18.20). Gemessen: Meldung ca. 2,5 s nach dem Absturz.
+- `InstrumentRack.pluginInvalidated` (Main) ordnet die Instanz einem Platz zu und lädt genau
+  diesen neu:
+  - Instrument: `teardownInstrument` + `loadInstrument` mit `channels[i].instrument`.
+  - Effekt: Observer und Platz freigeben, `detach`, `loadEffect` am selben Token.
+  - Kanalbelegung, Undo und Projekt bleiben unberührt; kein `onProjectChange`.
+- Zustand: der aus dem Modell (letztes Laden/Speichern/`captureStates`). Der Zustand der toten
+  Instanz ist nicht lesbar.
+- Sperre `recoveryLockout` (10 s) je Platz (Kanal-UUID bzw. Effekt-Token): erneuter Tod kurz
+  nach einem Neustart → Status `.missing`, Diagnose `pluginRecovery` mit `gaveUp`. Späte
+  Meldungen einer bereits ersetzten Instanz treffen keinen Platz.
+- Kein Eingriff in Tick- oder Render-Pfad.
+- Nicht umgangen (Fremdfehler): SCXT 0.9.316 verwirft `fullState`, das vor dem Initialisieren
+  gesetzt wird. FoF behält seine Reihenfolge (`restoreState` vor `attach`).
+
+## Gruppen je Spur und Notenwerte (ab v1.18.31)
+
+- `LaneData.groups: [Int]?` in Achteln (1–8 Gruppen, je 1–64), Schlüssel `groups` („3+3+2"),
+  ungültig → nil. nil = `defaultGroups(meter)`: Gruppierung der Taktart in Achteln (Nenner ≤ 8),
+  sonst ein Takt. `groupSixteenths(meter)` ersetzt `meter.groupSixteenths` in Snapshot,
+  Raster-Beschriftung und `requestMeter` (Ersatzlänge = erste Gruppe). Summe frei: die Spur
+  läuft dann gegen den Takt; Tick unverändert (`StepGroups`, ≤ 8 Einträge).
+- Notenwerte: Anzeige und Wahl als Bruch einer ganzen Note (`wholeFraction`, 1/16 = 1:1 einer
+  Sechzehntel, Punktierung/Tolen als eigene Zeilen `NoteRow`). Gespeichert wird weiter
+  Zähler/Nenner einer Sechzehntel (`ratio(whole:)`), Format und Tick unberührt.
+  `parseFraction`: mindestens 1 Puls (1/96), höchstens `maxLongSixteenths`.
+- Schreibweg: `ModelCommand.setLength(old:new:)` mit `LaneData.LengthState` (Zähler, Nenner,
+  Gruppe, Gruppen) — ein Undo-Schritt für jede Längenwahl im Popover. `setRatio` (Anfasser)
+  bleibt und schaltet „Gruppe" aus. Fällt unter die Zeile „Länge, Ratio" (`ModelWriter`, Undo
+  ja) in „Schreibwege und Undo-Vertrag".
+
+## Gruppierung und Steplänge „Gruppe" (ab v1.18.30)
+
+- `TimeSignature.grouping`: Teil der Taktart (Gleichheit, Vormerkung E2, Undo wie Taktart),
+  gespeichert im Pattern-Schlüssel `grouping`; `label` bleibt „7/8", Anzeige `displayLabel`.
+  Ungültig (Summe ≠ Zähler, < 2 oder > 8 Gruppen) → keine.
+- `LaneData.stepGroup`: Step k dauert `groupSixteenths[k mod n]` (ohne Gruppierung ein Takt).
+  Zähler/Nenner tragen die erste Gruppe als Ersatz (ältere Versionen, Breite); `requestMeter`
+  setzt sie auf die erste Gruppe der neuen Taktart. `setRatio` schaltet „Gruppe" aus (Undo
+  stellt sie wieder her).
+- Snapshot: `LaneSnapshot.groups` (`StepGroups`, ≤ 8 Pulslängen als Tupel, keine Allokation);
+  `pulses(ofStep:)` = Gruppe oder `pulsesPerStep`, `cyclePulses()` für Drones.
+- Tick: Schwelle = Länge des klingenden Steps (`currentStep`, auch in `track0WillWrap`);
+  `stepDuration` = Länge des neuen Steps; Halten = Summe der folgenden `holdSpan` Steplängen
+  (vorwärts wie `holdSpan`) + Gate-Rest; Drone = Durchlauf. Für gleich lange Steps rechnerisch
+  identisch zu vorher.
+- Raster (`StepBeatLinesView`): Linien an Gruppengrenzen im Takt, Taktstrich kräftiger.
+- Plug-ins (`HostSync`) bekommen weiter nur Zähler/Nenner.
+
+## Lange Steps (ab v1.18.29)
+
+- Eine Spurart weniger: `LaneData.isPad` entfällt. Lang ist ein Step, wenn er ganze Sechzehntel
+  > 2 dauert (`isLongStep`); der Tick sieht wie immer nur `pulsesPerStep = 6·Z/N`.
+- Auswahl `TrackData.stepRatios(meter)` = `sortedRatios` + `longRatios(meter)` (aufsteigend).
+  Anzeige: kurz zeitgetreu, lang `effectiveStepWidth` (`stepWidth`, 0 = `autoWidth`).
+- Ziehen: `HandleDragLogic.ratioIndex(…, longStepPx:)` — kurze Stufen an zeitgetreuer Lage,
+  lange in festen Abständen dahinter (eine Stepbreite).
+- RND: `rndMode` je Lane (`ModelCommand.setRndMode`, Undo). Lange Steps würfeln über
+  `randomizePadChords` (alle aktiv, Gate 1,0).
+- Taktartwechsel (`requestMeter`) rechnet alle langen Steps um.
+- Format: `width` (≠ 0), `rnd` (≠ Einzeltöne) optional; Lesen `pad` → `rnd = chords`, Breite aus
+  `padWidth` (fehlt: 1).
+- Undo-Vertrag: Breite und RND-Töne je Spur über den ModelWriter (Undo ja).
+
+## Drum-Gruppen (ab v1.18.28)
+
+- `DrumMap` (128 × 8 Bit: Sperrgruppe, Bit 7 One-Shot) entsteht nur beim Umwandeln einer
+  EXS-Datei (`AppleSampler.convert` → `Converted.drumMap`) und liegt am Instrument
+  (`PluginRef.drumMap`, optionaler Schlüssel). Nicht aus dem Sampler-Zustand ableitbar — ältere
+  Projekte bekommen sie erst durch Neuladen des Kits.
+- Ausführung im Render-Durchlauf (`AUEventQueue.render` → `emitDrum`, Audio-Thread): Tabelle in
+  16 Atomics, Main schreibt beim Laden (`setDrumMap`), beim Entfernen nil. Note-On in Gruppe g:
+  zuerst Note-Off an jede Taste von g (auch die eigene), gleicher Offset; Note-Off (auch On mit
+  Anschlag 0) an One-Shot-Tasten entfällt; Parameter, CCs (123) und Tasten ohne Eintrag
+  unverändert. Höchstens 128 Lesezugriffe je Note, keine Allokation. Tick-Pfad und Notenbuch
+  bleiben unberührt (das Notenbuch sieht seine Offs als ausgegeben).
+- Ausklang: Hüllkurve 0 (gemessen = Lautstärke) der Layer, deren Tasten alle Sperrgruppe +
+  One-Shot sind, Stufe 5 = 10 ms. Liegt im Sampler-Zustand und reist mit ihm.
+- `AppleSampler.loadQueue`: Umwandlungen seriell — paralleles `kAUSamplerProperty_LoadInstrument`
+  auf zwei Instanzen bricht in CoreAudio ab.
+- Undo: wie Sampler-Instrument laden (Rack, kein Undo).
+
+## Audio-Loop-Anzeige (ab v1.18.27)
+
+- `WaveformScale`: reine Anzeige; Verstärkung = 1/Spitze der Buckets (≤ 64, Stille → 1), Höhe
+  = √(|x|·g). Material, Pegel und Export unberührt.
+- Eingangspegel: einziger Leser von `AudioLoopCore.takeInputPeak()` (Austausch, Main) ist
+  `InputLevelMeter` (30 Hz TimelineView, nur bei `status.inputActive`). Gemessen wird im
+  Eingangs-Render nur bei Mithören/scharf/Aufnahme — kein eigener Eingangsbetrieb fürs Meter.
+  Ballistik in `InputMeterBallistics` (Main, testbar).
+
+## Pad-Länge neuer Pads (ab v1.18.26)
+
+- Neuer Pad (`makeTrack`) und Zurücksetzen im Längen-Popover: ein Takt in der Taktart des
+  Patterns (`sixteenthsPerBar`), nicht fest 16. Ist eine Taktart vorgemerkt, rechnet ihre
+  Übernahme den neuen Pad mit um (`requestMeter`). Nur `clampToValidRanges` fällt bei ungültigen
+  Daten noch auf 16 zurück (kennt keine Taktart).
+- Befund Apple Sampler/EXS: der Import über `kAUSamplerProperty_LoadInstrument` übernimmt
+  weder Exclusive-Gruppe (Gruppe, Byte 4) noch One-Shot der Zonen; Layer klingen mit dem
+  Ausklang der Hüllkurve weiter. Hi-Hat-Choke braucht eine eigene Lösung in FoF.
+
+## Spurfarbe (ab v1.18.25)
+
+- Resolver `VintageTheme.color(for: TrackData)`: `customColor` ("#RRGGBB") vor `colorIndex`
+  (Palette, 16). Aufgelöst in Views, die das TrackViewModel beobachten (`TrackRowView`,
+  `RoutedTrackColor` im Mixer) — die Regel „Auflösung nur in MainView" (v1.12.0) ist aufgehoben,
+  sie verhinderte das Nachzeichnen.
+- Schreibweg `ModelCommand.setTrackColor` (Undo: Paar alt/neu). Farbrad über `TrackColorPanel`
+  (NSColorPanel, nicht kontinuierlich). Menüsymbole als Nicht-Vorlagen-Bilder.
+- Undo-Vertrag: Farbe hat Undo (je Palettenwahl bzw. abgeschlossener Radwahl).
+- Nachzeichnen: Jede `Equatable`-View, die die Spurfarbe als Parameter bekommt, muss sie im `==`
+  vergleichen (`StepButtonView`); AppKit-Blätter (`CornerDotHandle`) setzen `needsDisplay` im
+  `didSet` der Farbe. Sonst erscheint die neue Farbe erst beim nächsten Zustandswechsel.
+- Lane-Anfasser: oben = Step-Anzahl (weißer Punkt), unten = Step-Länge (Spurfarbe), passend zur
+  Angabe am rechten Rand.
+
+## Taktart je Pattern (ab v1.18.24)
+
+- **Modell:** `Pattern.timeSignature`; `TransportState.timeSignature` spiegelt das aktuelle
+  Pattern (`syncMeter()` beim Setzen von `currentPatternIndex` und in `publishSnapshot`).
+  Schreibweg: `setTimeSignatureUndoable` (Undo identitätsgebunden an Pattern und Lanes).
+- **Vormerkung (E2):** läuft das Pattern, kommt die Änderung nach `pendingMeters` (Main) und in
+  `TransportState.pendingTimeSignature` (Anzeige). `applyPendingMeters()` in `publishSnapshot`
+  (nach `reconcilePatternSwitch`) übernimmt sie, sobald das Pattern nicht mehr läuft (Wechsel,
+  Stop) — mit Undo-Schritt, ohne eigenes Publish. Taktart und Pad-Längen eines Patterns ändern
+  sich so nie während seines laufenden Abschnitts (Codex KT-02).
+- **Snapshot:** `PatternSnapshot.meter` = Taktart des Patterns; der Tick übernimmt sie in
+  `openSection` am Wechsel. `PlaybackStateBundle.switchOnBar` (E3): manueller Wechsel bei
+  `(pulse − rtOrigin) % ppb == 0` statt `track0WillWrap`.
+- **Abschnitt mitten im Takt:** `openSection` beginnt immer einen neuen Takt; Takt =
+  `rtBar0 + ⌊rel/ppb⌋ + (rel % ppb ≠ 0 ? 1 : 0)`, Ursprung = Wechselpuls.
+- **Song:** `SongPlanner.schedule(pulsesPerBar:)` nimmt eine Funktion Pattern → Pulse je Takt.
+- **Preset:** `timeSignature` je Pattern (immer), `patternSwitch` oben; Laden löst fehlende
+  Pattern-Taktarten auf die Projekttaktart der Datei auf; ohne `patternSwitch` „track1". Neue
+  Projekte (`TransportState`-Vorgabe, `resetToNewProject`) „bar".
+- **Offen (Paket 4):** Loop-Vorberechnung nur für die Taktart des aktuellen Patterns
+  (`setStretchTarget`); Abschnittsgrenze innerhalb eines Renderblocks ohne Segmentierung;
+  Aufnahme über einen Abschnittswechsel.
+
+## Abschnitt: Taktart, Ursprung, Aktivierung (ab v1.18.23)
+
+- **Tick (`TickKernel`)** besitzt `rtMeter`, `rtPulsesPerBar`, `rtOrigin`, `rtBar0`,
+  `rtActivation`, `rtPattern`. Sitzungsbeginn: Ursprung 0, Takt 0, Taktart aus
+  `bundle.snapshot.meter`. Taktgrenze: `(pulse − rtOrigin) % rtPulsesPerBar == 0`, Takt
+  `rtBar0 + (pulse − rtOrigin) / rtPulsesPerBar`. `openSection(at:meter:)` beim Wechsel: auf einer
+  Taktgrenze neuer Ursprung und Taktart des neuen Patterns (Takt einmal weiter); mitten im Takt
+  bis Paket 3 nur Aktivierung + 1 (unverändertes Raster).
+- **Grenztick-Reihenfolge:** Plan-Linie auflösen → Songende/Wechsel entscheiden → Abschnitt →
+  Taktanker, HostSync, Loop-Fenster, Noten mit demselben `outTime`. Am Songende kein Abschnitt.
+- **HostSync:** Ring je Anker zusätzlich Taktart, Ursprung, Takt am Ursprung, Aktivierung,
+  Pattern/nächstes Pattern, Wechselpuls; alles im selben Seqlock. `State` liefert `numerator`,
+  `denominator`, `bar`, `barStart`, `activation`, `pattern`, `nextPattern`, `nextSwitchPulse`,
+  `pulse`. Laufend aus dem Anker, im Stillstand Projekttaktart ab Viertel 0. Host-Blöcke:
+  Downbeat = `barStart`. `HostSync.meter` ist nur noch die Projekttaktart.
+- **Loops:** Dehnungsverhältnis aus `State.quartersPerBar`; Materialposition
+  `(bar mod Takte + (beat − barStart)/Taktlänge) · Taktframes` (Codex KT-03). Blockgrenzen über
+  Abschnittswechsel folgen in Paket 3.
+- Nachweis `SectionTests`.
+
+## Positionsanzeige (ab v1.18.21)
+
+- `PositionDisplayView` (Transportleiste) liest `HostSync.state(at: mach_absolute_time())` und
+  `HostSync.meter`, nur Atomics, in einer `TimelineView` mit 30 Hz, angehalten im Stillstand.
+  Kein `@Published`, keine Engine-Beobachtung außer `TransportState.isPlaying`.
+- Zeitbezug: die HostSync-Anker liegen auf den geplanten Ausgabezeiten — die Anzeige zieht
+  keinen Vorlauf ab (Codex KT-04). INT: nominelle FoF-Ausgabe; EXT: verzögerte FoF-Ausgabe, nicht
+  die Position des Masters. Unbekannte Latenz externer Geräte ist nicht enthalten.
+- Ab v1.18.22 trägt die Anzeige auch Tempo (Ziehen/Doppelklick/▲▼/TAP → `engine.setBPM`) und
+  Taktart (→ `setTimeSignatureUndoable`); die Ziffern der Position laufen allein in der
+  `TimelineView`, Tempo und Taktart beobachten `TransportState` wie zuvor die BPM-Platte.
+- Rechnung `TimingInfo` (Position, Laufzeit, Notenwert, Spurlänge) ist reine Funktion, getestet in
+  `TimingInfoTests`. Mit Paket 2/3 (Taktart je Pattern) liefert HostSync Taktart und Taktursprung
+  je Abschnitt; die Anzeige rechnet dann vom Ursprung statt von Viertel 0.
+
+## Beobachter von Systemmeldungen (ab v1.18.20)
+
+- Meldungen aus Plug-in- und Audio-Warteschlangen (`kAudioComponentInstanceInvalidationNotification`,
+  `AVAudioEngineConfigurationChange`) werden **ohne** Warteschlange beobachtet
+  (`queue: nil`) und asynchron an Main gegeben. Mit `queue: .main` wartet der Absender, bis Main
+  den Block ausgeführt hat; steht Main gleichzeitig in einem synchronen Aufruf an dasselbe Plug-in
+  (`detach`, Bus-Freigabe über XPC), verklemmen beide (gemessen iMac, 1.18.17, Plug-in FSVR stürzt
+  beim Entladen ab). Nachweis: `PluginInvalidationTests`.
+
+## Budget, Schreibgeneration (ab v1.18.17)
+
+- `AudioLoopStorage.init` reserviert `bytes(frames:)` per CAS (`reserve`) vor der Allokation;
+  deinit gibt frei. `fits` ist nur Vorprüfung. Vorberechnung reserviert zusätzlich ihren
+  Arbeitsspeicher (32 B × (Quelle + Ziel) + 8 MB Bibliothek, STFT-Puffer < 2 MB bei 384 kHz).
+- `AudioLoopCore.writeGeneration`: der Eingangs-Render erhöht sie (seq_cst) zu Beginn jedes
+  Aufnahmeblocks vor dem ersten Schreiben. Vorberechnung gilt nur bei unveränderter
+  Schreibgeneration, Materialstand, Startzähler, Stillstand und Ruhezustand.
+- `AppleSampler.relocate`: je Verweis `SampleFolders.locate` (keine Präfix-Abkürzung).
+- v1.18.18: Verweise sind Pfade (EXS-Samples, `Sample:n`) oder `file://`-URLs (SoundFont/DLS-Bänke,
+  `Bank:n`); `AppleSampler.path(of:)`/`reference(_:like:)` lesen beide und erhalten die Form.
+
+## Apple Sampler (ab v1.18.16)
+
+- Gemessen (`AppleSamplerProbeTests`, gesteuert über `fof-sampler-probe` im Container-tmp):
+  AUSampler außerhalb des Prozesses läuft, `kAUSamplerProperty_LoadInstrument` dort −10879;
+  im App-Prozess geladen und als `fullState` übergeben: alle Verweise; umgebogene absolute Pfade
+  liest der Hostprozess, fehlende ergeben 0 Verweise; ein Ausgangsbus.
+- Ausnahme zur Regel „nur out-of-process" (v1.13.7): nur `AppleSampler.convert` legt eine
+  kurzlebige AUSampler-Instanz im App-Prozess an (Systembestandteil, kein fremder Code, kein
+  Render). Gespielt wird immer die Instanz außerhalb.
+- `SampleFolders`: Security-Scoped-Bookmarks (nur lesen) in `samplerFolders`, Zugriff offen
+  solange FoF läuft. Der Debug-Build hat durch Xcode eine Leseausnahme für absolute Pfade —
+  Tests mit `~/Music` sagen nichts über die Freigabe im Release.
+- `PluginLifecycle.restoreState` → `AppleSampler.relocate` (nur Sampler): nicht vorhandene
+  Verweise per Suffixsuche unter freigegebenen Ordnern, gefundene Verschiebung als Präfix für
+  die übrigen. Ungefundenes bleibt unverändert.
+- Undo: Sampler-Instrument laden = Rack, kein Undo (wie Plug-in wählen).
+- Zuordnung (Codex R15-05): `SampleFolders.locate` bewertet alle Ordner nach dem längsten
+  Komponenten-Pfadende (mindestens Ordner + Datei), Gleichstand → nil. Präfixverschiebungen
+  gelten nur komponentenweise und nur für lesbare Dateien.
+- Freigaben (R15-06): Lesezeichen → aufgelöste URL → `startAccessing`; gültig, wenn danach
+  lesbar. `scoped` merkt, ob geschlossen werden muss (Entfernen, Ersetzen durch übergeordneten
+  Ordner, deinit).
+- Vorberechnung (R15-01/-02/-03/-04, Abschnitt v1.18.15 ergänzt): Überblendung `xfadeDone` über
+  Blöcke, beide Rampen gegenläufig nach Frame-Index (`renderStretched(fadeOutAt:fadeOutDone:)`,
+  `renderExact(xfade:)`); Grenze = jüngster Anker bis zum letzten Frame, falls ≥ Blockbeginn
+  (Frame 0 eingeschlossen). Budget: `AudioLoopStorage.reserve(bytes:)` vor jeder Berechnung.
+  Übernahme nur bei unverändertem `transportStarts` und Stillstand.
+
+## Vorberechnete Zeitdehnung, Clock-Vorlauf (ab v1.18.15)
+
+- `AudioLoopCore` veröffentlicht neben dem Material eine Vorberechnung (`renderedRaw`, eigener
+  Hazard `hazardRendered`, Freigabe über dieselbe `retired`-Liste; `reclaim` prüft drei Hazards).
+  `bind` löst sie vor dem Veröffentlichen des neuen Materials (kein ABA über Rohzeiger).
+- Gültig nur, wenn `prerenderSource == raw(Material)`, `prerenderVersion == materialSerial`,
+  gleiche Takte/Rate und |barFrames − Taktlänge jetzt| ≤ 1. Sonst Echtzeitdehnung wie v1.18.13.
+- Tausch Echtzeit → Vorberechnung nur in dem Block, der eine Taktgrenze enthält: Echtzeit bis
+  zur Grenze + 128 Frames mit Ausblenden, Vorberechnung ab der Grenze mit Einblenden
+  (`renderPrerendered`). Umgekehrt (Tempo ändert sich) setzt der Stretcher wie bisher neu auf.
+- Erzeugung nur auf Main angestoßen, gerechnet auf `fof.loop.prerender` (utility):
+  `AudioLoopController.setStretchTarget` (aus `publishSnapshot`), Stopp, Materialwechsel,
+  Laden, Umrechnung; 250 ms gebündelt, nie bei laufendem Transport. Budget über
+  `AudioLoopStorage.fits` (die Vorberechnung zählt mit).
+- `fof_stretch_render_loop`: Block 120 ms, Abstand 15 ms, `exact()` über drei Umläufe, Ausgabe
+  der mittlere, erste 20 ms aus der Fortsetzung des dritten übergeblendet (Naht).
+- Clock-Vorlauf: `InstrumentRack.outputBufferSeconds` (Gerät der laufenden Engine, sonst
+  Standard), `onOutputConfigChange` bei jedem Engine-Start und -Stopp.
+
+## Akkorde in der Skala, Lizenzdateien (ab v1.18.14)
+
+- `SequencerEngine.rolledChords(scaleIndex:scaleRoot:count:source:fixedFamily:using:)` ist der
+  einzige Weg zu gewürfelten Akkorden (Pad-RND, Einzeltöne/Akkorde gemischt). Skala > 0 heißt:
+  jeder Ton jedes Akkords erfüllt `noteInScale`. Familien zählen nur, wenn `PadChords.fits(family,
+  scale:)` alle möglichen Akkorde abdeckt (Terzkette ist nicht aufzählbar → nie bei Skala).
+  Rückfall immer `freeProgression(restrict: true)`; Skalen ≠ 7 Stufen über `scaleChordWalk`.
+  Nachweis `PadChordScaleTests` (alle Skalen × Quellen × Familien).
+- Lizenzen: `VintageSequencer/Licenses/` (synchronisierter Ordner → Bundle-Ressourcen). Neue
+  Abhängigkeiten tragen sich in `THIRD_PARTY_NOTICES.md` ein (Version, Commit, Lizenz, Einbindung).
+
+## Zeitdehnung der Audio-Loops (ab v1.18.13)
+
+- Weg-Wahl je Ausgangsblock (`AudioLoopCore.stretchRatio`): Taktlänge jetzt (Viertel je Takt ·
+  60 / Tempo · Rate, aus `HostSync`) gleich `barFrames` (±0,5) → bisheriger samplegenauer Weg
+  über Taktanker und `LockedIndex`; sonst Stretcher. Verhältnis außerhalb 0,25…4 → samplegenau.
+- Position: `materialPosition(h)` = ((Beat(h) / Viertel je Takt) mod bars) · barFrames — je
+  Block neu aus der Musikposition, nie aufsummiert. Cursor-Ziel am Blockende = Position(Ende) +
+  Eingangslatenz + Ausgangslatenz · Verhältnis (gemessen am Prototyp, ±10 Frames). Abweichung
+  < 0 oder > 4·n+256 → Neuaufsetzen (`output_seek` ab Position am Blockbeginn, Einblendung
+  128 Frames). Zähler `stretchSeeks` (Tests: genau 1 je Lauf).
+- Threads: `HostSync` gehört jetzt dem `AudioLoopController` (Rack reicht ihn durch); der
+  Stretcher (`FoFStretch`, C-Brücke `LoopStretch.h/.cpp`) wird in `prefault` auf Main angelegt,
+  danach nur vom Ausgangs-Render benutzt; Puffer `ZeroedMemory`, Zeigerfelder vorab. Gemessen:
+  `process` und `output_seek` allokieren nicht (C++-Prüfung mit gezähltem `operator new`, auch
+  8192-Frame-Blöcke und Verhältnisse 0,25…3,7).
+- Übergang zurück auf den samplegenauen Weg: Einblendung 128 Frames (`exactFade`).
+- Overdub bei abweichender Taktlänge: `AudioLoopController.setRecording` weist ab (`stretched`).
+- Bibliothek: `ThirdParty/` (README mit Version, Commit, Lizenz), `SIGNALSMITH_USE_ACCELERATE`,
+  Suchpfade und `-framework Accelerate` im App-Target. Nachweis: `AudioLoopStretchTests`.
+- Offen: Vorberechnung im Stillstand (hochwertig, Tausch an der Taktgrenze).
+
+---
+
+## Taktart (ab v1.18.12)
+
+- `TimeSignature` (Zähler 1–16, Nenner 2/4/8/16), projektweit in `TransportState.timeSignature`;
+  Schreibweg `SequencerEngine.setTimeSignatureUndoable` (nur `!isPlaying`, Undo, Pad-Umrechnung
+  identitätsgebunden an `LaneData`), `replaceTimeSignature` ohne Undo für Laden/Neu. Preset:
+  optionaler Schlüssel `timeSignature` ("7/8"), Dekodieren wirft nie (ungültig → 4/4).
+- Zeitbasis unverändert 24 Pulse je Viertel; Pulse je Takt = 96·Z/N. `Song.pulsesPerBar` (96)
+  bleibt nur 4/4-Vorgabe.
+- Tick-Pfad: `PlaybackStateBundle.meter`; der Tick setzt `rtPulsesPerBar` und die Taktart von
+  `HostSync` beim Sitzungswechsel (Puls 0) — innerhalb einer Sitzung ändert sie sich nicht
+  (Main ändert sie nur im Stillstand). Taktanker, Songwechsel und Horizontprüfung rechnen damit.
+- Main: `SongPlanner.schedule(pulsesPerBar:)`; Loop-Speicher `AudioLoopStorage.barFrames(quarters:)`
+  mit Vierteln je Takt; neu angelegt wird bei abweichender Taktlänge (statt nur abweichendem
+  Tempo). Vorhandenes Material behält `barFrames`.
+- Plug-ins: `HostSync.meterBits` (Atomic, Z·256+N); `musicalContextBlock` meldet Zähler/Nenner,
+  `currentMeasureDownbeatPosition` = ⌊Beat/Viertel-je-Takt⌋·Viertel-je-Takt (Beat in Vierteln).
+- Pad-Lane: Auswahl `TimeSignature.padSixteenths` (1–3 Schläge unter einem Takt, 1/2/3/4/8
+  Takte), `LaneData.ratioOptions(_:)` nimmt die Taktart; `clampToValidRanges` erlaubt ganze
+  Sechzehntel 1…2048. Nachweis: `TimeSignatureTests`.
+
+---
+
+## Kanal-EQ (ab v1.18.11)
+
+- Modell `ChannelEQ` (8 Bänder, feste Arten und Reihenfolge), je Kanal `InstrumentChannelData.eq`;
+  optionaler Presetschlüssel `eq`, nur bei Abweichung von der Grundeinstellung geschrieben;
+  `clamp` ersetzt falsche Bänderzahl/-arten durch die Grundeinstellung.
+- DSP: die Gain-Stufe des Kanals (`Live.gain`, `AVAudioUnitEQ`) hat `ChannelEQ.unitBandCount` =
+  14 Stufen (Low Cut 4, Low Shelf, 4 Glocken, High Shelf, High Cut 4); `globalGain` bleibt der
+  Fader. `InstrumentRack.apply(_:to:)` schreibt nur geänderte Bandwerte (Main); Parameter der
+  Einheit sind threadsicher, nichts im Tick- oder Render-Pfad ändert sich.
+- Gemessenes Verhalten der Einheit (Grundlage der Anzeige, `ChannelEQTests`): Glocke =
+  RBJ-Peak, `bandwidth` in Oktaven zwischen den Punkten halben dB-Gewinns (Q → Oktaven über
+  `asinh`); Shelf: `bandwidth` ohne Wirkung, halber Gewinn an der Ecke (RBJ S = 1);
+  `.highPass`/`.lowPass`: Butterworth 2. Ordnung, `bandwidth` ohne Wirkung. Cut mit n Stufen:
+  Ecke je Stufe f·(2^(1/n)−1)^(±1/4), Summe −3 dB bei f (Tiefpass nahe 3 kHz ≤0,2 dB daneben,
+  Frequenzverzerrung).
+- Anzeige rechnet dieselben digitalen Biquads (`Biquad`) bei der Geräterate. Nachweis: Kurve
+  gegen Offline-Render der Einheit (Sinus, ≤0,3 dB einzeln, ≤0,5 dB kombiniert).
+- UI: `ChannelEQThumbnail` im Zug, Editor als Popover (`ChannelEQEditor`); Ziehen hält einen
+  lokalen Entwurf (`EQDraft`) und schreibt höchstens alle 40 ms ins Rack.
+
+---
+
+## Umbau des Graphen bei laufender Engine (ab v1.18.10)
+
+Gemessen (AVAudioEngine, Einzelversuche): bei laufender Engine greift `connect(_, to: mainMixer)`
+nur, wenn der Zweig darüber schon eine Quelle hat (Instrument, Quellknoten). Dann bereitet die
+Engine alle Knoten des Zweigs vor — kein Neustart. Ein Zweig ohne Quelle (Gain → Mixer) kommt an
+der laufenden Summe nie an; ein später darunter gehängtes Instrument bleibt stumm (Befund
+v1.13.6). Effekte in einen hängenden Zweig einfügen oder tauschen funktioniert direkt.
+
+- Kanalausgang (`Live.mixer`) hängt bei laufender Engine erst mit Quelle an der Summe
+  (`InstrumentRack.hook`, `Live.hooked`); bei stehender Engine sofort. `rewire` ruft `hook`
+  nach dem Verbinden der Kette; `rebuildGraph` setzt `hooked` zurück und hängt neu.
+- `AudioGraph.adopt` (Stopp + Start, alle Kanäle setzen aus) ist nur Rückfall, wenn ein Knoten
+  danach keine Renderressourcen meldet; das Diagnoseereignis `restart` steht nur bei einem
+  tatsächlichen Neustart.
+- Bewusst mit Neustart: `setRenderRate` (neues Format des Instruments).
+- Nachweis: `GlitchFreeLoadTests` (Neustarts, Sample-Zeit-Lücken eines unbeteiligten Kanals,
+  Render-Zähler des neuen Instruments, Ressourcen von Loop-Kanal).
+
+---
+
+## Host-Blöcke nur ohne gleichzeitigen Zugriff (ab v1.18.9)
+
+Befund iMac (macOS 12.7.6, Absturzbericht AUHostingServiceXPC): Odin2 ruft im Render
+`getCurrentPosition` → `transportStateProc` → leerer Funktionszeiger, SIGSEGV. Ursache: FoF setzte
+die Host-Blöcke bei jedem Neuverdrahten neu (Getter eines ausgelagerten Plug-ins ist leer), also
+auch beim Effektwechsel, während das Instrument im Hostprozess renderte (Test: 7× bei 4 Wechseln).
+
+Regel: Host-Blöcke werden gesetzt
+1. bei der Installation, bevor das Plug-in in die Engine kommt;
+2. vor jedem Start, solange die Engine steht (`AudioGraph.onWillStart`, vor `prepare`);
+3. nach einem Start genau dann, wenn das Plug-in seither gerendert (`HostBinding.renders`), die
+   Blöcke aber nicht aufgerufen hat (`calls` unverändert, Prüfung nach 0,3 s) — dann ruft sie im
+   Hostprozess niemand, es gibt keinen Wettlauf (A17-09: ein Neustart verliert sie dort).
+Nie im laufenden Betrieb bei einem Plug-in, das sie benutzt. Annahme: Plug-ins, die die Blöcke
+nutzen, fragen je Block (JUCE: jeder `processBlock`); ein Plug-in, das seltener als alle 0,3 s
+fragt, bekäme sie nach einem Start einmal erneut gesetzt.
+
+## Abtastrate des Instruments je Kanal (ab v1.18.9)
+
+Messung (Test `DecentSamplerProbeTests`, nur mit Steuerdatei): Decent Sampler 1.42.1 gibt ein
+44,1-kHz-Sample bei 44,1 kHz bitgenau aus (−134 dB Restfehler), rechnet es bei 48/96 kHz aber
+grob um (−35,7 dB, auch bei feiner Ausrichtung) — hörbar an Becken/Snares. Über das FoF-Rack und
+über eine nackte Engine identisch: FoF fügt nichts hinzu. DS bei 44,1 kHz + Umrechnung durch den
+Mischer der Engine: −62 dB.
+
+- `InstrumentChannelData.renderRate` (optional, Schlüssel `renderRate`; 44,1/48/88,2/96 kHz,
+  nil = Geräterate). Weicht sie ab, steht hinter dem Instrument eine `AVAudioMixerNode` als
+  Umrechnungsstufe (`Live.rateStage`); die erste Verbindung trägt die eigene Rate
+  (`AudioGraph.connectChain(headFormat:)`). Umstellen bei laufendem Instrument: kurzer
+  Engine-Neustart, Observer neu (Frames je Host-Tick aus der neuen Rate).
+- **Timing gemessen** (Abstände von 12 Einsätzen zu Future-Zeitstempeln über die
+  Kanal-Warteschlange): Streuung 0,008 ms (Geräterate) bzw. 0,011 ms (44,1 kHz), Versatz der
+  Stufe 0,04 ms — kein Ausgleich nötig. Offen: die erste Note nach dem Laden lag in beiden Fällen
+  4,4 ms später als die übrigen (Ursache nicht geklärt, FoF oder DS).
+- Bedienung: Kontextmenü des Kanalzugs „Abtastrate des Plug-ins"; der Instrumentplatz zeigt eine
+  abweichende Rate an.
+
+## Geräte von Aufnahme und Wiedergabe (ab v1.18.7)
+
+- **Quelle der Wahrheit** ist das Gerät, an dem die laufende Engine hängt
+  (`kAudioOutputUnitProperty_CurrentDevice` ihrer Ein- bzw. Ausgabe-Einheit, `AudioDevices`),
+  nicht der Systemstandard. Der Standard erscheint nur als „wird beim nächsten Start benutzt"
+  bzw. — läuft die Engine noch am alten Gerät — als ausdrücklicher Hinweis auf die Abweichung.
+- `AudioDeviceState` (Besitzer `AudioLoopController`, eigenes Zustandsobjekt) hält Eingang und
+  Ausgang getrennt: läuft, Gerät, Kanäle, Abtastrate, Systemstandard, Fehler. Abgleich bei
+  jedem Start/Stop/Neustart beider Engines und über CoreAudio-Listener (Standardgeräte,
+  Geräteliste) auf Main. Nur die Blätter `LoopDeviceLabel`/`LoopDeviceSection` beobachten ihn.
+- **Latenz:** Aufnahmeausgleich und Loop-Latenz nehmen die Werte des tatsächlich benutzten
+  Ein-/Ausgabegeräts (vorher: Systemstandard, falsch, sobald beide auseinanderliefen).
+
+## Zeilenidentität über Patterns (ab v1.18.6, Codex A17-12)
+
+Jede Spur trägt `TrackData.row` (UUID). Die Spuren derselben Zeile in allen Patterns teilen
+ihn; `id` bleibt je Instanz eindeutig (ViewModels, Snapshot, ModelWriter).
+
+- **Strukturbefehle** (Verschieben, Einklappen, Löschen, Duplizieren, Einfügen nach) bekommen
+  eine Nummer im aktuellen Pattern, lösen sie in dessen Zeile auf und wirken in jedem Pattern
+  auf die Spur dieser Zeile. Ein Pattern ohne die Zeile bleibt unberührt.
+- **Verschieben:** die Zeile kommt in jedem Pattern vor die erste Zeile, die im aktuellen
+  Pattern danach unter ihr liegt und dort vorkommt, sonst ans Ende. Vorher/Nachher je Pattern
+  wie seit v1.17.7 (exakt invers).
+- **Neue Zeile:** Hinzufügen/Einfügen legt eine Zeile für alle Patterns an; Duplizieren
+  ergibt eine neue Zeile direkt unter der Quelle. Pattern einfügen (Zwischenablage) und
+  `freshCopy` behalten die Zeile.
+- **Presetformat:** optionaler Schlüssel `row` je Spur (immer geschrieben). Fehlt er (Dateien
+  vor 1.18.6) oder in aufgefüllten Plätzen, vergibt `Pattern.assignMissingRows` die Zeile nach
+  Nummer — genau die bisherige Bedeutung. Ältere FoF-Versionen ignorieren den Schlüssel.
+- Nicht über die Zeile: Spurinhalte (Steps, Name, Ausgang …) bleiben je Instanz und Pattern.
+
+## Zerlegung des Racks (ab v1.18.0, Codex A17-10)
+
+Ziel: genau ein Besitzer je veränderlicher Ressource, schmale Schnittstellen; `InstrumentRack`
+bleibt Fassade. Abnahme je Schritt: weniger Zugriffsrechte, nicht nur kleinere Dateien.
+
+| Besitzer | Besitzt | Liest vom Rack | Schreibt ins Rack | seit |
+|---|---|---|---|---|
+| `ParameterCatalog` | Parameter-Caches je Installation, Baumbeobachtung, Zielauflösung | `ParameterCatalogHost`: Kanaldaten, Einheiten, Status, Effekt-Warteschlange | nichts (`onChange` → Rack löst Routing neu auf) | 1.18.0 |
+| `RackDiagnostics` | Proben-Vergleichsstände, AU-Beobachtung (Preset/Baum/Zustand) | nichts — bekommt je Probe `Probe` (Momentaufnahme) | nichts (schreibt nur in `AudioDiagnostics`) | 1.18.1 |
+| `AudioGraph` | `AVAudioEngine` (Anlegen, Start/Stop, Neustart beim Aufnehmen neuer Knoten, Rücksetzen), Summe (Master-Gain, Lautstärke, Summen-Tap), Mischformat, Beobachtung Geräte-/Formatwechsel | nichts — das Rack reicht Ketten (`connectChain`/`disconnect`) und Knoten (`adopt`) | nichts; meldet `onStarted` (Rack: Fehler/Lauf veröffentlichen, Host-Blöcke bestätigen, A17-09) und `onConfigurationChange` (Rack: Neuverdrahtung) | 1.18.3 |
+| `AudioLoopController` | Block der Loop-Kerne, Taktanker, Material (`AudioLoopAssets`), Eingangs-Engine, Anzeigen und ihre Abfrage, Latenzmessung, Speicher-/Ladeaufträge | `AudioLoopHost`: Loop-Kanäle (Reihenfolge, Einstellungen), Abtastrate des Ausgangs, Lauf der Engine | nur über `AudioLoopHost`: `loopConfigured` (Rack setzt Gates, Routenlatenz), `loopSettingsMeasured` (Messergebnis in die Kanaldaten), `loopProjectChanged` | 1.18.4 |
+| `PluginLifecycle` | Laden (nur out-of-process, Test-Ersatz), Klangzustand lesen/setzen, Host-Bindung (Anlegen, Bestätigen nach dem Verdrahten, Wiedereinsetzen nach Engine-Starts), Render-Observer von Instrument und Effekt, Editorfenster (je Instrument bzw. Effekt-Token, angeforderte getrennt geführt) | nichts — bekommt Einheit, Warteschlange (unretained) und Bindung je Aufruf | nichts (schreibt nur in `AudioDiagnostics`) | 1.18.5 |
+
+Belegung: das Rack meldet jeden Slot (`occupy`/`vacate`, auch Kanäle ohne Loop), der Kern folgt
+der Belegungsepoche der Kanal-Warteschlange wie bisher. Abbau: das Rack hält zuerst Engine und
+Eingang an, dann werden Warteschlangen und (mit der Steuerung) die Loop-Kerne freigegeben — die
+Render-Rückrufe lesen beide (in 1.18.3 lag der Stopp erst nach der Freigabe der Warteschlangen).
+
+Jeder Start und Neustart der Engine läuft über `AudioGraph.start()` und damit über `onStarted` —
+kein Weg kann die Bestätigung der Host-Blöcke mehr auslassen. Kanalknoten (Fader, Kanal-Taps,
+Gate, Loop-Quellen) gehören dem Rack (`Live`).
+
+Editorfenster (v1.18.5): ein Editor, der geschlossen wird, bevor sein Fenster eintrifft
+(entfernter Controller kommt asynchron), wird verworfen statt verwaist geöffnet; ein zweiter
+Aufruf während des Anforderns öffnet kein zweites Fenster. Vorher hielt `Live` die Fenster
+schwach gebunden — nach dem Entfernen eines Kanals konnte ein Editor ohne Besitzer erscheinen.
+
+Beim Rack bleiben: Kanalliste und `@Published`-Zustand, `Live` (Knoten, Slot, Tokens,
+Bindungen), Slot- und Effekt-Warteschlangen-Belegung, Verdrahtung der Kanäle, Mix,
+Routenlatenz, Wächter. Damit ist die Zerlegung aus A17-10 abgeschlossen (Rack 2236 → 1473
+Zeilen); weitere Schnitte nur bei neuem Anlass.
+
+## Schreibwege und Undo-Vertrag (v1.17.8, Codex A17-11)
+
+Alle Wege laufen auf Main. „Dirty" = `hasUnsavedChanges`; „Snapshot" = Playback-Neuaufbau.
+
+| Aktion | Weg | Undo | Dirty | Snapshot |
+|---|---|---|---|---|
+| Steps, Länge, Ratio, Tonhöhen, Name, Farbe, Drum-Modus, MIDI-Kanal, Offset, Skala | `ModelWriter` | ja | ja | bei Playback |
+| Richtung, Mute, Solo | `ModelWriter` | nein (bewusst: Spielhandlung) | ja | bei Playback |
+| Spur anlegen/einfügen/duplizieren/löschen | Engine `…Undoable` (Platzierungen, Transaktion) | ja | ja | ja |
+| Spur verschieben | Engine `moveTrackUndoable` (`TrackOrder`) | ja | ja | ja |
+| Spur ein-/ausklappen | Engine `setTrackCollapsedUndoable` (`CollapseChange`, `viewChanged`) | ja | ja | nein |
+| Song (Szenen, Länge, Schleife) | Engine `setSongUndoable` | ja | ja | ja |
+| Loop-Material (Durchgang zurück, Löschen) | Engine `undoAudioLoopPassUndoable`/`clearAudioLoopUndoable` (versionsgebunden) | ja | ja | — |
+| Loop-Einstellungen (Takte, Eingang, Gate) | Rack | nein | ja | — |
+| Mixer (Pegel, Pan, Mute/Solo Kanal, Kanal-EQ), Plug-ins, Effektkette, Sampler-Instrument laden | Rack | nein | ja | Routing |
+| Laden/Neu | Engine Preset-IO | leert Undo | nein | ja |
+
+Neue Aktionen: Zeile ergänzen. Undo heißt immer identitätsgebunden mit gemerktem Vorzustand
+(keine Gegenbewegung mit Indizes, keine Wiederholung nicht-deterministischer Aktionen).
+
+## Effekt-Identität und Parameterkatalog (v1.17.8)
+
+- **Instanz:** Jeder Effekt trägt `PluginRef.instance` (neu bei jeder Einfügung, auch beim
+  Austausch auf einem Platz). `replaceAll` vergibt fehlende und doppelte Instanzen neu.
+  Umordnen ändert sie nicht.
+- **Ziel:** `ParameterRef.effectInstance` ist maßgeblich; `effect` (laufende Nummer) wird für
+  ältere Versionen weiter geschrieben, aber nur ohne Instanz ausgewertet. Ältere Ziele bindet
+  `bindLegacyEffectTargets` einmal direkt nach dem Laden. Fehlt die Instanz → Ziel offen.
+- **Parameterbaum:** KVO auf `parameterTree` (Instrument über die Diagnose-Beobachtung, Effekte
+  je Token) leert den jeweiligen Cache auf Main und ruft `onRoutingChange` (Snapshot-Ziele neu).
+
+## Spurbefehle und Kanalpuffer (v1.17.7)
+
+- **Verschieben:** `trackMovePlan` erfasst je Pattern die Instanzfolge vorher/nachher;
+  `applyTrackOrders` setzt sie identitätsgebunden. Undo = Vorher-Folge, nie Gegenbewegung mit
+  Indizes. **Einklappen:** `CollapseChange` (Instanz, Wert) vorher/nachher; Signal
+  `viewChanged` (nur `TrackViewModel`), kein `changed` → kein Snapshot, aber Dirty-Flag.
+- **Strukturtransaktion:** `withStructureTransaction` unterdrückt die `$tracks`-Senken und baut
+  die Abos am Ende einmal auf (Insert/Remove/Move über alle Patterns).
+- **Kanalpuffer:** Ereignisringe/Wartelisten (`AUEventRing`, `AUEventQueue`), Loop-Arbeitspuffer
+  und `AudioSampleRing` liegen in `ZeroedMemory` (anonyme mmap-Seiten, null = gültiger Wert).
+  Main belegt sie real (`prefault`), bevor sie aktiv werden: Instrument-Warteschlange und
+  (bei Loop-Kanälen) Loop-Kern in `install`, Effekt-Warteschlange in `reserveEffectQueue`.
+  Echtzeit-Pfade berühren nur Puffer aktiver Kanäle; Eingangs-Render und Songende fassen bei
+  unbenutzten Kanälen nur Atomics an. Notenbuch bleibt fest belegt.
+
+## Host-Zeitvertrag der Plug-ins (v1.17.6, ersetzt die Zeitangaben von v1.17.2)
+
+- **Sitzung:** `beginSession(session)` im Tick mit der Snapshot-Sitzungsnummer setzt Anker,
+  Startzeit und Ende zurück. Startzeit = Host-Zeit des ersten Ankers (Puls 0).
+- **Anker:** Ring von `ringSize` = 32 Pulsankern (Puls, Host-Zeit, Tempo). Eine Abfrage zur
+  Zeit h benutzt den jüngsten Anker mit Zeit ≤ min(h, Ende); gibt es keinen, den ältesten.
+  Vorlauf des Ticks ≤ Intervall + Sicherheitsabstand + Verspätung = wenige Pulse.
+- **Sample-Position** = (min(h, Ende) − Start) in Samples der Ausgangsrate des Plug-ins.
+  Unabhängig vom Tempo; FoF springt nicht, jede Sitzung beginnt bei 0.
+- **Ende:** wird nur früher (CAS). Schreiber: Tick am Songende (`end(at:)` auf dem geplanten
+  Endpuls, ohne Main) und Main beim Benutzer-Stop (`stop(at:session:)`, wirkt nur auf die
+  genannte Sitzung). Ab dem Endpuls veröffentlicht der Tick keine Anker mehr.
+- **`.changed`:** Wechsel von Lauf oder Sitzung, einmal gemeldet (atomarer Austausch in der
+  Bindung) — auch wenn ein Plug-in aus mehreren Threads fragt.
+- **Bindung:** `HostBinding` je Installation (Blockzeit vom Vor-Render-Observer, Ticks je
+  Sample, Aufrufzähler). Blöcke halten HostSync, Bindung und Warteschlange stark — kein Zugriff
+  auf Rack-Speicher, der mit dem Rack verschwindet. Installation: vor dem Einhängen und, falls
+  der Getter danach leer ist, einmal nach dem Verdrahten (Diagnose
+  `hostBlocksInstalledAfterWiring`). Kein periodisches Neusetzen. Nachweis der Wirkung:
+  Zähler > 0 im echten Renderpfad (Test `HostSyncRealPluginTests`, Diagnose `hostCalls`).
+  **Ursache und Behebung (v1.17.10):** Startet die Audio-Engine neu (`adoptNewNodes` beim
+  Laden eines weiteren Plug-ins, Wiederherstellung, Start), kann ein ausgelagertes Instrument
+  seine Blöcke verlieren (Getter leer, es rendert, 0 Aufrufe). `reaffirmHostBindings()` setzt
+  nach jedem dieser Ereignisse und nach `rewire` fehlende Blöcke derselben Bindung neu
+  (Zähler `reinstalls`, Diagnose `hostBlocksReaffirmed`). Beleg im Testbericht
+  `fof-hostsync-real.txt`: `instReinstalls=1`, danach Aufrufe.
+
+## Spurzeilen: verschieben, einklappen, 64 Kanäle (v1.17.3)
+
+- **Verschieben** (`moveTrack(from:to:)`) wirkt in allen Patterns auf denselben Index, weil
+  Zeile n überall dieselbe Spur ist; Patterns mit weniger Zeilen so weit möglich. Instanzen
+  bleiben erhalten, Runtime-Bindung (Slot + Epoche) reist im Snapshot mit — der Tick braucht
+  nichts Neues. Ende über `structureDidChange`, Undo als Gegenbewegung. Folge: ohne Song
+  bestimmt die neue Zeile 0 die Patternlänge.
+- **Einklappen** (`TrackData.isCollapsed`) ist reine Ansicht, nicht im Snapshot; gesetzt für den
+  Index in allen Patterns, `changed` je Spur. Preset: optionaler Schlüssel `collapsed`, nur bei
+  true kodiert; `freshCopy` übernimmt ihn.
+- **Kanäle:** `InstrumentRack.maxChannels = 64` (Instrument-Warteschlange ~100 KB, Loop-Kern,
+  Notenbuch-Port je Kanal, fest in `init`). Effekt-Warteschlangen `AUEventQueue(ringCapacity:
+  256, pendingCapacity: 128)` — sie tragen nur Parameterwerte. `pendingCapacity` ist jetzt
+  Eigenschaft der Instanz (Entnahmegrenze je Block). Loop-Markierung im Tick: `UInt64`; mehr
+  als 64 Kanäle bräuchten eine andere Markierung.
+- **Ansicht:** `TrackRowChrome.swift` — `TrackNameField`, `TrackRowEdge` (Einklappen, Ziehgriff),
+  `CollapsedTrackRow`.
+- **Ziehen (v1.17.10, ersetzt das Ablegen von v1.17.4):** eigene `DragGesture` am Griff im Raum
+  `fofTrackList`; `TrackDragState` (MainView hält es als `@State`, beobachtet nicht) rechnet die
+  Zielzeile aus den Zeilenmitten (`TrackRowFramesKey`) und den Versatz der übrigen Zeilen;
+  nur das Blatt `TrackDragOffset` beobachtet. Loslassen (v1.18.2) → `settle`: die Zeile gleitet
+  animiert auf ihre Ruhelage in der Lücke; danach `moveTrackUndoable` und Zurücksetzen in einer
+  Transaktion ohne Animation (Lage stimmt schon, nichts springt).
+- **Ablegen (v1.17.4):** `DropDelegate`, Vorschlag `.move` (kein Kopier-Plus). Obere/untere
+  Zeilenhälfte = Lücke `trackIndex`/`trackIndex + 1`; `moveDestination(from:gap:count:)` ist
+  die einzige Umrechnung Lücke → Zielzeile (nil = keine Bewegung, dann keine Linie). Verschoben
+  wird nach dem Inhalt des Ziehvorgangs (UUID); `TrackDragSession.draggedID` dient nur der Linie.
+  Linie mittig im Zeilenabstand (`halfGap` = halber `VStack`-Abstand der MainView).
+- **Step-Leiste eingeklappter Spuren (v1.17.4):** Canvas mit der Zelllage des Rasters
+  (`CollapsedStripLayout` = `distributedStepWidth` + `stepGridLeadingPad`), scrollt über
+  `laneScrollShift`, Playhead nur im Blatt `CollapsedPlayhead`. Seit v1.17.5 LED je Step wie
+  im Raster (`ledCenter`), Playhead = helle LED, kein Rahmen. Als Overlay eingehängt, damit
+  die Lane-Breite die Zeile nicht verbreitert.
+
+## Nachprüfung 1.16.0 (v1.16.1)
+
+Grundlage: Codex-Nachprüfung von v1.16.0 (V16-1 bis V16-6, `.agent_handoff/latest_codex_architektur.md`).
+Planung und tatsächliche Ausführung sind unten getrennt benannt.
+
+**Songende unabhängig von Main (V16-1).** Erreicht der Tick `stopAtPulse` (einmal je
+Sitzung), plant er auf `outTime` dieses Pulses: Loop-Fenster schließen (wie bisher),
+`NoteOutput.endAllNotes(at:)` — jede Note mit offenem Off bekommt ihr Off zu
+min(geplantes Off, Ende); liegt ihr letztes On schon dahinter (Ratchet/Swing/Offset), direkt
+nach diesem On, nie davor — und `midi.sendStopRT(at: Ende + 1)`. Für MIDI geplant heißt: mit
+Zeitstempel an CoreMIDI übergeben; für Instrumente: in deren Warteschlange, der Render setzt
+den Sample-Offset. Main (`stopIfSongEnded`) hält danach Anzeige und Transport an und sendet
+für das Songende weder `flushOutput` (würde genau diese Offs verwerfen) noch ein zweites
+0xFC; Benutzer-Stop bleibt unverändert sofort. Sitzungsbindung wie v1.15.2. Test:
+`TransportPlanTests/songEndFinishesMIDIWithoutMain` (250 ms und 1 s Main-Ausfall: keine
+Anschläge ab dem Ende, gehaltener Drone endet auf dem Endpuls, kein Off dahinter, 0xFC genau
+einmal auf Ende + 1, Buch leer, kein zweites 0xFC von Main). **Offen:** Gerätenachweis
+(hörbares gemeinsames Ende MIDI/AU/Loop über Loopback-Aufnahme).
+
+**Speichern ohne synchrone Kodierung (V16-2).** `saveDataAsync`: Main ruft
+`captureStates`, sammelt je Loop-Kanal einen Auftrag (`AudioLoopAssets.SaveJob`: fertige Datei
+oder unveränderlicher Speicher + Version) und kodiert das Modell ohne Loops. Fehlende Loops
+kodiert ein Hintergrund-Thread; `PresetManager.merge` setzt sie unter `audioLoops` ein. Das
+Ergebnis füllt den Vorkodier-Speicher (nur bei unveränderter Version). Konsistenz: Modell und
+Material sind der Stand beim Aufruf. `PresetEditorState.changeEpoch` zählt jede
+Änderungsmeldung; der Indikator wird nur zurückgesetzt, wenn seit dem Speicherbeginn keine kam.
+Ein Speichervorgang zur Zeit (`saveInFlight`). Gemessen -O: synchron 231 ms, Main-Anteil 4,2 ms. Die Dialogpfade (Laden, Neu, Beenden über
+`.terminateLater`) laufen mit Fortsetzung. `saveData()` bleibt synchron für Tests/Messungen.
+Gemessen (Debug, 4 Loops à 4 Takte, 48 kHz, Cache-Miss): synchron 1168 ms, Main-Anteil
+asynchron 4,4 ms (`SaveAsyncTests/cacheMissEncodesOffMain`, Messdatei `fof-save-async.txt`).
+
+**EXT-Vorlauf und Einzelboden (V16-3).** Der EXT-Vorlauf enthält jetzt die Offsetreserve
+(größter negativer Spuroffset), wie INT. Zulässiger Spuroffset in beiden Modi ±50 ms
+(`TrackData.maxTimingOffset`, Bedienung und Decode). Einzelboden: ein Ereignis, das trotz
+Verschiebung vor „jetzt + 1 ms" läge, wird dorthin begrenzt und gezählt — bei fristgerechten
+Ticks tritt das nicht ein, da beide Vorläufe Overshoot und Reserve enthalten. Test:
+`externalClockCoversTheFullNegativeOffsetRange` (−50 ms, Puls über den MIDI-Callback in
+Echtzeit: genau 50 ms früher, kein Einzelboden).
+
+**Renderkosten (V16-4).** `renderCostAtFullLoad` misst je Block Thread-CPU-Zeit
+(Arbeitskosten, ohne Preemption) und Wandzeit (mit Scheduler-Störung). Grenzen: CPU p95 < 500 µs
+und CPU-Maximum < Blockzeit 1333 µs; Wandzeit-Überschreitungen werden gezählt, p95/p99/max
+immer in `fof-render-cost.txt` abgelegt.
+
+**Rote Tests im Volllauf (V16-5).** Ursache: Main stand im parallelen Volllauf zeitweise
+über 10–20 s nicht zur Verfügung — synchrone Main-Tests mit verschachteltem
+`RunLoop.main.run` (der in einem Main-Job die Main-Queue nicht abarbeitet) und das 60-s-XCTest
+mit `Thread.sleep` hielten Main am Stück. Eingegrenzt per Teilläufen: RT3b/S01 mit den
+GUI-Suites rot, mit jeder einzeln grün. Die RT3b-Tests zählten die Wartezeit auf Main zu
+stop() hinzu, der S01-Deinit-Test ließ den Reader nach 20 s von selbst los (danach war die
+Freigabe korrekt). Behoben: Langläufer und Szenen-Render suspendieren (`Task.sleep`) statt zu
+blockieren; RT3b misst die Dauer von stop() im Main-Block (< 2 s; Wartezeit auf Main bis
+120 s); der S01-Reader parkt bis 120 s und der Test prüft, dass er während der Publikationen
+geparkt war; die Sonde sitzt auf der tatsächlich gehaltenen Box (`_s01ProbeHeldBox`; ein
+nachgereichtes Publish konnte die beim Aufbau aktuelle Box vor dem Erwerb ablösen). Ergebnis:
+Volllauf 614 bestanden, 0 rot (Ergebnisbundle und Zahlen in
+`.agent_handoff/fof-measurements-v1.16.1.txt`). **Offen:** Monterey/Intel-Abnahme (Start,
+Preset, Gesten, MIDI, AU-Laden, Gerätewechsel, Wiedergabe) — kein Gerät verfügbar.
+
+**Messungen -O (v1.16.1).** Loop-Render 16 aufnehmende Kerne, 512 Frames, isoliert:
+CPU median 452 µs, p99 635 µs, max 696 µs (Blockzeit 10 667 µs) — wie v1.15.2. Der Test
+misst jetzt CPU (Grenze) und Wandzeit (Bericht) getrennt. **Offener Befund:** parallel zu
+`SaveAsyncTests` (Hintergrund-Kodierung mehrerer MB, Engines mit Loops) steigt CPU p99 auf
+4,2–4,8 ms, max bis 10,4 ms; mit anderen Suites nicht. Ausgeschlossen: Seitenfehler (`mlock`
+der PCM-Blöcke ohne Wirkung) und Thread-QoS. Ursache nicht belegt; Gerätemessung (Speichern
+während 16 Loops aufnehmen, Echtzeit-Thread) steht aus. AU-Ereignis-Render -O: CPU p95 2,8 µs,
+max 23,9 µs.
+
+**Positionskopf der Loop-Spur bei Play.** Die Anzeigeabfrage (`kickLoopDisplays`) lief nur
+weiter, solange ein Kern spielt, aufnimmt oder scharf ist; beim Start war `playFrame` noch −1
+(erster Tick ausstehend), die Abfrage startete nicht. Jetzt gilt zusätzlich: Transport läuft und
+der Kanal hat Material (`transportRunning`). Test: `playheadPollingRunsWhileTransportPlays`. **Offen:** Monterey/Intel-Abnahme
+(Start, Preset, Gesten, MIDI, AU-Laden, Gerätewechsel, Wiedergabe) — kein Gerät verfügbar.
+
+**Schnitt Tick ↔ Rack (V16-6).** `TickKernel` hält statt des Racks `TickOutputs`
+(Warteschlangen-Block, Loop-Kern-Block, `BarClock`, Besitzer nur als Lebensdauer-Anker);
+`HostTime` übernimmt die Zeitumrechnung, die Engine-Namen leiten weiter.
+
+---
+
+## Zerlegung und Presetformat (v1.16.0)
+
+Grundlage: Codex-Architekturreview, Punkte M4 (Ausgang als Fall) und M6 (Zerlegung). Stephan:
+„erst zerlegen. Alte presets sind dann halt obsolet". Das Tick-Verhalten ist unverändert; der
+Code ist verschoben, nicht neu geschrieben.
+
+**Ausgang und Quelle als Fall (M4).** `TrackData.output: TrackOutput` (`.midi`,
+`.instrument(UUID)`, `.audioLoop(UUID)`) ersetzt `instrumentID` + `isAudioLoop`;
+`InstrumentChannelData.source: ChannelSource` (`.instrument(PluginRef?)`,
+`.audioLoop(AudioLoopSettings)`) ersetzt `instrument` + `audioLoop`. Die alten Namen bleiben als
+berechnete Eigenschaften; ihre Setter wirken nur innerhalb desselben Falls (eine Loop-Spur wird
+nie zur Instrumentspur). Kodierung als Ein-Schlüssel-Objekt (`{"midi":{}}`,
+`{"instrument":"<uuid>"}`, `{"audioLoop":"<uuid>"}`; Quelle `{"instrument":{…}|{}}` bzw.
+`{"audioLoop":{…}}`). `output`/`source` sind Pflicht — **Presets vor 1.16.0 laden nicht**
+(Formatbruch, kein Migrator). Loop-Spuren kodieren keine Lane; beim Laden entsteht eine
+Standard-Lane. Routing: `InstrumentRack.route(for:)`/`routeEpoch(for:)` liefern −1, wenn Fall
+und Kanalquelle nicht zusammenpassen (Instrumentausgang auf Loop-Kanal und umgekehrt). Test:
+`AudioLoopTests/outputAndSourceAreExplicitCases`.
+
+**Eigene Besitzer (M6).** Jeder Besitzer hält seinen Zustand allein; die Engine verdrahtet und
+leitet für Main und Test-Hooks weiter.
+- `TickKernel`: Tick-Zutritt (`activeTick`-CAS, Dekker-Paar mit `isPlayingRT`), Transport-
+  Spiegel (`clockIsInternal`, `midiStartPending`), Tick-eigener Zustand (Runtime-Slots, PRNG,
+  Aktivierung, Puls, Sitzung/Plan-Linie, Verspätung), Rückkanal-Atomics (Wechselstempel,
+  Songende, Zähler) und `clockTick`/`tick`/`advanceSteps`. Abhängigkeiten (`SnapshotPublisher`,
+  `NoteOutput`, Rack, MIDI, Ringe) sind unveränderliche Referenzen aus `init`; `displaySignal`
+  setzt Main vor dem ersten Tick. Der Clock-Thread-Callback hält den Kern direkt (kein
+  weak-Load der Engine im Tick).
+- `SnapshotPublisher`: Hazard-Pointer-Protokoll (R1–R5/W1–W3), Publikation, Erwerb, Teardown.
+- `NoteOutput`: Notenbuch, Ausgabe nach Ausgang, fällige Offs, Port-Epochen.
+- `SongPlanner` (Werttyp, Main): Lauf, Plan, Endpuls, Horizont. `PlanLedger` (Main):
+  Sitzungen, Plan-Linien, Zuordnung des Wechselstempels.
+- `OutputWatchdog` (Rack): Wächter der Audioausgabe über Closures (Lesen, Erholen, Ergebnis).
+`TickKernel` und `NoteOutput` entstehen in `SequencerEngine.init` auf Main (erzwungene
+lazy-Initialisierung) — der Tick-Pfad löst nie eine Initialisierung aus.
+
+**macOS 12.** `MACOSX_DEPLOYMENT_TARGET` bleibt 12.0 (Stephan: „12.0 behalten"). Ausweich-
+stellen in `Views/Compat.swift`: `onValueChange(of:initial:_:)` (14+: `onChange(initial:)`,
+sonst `onChange(of:perform:)` + `onAppear`), `hiddenScrollBackground()`; Tippen mit Ort über
+`DragGesture(minimumDistance: 0)`; Fenstergröße über `idealWidth/idealHeight`; ⌥1–⌥9 über
+`OptionDigitShortcut`.
+
+---
+
+## Nachprüfung und offene Punkte des Reviews (v1.15.2)
+
+Grundlage: Codex-Nachprüfung von v1.15.1 (R1–R8) und die dort offenen T-/M-Befunde. Jeder
+Vertrag unten hat einen eigenen Test; Gerätenachweise sind ausdrücklich getrennt benannt.
+
+**Sitzung und Planlinie (R1, R6, R7).** Das Bundle trägt `session` (je Transportsitzung, im
+Stopp/Start neu) und `planID` (je Planlinie). Der Tick setzt bei neuer Sitzung Puls 0 und
+beginnt die Taktanker neu — unabhängig davon, ob Main einen vom Tick vorausgeschalteten
+Songwechsel schon nachgezogen hat. Der Wechselstempel packt Sitzung(8) | Plan(12) |
+Serial(12) | Puls(32); Main ordnet ihn über `planHistory` (letzte vier Linien, absolute
+Serials) dem tatsächlich verwendeten Plan zu. Wechselt die Linie, während der Tick noch die
+alte spielt, hält der Tick auf deren nächstem Schritt (`prevSteps`) und schaltet nicht weiter;
+tiefere Ketten zählt `rtPlanConflicts`. Horizont: mit Loop 16 Wechsel, ohne Loop bis zum Ende
+(begrenzt durch Runtime-Slots). Erschöpft: der Tick bleibt auf dem letzten Plan-Pattern und
+zählt `rtHorizonUnderruns` (Diagnoseereignis „songPlan"). Tests: `TransportPlanTests`.
+
+**Songende für alle Wege (R2).** Der Tick meldet das Ende mit seinem Host-Zeitpunkt; Main
+plant `stop()` auf genau diesen Zeitpunkt (`pendingSongStop`, sitzungsgebunden) — MIDI-Flush,
+Stop, AU-Stille und Offs kommen nicht mehr vor dem Ende.
+
+**Eingang über Belegungswechsel (R3).** Der Eingangsblock schreibt weder Ring noch Speicher,
+wenn die Belegung seit Blockbeginn gewechselt hat; der Speicher trägt `boundOccupancy`, die
+Aufnahme prüft sie nach dem Erwerb. Test mit Haltepunkt mitten im Callback.
+
+**CAF gegen Metadaten (R4).** Dekodieren verlangt CAF-Rate = JSON-Rate und Länge ±4096
+Frames; die Umrechnung nimmt die tatsächliche Dateirate.
+
+**Budget vor jeder Allokation (R5).** Statisches Hauptbuch `AudioLoopStorage.liveBytes` zählt
+jeden lebenden Speicher (auch Undo-Kopien und im Struktur-Undo gehaltenes Material);
+`fits(frames:)` vor Aufnahme, Duplizieren, Durchlauf-Undo, Laden (vor dem Dekodieren) und
+Umrechnen.
+
+**Ausgabezeit und Vorlauf (T2, T3, T8, R8).** Eine Verspätungsregel für alle Wege:
+`outTime = tickTime + lateShift`; Noten, CCs, F8, Anker, Loop-Fenster und Songende werden
+gemeinsam verschoben, nichts verworfen (F8 vorher teils gedroppt). Negative Spuroffsets
+wirken vorzeichenrichtig (`shifted(_:bySeconds:)`). INT: `ClockSource.extraLeadNs` =
+Ausgabepuffer + Reserve für negative Offsets + Routenlatenz — ändert nur den Weckzeitpunkt,
+nie das Raster. EXT: `extLookahead` = Puls + 10 ms + Ausgabepuffer + Routenlatenz (auf ms
+aufgerundet). Beide werden bei Tempo, Moduswahl, Start, Projektwechsel und jedem Umbau des
+Audiographen (Geräte-/Pufferwechsel) neu gesetzt.
+
+**EXT-Start ohne Main (0xFA).** Im Stopp ist die Startsitzung vorbereitet
+(`armExternalStart`: Song-Anfang, Sitzung, Notenbuch, Snapshot). 0xFA/0xFB schalten
+`isPlayingRT` direkt auf dem MIDI-Thread; der erste F8 spielt Puls 0, auch wenn Main noch
+beschäftigt ist. Main zieht nur noch Anzeige und Wächter nach. RT-3-Vertrag dazu: nach
+`stop()` im EXT-Modus liegt die Box der vorbereiteten nächsten Sitzung aus (nicht mehr
+„kein Pointer"); die gestoppte Sitzung wird unverändert erst nach bewiesener Quieszenz
+freigegeben, die Vorbereitung läuft erst nach dem Aufräumen (`stopCleanupPending`). Die
+RT-3/S01-Tests prüfen das über die Sitzungsnummer (`expectStoppedSessionReleased`).
+
+**Kodieren außerhalb von Main.** Ruhendes Material wird im Hintergrund vorkodiert
+(`AudioLoopAssets.preencode`, gebunden an Speicherinstanz und Materialversion); Speichern
+nimmt diesen Stand und kodiert nur, was sich seitdem geändert hat.
+
+**Routenlatenz (T7).** AVAudioEngine gleicht Plug-in-Latenzen nicht aus. Je Kanal wird die
+deklarierte Latenz (`AUAudioUnit.latency` von Instrument, Effekten, Gates; max. 100 ms)
+gelesen — bei Laden/Entfernen und viermal je Sekunde im Wächter (Lookahead-Plug-ins ändern
+sie zur Laufzeit). AU-Ereignisse gehen um diese Latenz früher in den Renderweg
+(`AUEventQueue.setLatencyAdvance`), Loop-Quellen lesen um sie voraus
+(`AudioLoopCore.setOutputAdvance`); die Clock plant um die größte Routenlatenz weiter voraus.
+Nicht ausgeglichen: Latenz externer MIDI-Geräte (dafür bleibt der Spuroffset). Ob jedes
+Plug-in seine Latenz korrekt meldet, ist nur per Messung (unten) zu belegen.
+
+**Gerätetakt ≠ Hostuhr (T5).** Frame-Zeiten folgen `mRateScalar` des Zeitstempels statt der
+Nominalrate. Aufnahme und Wiedergabe führen einen fortlaufenden Index (`LockedIndex`) mit
+Totband ±1 Frame: Drift wird als einzelner Schritt ausgeglichen; ein wiederholter Index wird
+bei der Aufnahme nicht doppelt addiert, ein übersprungener mit demselben Sample gefüllt;
+Zeitstempel-Jitter unter einem Frame bewegt nichts. Bewusst ohne Interpolation (keine
+Klangfärbung durch Bruchteilpositionen); Kosten: ein Ein-Sample-Schritt je akkumuliertem
+Frame Drift (50 ppm ≈ 2,4 Schritte/s). Mithören: Füllstand gemittelt, Sollwert nach dem
+Einschwingen, Korrektur um höchstens einen Frame je Block jenseits ±48 Frames. Zähler
+`driftSlips`/`monitorSlips` in der Audio-Diagnose. Tests: `AudioLoopDriftTests`.
+
+**Aufnahmelatenz messen (T4/M1).** Eingangs-Popover → MESSEN: der Kanal spielt einen Klick,
+der per Kabel verbundene Eingang fängt ihn auf; gemessen wird zwischen den beiden
+Gerätezeitstempeln. Damit enthält das Ergebnis genau die Anteile, die die Zeitstempel nicht
+abbilden — es wird nichts doppelt addiert. Der Feinwert wird so gesetzt, dass
+Automatik + Feinwert = Rundlauf − Vorauslesen der Kette. Die Automatik bleibt als
+Ausgangswert ohne Kabel. **Gerätenachweis steht aus** (kein Kabel-Loopback am Prüfplatz).
+
+**Loop-Zeile beobachtet nur ihren Kanal (M5).** `AudioLoopDisplay` je Kanal (Einstellungen,
+Kernstatus, Fehler, Wellenform, Messung); veröffentlicht nur bei Änderung. Eine Abfrage
+(10 Hz) läuft nur, solange ein Loop scharf ist, aufnimmt, mithört, spielt oder seine
+Wellenform nachzieht; Wiedergabeort, Pegel-LED und Blinken sind eigene Blätter, die nur dann
+einen Zeitplan haben. Fehler gehören dem Kanal (Eingangsfehler nur den Kanälen, die den
+Eingang brauchen). Mixer-/Plug-in-Änderungen invalidieren die Zeile nicht (Test).
+
+**Undo-Vertrag der Loops (M2).** Kanal-Einstellungen (Länge, Eingang, Mithören, Gate,
+Ausgleich) folgen dem Kanalvertrag wie Fader/Panorama: kein Dokument-Undo. Material
+(Löschen, letzten Durchlauf zurücknehmen) läuft über den Dokument-UndoManager und ist
+versionsgebunden (`exchangeLoop(expected:with:)`): Undo/Redo wirkt nur, solange der Kanal
+noch genau den Speicher trägt, den der Befehl hinterließ. Aufnahme ist Transport, kein
+Dokumentbefehl.
+
+**Besitz (M6, Teil).** `AudioLoopAssets` besitzt Loop-Material, nicht wiederhergestellte
+Originaldaten, Vorkodierung, Codec-Aufrufe und Wellenform; `AudioLoopDisplay` den
+Anzeigezustand. Das Rack bindet nur noch Speicher an Kerne und verwaltet Graph/Kanäle.
+
+**Gemeinsame Kopfbausteine (N2).** `TrackMuteSoloButtons` für Step-, CC- und Loop-Köpfe;
+Längenlabels der Pad-Steps über `Str.stepLength` (EN „2 bars", DE „2 T") statt im Modell.
+
+**Nachweis v1.15.2.** Volllauf (Debug): 601 bestanden, 2 übersprungen, 3 rot — nur die
+bekannten lastabhängigen `RT3bDeferredCleanupTests` (2) und
+`S01SnapshotAcquireTests/deinitRunsOnPublisherNotOnReader`; beide Suiten isoliert 11/11 grün.
+Dabei gefunden und behoben: das DEBUG-Assert in `teardownRTState` meldete das kurze
+`activeTick`-Fenster eines nach `isPlayingRT = false` abbrechenden Ticks fälschlich als
+Verletzung (Absturz des Testprozesses); es wartet dieses Fenster jetzt ab. Renderkosten
+optimiert (-O, arm64, 14.11.2026): 16 Loops (mit Driftindex, Mithörregelung,
+Ketten-Vorauslesen), 512 Frames @ 48 kHz — median 431 µs, p99 617 µs, max 672 µs bei
+10 667 µs Blockzeit; Artefakt `.agent_handoff/fof-loop-render-cost-v1.15.2.txt`.
+
+**Weiter offen.** M4 (TrackContent/ChannelSource statt Bool + Optional) ist eine
+Presetformat-Änderung und bekommt ein eigenes Paket mit Kompatibilitätsplan. M6-Rest:
+Zerlegung von `SequencerEngine` (Transport/Song-Plan, Snapshot-Publisher, Tick-Kern) und
+des AU-Graph-Lebenszyklus im Rack. Gerätenachweise: Kabel-Loopback (Aufnahmelatenz,
+Routenlatenz mit Lookahead-Plug-in, gemeinsamer Onset MIDI/AU/Loop), zwei getrennte Geräte
+über Stunden (Drift).
+
+## Konsolidierung nach dem Architekturreview (v1.15.1)
+
+Grundlage: Codex-Review vom 14.11.2026 (`.agent_handoff/latest_codex_architektur.md`). Befund-IDs
+in Klammern. Nachweise: `AudioLoopSafetyTests`, `SongTests/songAdvancesSeveralScenesWithoutMain`.
+
+**Speicherfreigabe Loop-PCM (K1).** Dasselbe Protokoll wie S01, mit zwei Lesern: `bind`
+publiziert den Rohzeiger seq_cst, `reclaim` lädt beide Hazards seq_cst; der Leser speichert
+seinen Hazard seq_cst und lädt den Zeiger seq_cst erneut. Der Leser greift ohne Retain zu
+(`Unmanaged` + `_withUnsafeGuaranteedRef`) — auf dem Audio-Thread kann damit weder ein
+Release noch ein `deinit` laufen.
+
+**PCM-Besitz (H2).** Samples liegen als atomare 32-Bit-Werte (`PCMChannel`, relaxed) —
+gleichzeitiges Lesen (Wiedergabe, Anzeige, Speichern) und Schreiben (Aufnahme) ist kein
+Datenrennen. Einziger Schreiber eines veröffentlichten Speichers ist der Eingangs-Render.
+Undo und Löschen schreiben nie in veröffentlichtes PCM: Undo baut auf Main eine Kopie mit
+vertauschtem Durchlauf und tauscht sie per `bind(keepUndo:)` ein, Löschen löst den Speicher.
+Sample-übergreifende Konsistenz einer Speicherung während einer laufenden Aufnahme ist nicht
+zugesagt (ein laufender Durchlauf kann teilweise enthalten sein).
+
+**Undo-Kopie (H11).** Abschnitte zu 1024 Frames, je mit der Nummer des Durchlaufs, in dem sie
+gesichert wurden. Erstes Schreiben in einen Abschnitt kopiert genau diesen. Kopierbudget je
+Block `n / 1024 + 3` Abschnitte; darüber wird ausgelassen (`skippedFrames`), nicht kopiert.
+Übersprungene Bereiche (Eingangsaussetzer) bleiben unmarkiert und werden beim Undo nicht
+getauscht.
+
+**Mithör-Ring (H1).** Atomare Lese-/Schreibindizes (Release/Acquire), Producer überschreibt
+nie ungelesene Plätze (voller Ring: Rest verwerfen, `dropped`), Tiefenbegrenzung nur durch den
+Consumer. Keine Driftregelung zwischen Ein- und Ausgangsgerät (offen, T5).
+
+**Belegung (H7).** `AudioLoopCore.beginOccupancy(epoch)` übernimmt die Belegungsepoche der
+Warteschlange desselben Slots (bei `install`/`uninstall`). `markActive` trägt die
+`routeEpoch` des Snapshots; fremde Epochen werden verworfen, ein während der Meldung
+gewechselte Belegung schließt das Fenster wieder (seq_cst-Gegenprobe). Eingangs- und
+Ausgangs-Render setzen ihren Zustand (Aufnahme, Gate, Ring) beim ersten Block einer neuen
+Epoche zurück.
+
+**Taktanker je Sitzung (H4).** `BarClock.beginSession()` läuft im Tick-Thread im selben Tick,
+der `rtPulse` auf 0 setzt — für Play, MIDI-Start aus dem Stopp und Neustart während der
+Wiedergabe gleich. Einziger Schreiber der Anker ist damit der Tick-Thread. Main setzt nur das
+Ende (`stop(at:)`; ein späteres Ende verschiebt ein früheres nicht). MIDI-Start aus dem Stopp
+beginnt einen aktiven Song wie Play (`beginSongIfActive`).
+
+**Loop-Fenster exakt (H5/T6).** Jeder Tick meldet die Kerne seiner hörbaren Loop-Spuren und
+schließt alle übrigen auf `tickTime` (`closeWindow`). Mute, Solo, Patternwechsel und Songende
+wirken damit auf den Puls genau; die Reserve von 1,25 Pulsen reicht nie über eine Grenze. Am
+Songende schließt der Tick alle Fenster und meldet den Endzeitpunkt (`rtSongEndHost`); Main
+beendet die Anker auf diesem Zeitpunkt (`stop(loopsEndAt:)`), nicht zur eigenen Reaktionszeit.
+
+**Song-Horizont (H3).** `scheduleSongNext` plant bis zu 8 Wechsel voraus (`songPlan`),
+begrenzt durch die Runtime-Slots (verschiedene Patterns im Plan × Spuren ≤ 256). Das Bundle
+trägt `queued` + `later: [PlanStep]`; der Tick-Thread geht den Plan ohne Main durch
+(Aktivierung `serial + k`). Ein im Plan wiederkehrendes Pattern teilt Slots/Epochen mit seinem
+früheren Lauf; der Tick setzt dessen Runtimes beim Song-Wechsel zurück (frischer Beginn).
+Der letzte Wechsel geht als ein Atomic (`rtSwitchStamp`: Aktivierung | Puls) an Main;
+`reconcilePatternSwitch` übernimmt k Wechsel auf einmal und hält die Slots aller noch
+geplanten Patterns.
+
+**EXT-Clock (T1).** Zeitbezug ist der CoreMIDI-Paketzeitstempel des 0xF8; jeder Puls — auch
+der erste — wird um `extLookaheadMach` = 10 ms + ein Ausgabepuffer des Standardgeräts später
+geplant (T3: Renderhorizont gehosteter Instrumente/Loops). Konstante Phase zum Master;
+gebündelte Zustellung ändert sie nicht. Offen: 0xFA geht weiter über Main; ein 0xF8 vor der
+Startverarbeitung fällt aus.
+
+**Eingang und Geräte (H6/H10).** `AudioInputEngine` beobachtet
+`AVAudioEngineConfigurationChange` und baut sich neu auf (Format, Latenz, Fehlerstatus via
+`onRestart`); `isRunning` ist der echte Engine-Zustand. Start trägt eine Auftragsnummer; ein
+verspäteter Abschluss der Mikrofonfreigabe startet nur, wenn Nummer und aktueller Bedarf noch
+passen. Ausgabe-Ratenwechsel: `rebuildGraph` rechnet ruhendes Material um
+(`AudioLoopCodec.resample`); Material mit abweichender Rate spielt nicht (statt falsch schnell).
+
+**Blockgrößen (M9).** Eingangs- und Ausgangs-Render verarbeiten beliebige Blocklängen in
+Abschnitten zu 8192 Frames.
+
+**Persistenz (H8/H9/M7/M8).** Metadaten (Takte 1…16, Rate 1…384 kHz, Tempo 1…1000, endliche
+Werte, geprüfte Multiplikation, Dauer ≤ 120 s, Dateilänge passend, Rohdaten ≤ Grenze) werden
+vor jeder Allokation geprüft. Projektbudget 1 GiB Loop-PCM inkl. Undo-Kopien
+(`maxProjectBytes`). Kodierfehler lassen das Speichern scheitern (kein „gespeichert"). Nicht
+wiederherstellbares Material bleibt unverändert erhalten und wird beim Speichern
+zurückgeschrieben; Laden meldet es (`loadWarning`). Überpegel: vor der 24-Bit-Quantisierung
+skaliert (`scale`, optional), NaN/∞ → 0. Offen: Kodieren läuft synchron auf Main.
+
+**Undo „Audio-Loop-Spur hinzufügen" (M3).** Entfernt Spuren und den eigens angelegten Kanal
+gemeinsam; Redo setzt denselben Kanal (Identität, Material) wieder ein
+(`take/putAudioLoopChannel`).
+
+**Messung.** `AudioLoopRenderCostTests`: 16 Kerne nehmen gleichzeitig auf (Gate, Mithören,
+Overdub) und spielen ab, 512 Frames @ 48 kHz, 2000 Blöcke. Optimiert (-O, 14.11.2026, arm64):
+median 443 µs, p99 669 µs, max 894 µs bei 10 667 µs Blockzeit. Unoptimiert (-Onone) rund
+11 ms median — Debug-Builds sind für Volllast mit vielen Loops nicht maßgeblich.
+
+**Offen nach v1.15.1** (erledigt bzw. eingegrenzt in v1.15.2, siehe oben). T2 gemeinsame Clamp-/Drop-Politik für Noten, F8 und Anker;
+T3 INT-Vorlauf aus dem Renderhorizont; T4/M1 Latenzmodell erst nach Kabel-Loopback-Messung;
+T5 Drift zwischen getrennten Geräten; T7 Latenz je Route; T8 negativer Spuroffset;
+M2/M4/M6 Dokument-Command-Grenze, TrackContent/ChannelSource, Fassaden zerlegen;
+M5 kanalbezogene Beobachtung der Loop-Zeilen; Kodieren außerhalb von Main.
+
+## Audio-Loop-Spur (v1.15.0)
+
+**Grundlage.** Prinzipien aus dem Schwesterprojekt lOOper (0.4.9): Overdub = Addition,
+eine Undo-Stufe über eine Kopie, die dem Schreibkopf vorausläuft, Ränder ein-/ausblenden,
+SPSC-Ring fürs Mithören (`AudioSampleRing` übernommen), keine Geräte-Bindung an der Engine.
+Nicht übernommen: der frei laufende C++-Kern — FoF braucht Takte im Sequencer-Raster.
+
+**Zeitbasis: Taktanker.** `BarClock` (Rack): der Tick-Thread veröffentlicht bei jedem
+Takt-Puls (`pulse % 96 == 0`, Pulse seit Sitzungsbeginn) „Takt n beginnt bei Host-Zeit t"
+(vorausgeplanter Tick-Zeitpunkt). Vier Plätze mit Seqlock, Rohspeicher (`UnsafeAtomic`), kein
+ARC. Leser bilden je Block ein `Window` und wählen je Frame den jüngsten Anker ≤ Host-Zeit.
+Ort im Loop: `(n mod bars) · barFrames + (h − t) / ticksPerFrame`; liegt er hinter dem
+Taktende (Sequencer langsamer als bei der Aufnahme), Stille — keine Zeitdehnung. `reset` in
+`play()` vor dem Clock-Start, `stop()` → `rack.transportStopped()` (Anker aus, Aufnahmen enden).
+
+**Kern.** `AudioLoopCore`, einer je Rack-Slot, fest angelegt wie `queues` (`rack.loopCores`).
+Speicher (`AudioLoopStorage`: L/R + Undo-L/R, `bars · barFrames`) gehört Main (Rack,
+je Kanal); Audio-Threads greifen über einen veröffentlichten Rohzeiger mit je einem
+Hazard-Pointer für Eingang und Ausgang zu; abgelöste Speicher gibt `reclaim()` erst frei,
+wenn kein Hazard sie hält. Zustand idle → armed → recording ⇄ finishing gehört allein dem
+Eingangs-Render; Main äußert nur den Wunsch (`setRecording`). Beginn: nächster Taktwechsel
+nach dem Scharfschalten. Jeder Loop-Anfang beginnt einen neuen Durchlauf (neue Undo-Kopie,
+copy-ahead in 8192er-Stücken). Ende (`finishing`): am nächsten Loop-Anfang, Ausblenden in den
+letzten 128 Frames. Undo/Löschen nur im Ruhezustand (kein Schreiber); die Wiedergabe liest je
+Sample alt oder neu. Aufnahmeort = Eingangszeit − Latenz (Ein- + Ausgangsgerät:
+`kAudioDevicePropertyLatency` + `SafetyOffset`, plus Feinwert in ms).
+
+**Aktivfenster.** Audio-Loop-Spuren (`TrackData.isAudioLoop`, `TrackSnapshot.isAudioLoop`)
+haben keine Steps; der Tick-Thread meldet je Puls `markActive(tickTime, 1,25 Pulse)` an den Kern
+ihres Kanals (nicht bei Mute/Solo-Ausschluss). Die Wiedergabe klingt nur für Frames in
+[since, until) — Patternwechsel und Mute wirken damit auf dem Tick-Raster, ohne Main.
+
+**Eingang.** `AudioInputEngine`: eigene AVAudioEngine (Eingang → `AVAudioSinkNode`), getrennt
+von der Ausgabe-Engine, weil AVAudioEngine auf macOS Ein- und Ausgang in einer Geräteeinheit
+koppelt (lOOper 0.4.7). Läuft nur, solange ein Kanal scharf ist, aufnimmt oder mithört
+(`updateInputNeeded`, Nachlauf-Timer). Mikrofonfreigabe per `AVCaptureDevice`; Sandbox-
+Entitlement `device.audio-input`, `NSMicrophoneUsageDescription`. Gleiche Abtastrate von Ein-
+und Ausgang ist Voraussetzung (sonst `rateMismatch`, keine Aufnahme).
+
+**Kanal.** `InstrumentChannelData.audioLoop` (Einstellungen) macht einen Kanal zum
+Audio-Loop-Kanal: Quelle `AVAudioSourceNode` (Mithören aus dem Ring + Loop), danach die
+normale Kette Effekte → Gain → Mixer. Material gehört der Zeile (Kanal), nicht der Spur-Instanz
+— Spuren existieren je Pattern als eigene Instanzen. Spur löschen lässt den Kanal stehen.
+
+**Gate.** `GateDSP` (Spitzenhüllkurve, Öffnen ab Schwelle, Schließen −3 dB darunter nach der
+Haltezeit, Verstärkung gleitet 1 ms auf / Ausklingen zu). Eingang: im Kern vor Mithören und
+Aufnahme. Pre-/Post-Fader: `GateAudioUnit`, eine im Prozess registrierte AUAudioUnit-Unterklasse
+(synchron als `AVAudioUnitEffect` angelegt — eigener Code, keine Sandbox-Abfrage), vor dem Gain
+bzw. zwischen Gain und Kanal-Mixer. Einstellungen über `GateControl` (Atomics).
+
+**Preset.** `TrackData` Schlüssel `audioLoop` (Bool), Kanal `audioLoop` (Einstellungen),
+Datei `audioLoops: [AudioLoopFile]` (Apple Lossless 24 Bit, CAF, Base64; beim Laden auf die
+Abtastrate der Anlage umgerechnet). Alle optional.
 
 ## Song-Lane und 16 Patterns (v1.14.0)
 
@@ -65,9 +1011,20 @@ vorberechnet; der Tick-Pfad liest nur `isHold` (→ überspringen) und `holdSpan
 `holdSpan + min(gate, 1)` Steps, Ratchet aus). Bei Rückwärts-, Pingpong- und Zufallsrichtung
 gilt dieselbe Vorwärts-Spanne — bewusst einfach.
 
-**Fester Ton.** `LaneData.fixedNote` (Schlüssel `fixedNote`, optional) ersetzt beim Bau des
-Snapshots die Noten jedes Steps durch diese eine Note; die Step-Noten bleiben im Modell.
-Gesetzt über `ModelCommand.setFixedNote` mit Undo.
+**Fester Ton / fester Akkord.** `LaneData.fixedNotes: [Int]?` (seit v1.17.0; vorher `fixedNote: Int?`)
+ersetzt beim Bau des Snapshots die Noten jedes Steps durch diese Noten; die Step-Noten bleiben
+im Modell. Gesetzt über `ModelCommand.setFixedNotes` mit Undo; normalisiert (geklemmt,
+sortiert, ohne Doppelte, leer = aus) über `LaneData.normalizedNotes`. Format: ein Ton als
+`fixedNote` (Int, unverändert lesbar für ältere Versionen), mehrere als `fixedNotes` ([Int]);
+Laden liest `fixedNotes`, sonst `fixedNote`.
+
+**RND-Töne (v1.17.0).** `RandomNoteMode` (`single`/`chords`/`mixed`) je Spurart in UserDefaults
+(`rndNotesStep`, Standard Einzeltöne; `rndNotesPad`, Standard Akkorde); Drum-Spuren würfeln immer
+Einzeltöne. Akkorde für beide Spurarten aus `SequencerEngine.rolledChords` (dieselbe Quelle und
+Stimmführung wie Pad-Akkorde); gemischt = je Step Akkord oder einer seiner Töne; Einzeltöne auf
+Pad-Spuren = ein Ton des Akkords der Folge. Einzeltöne auf normalen Spuren setzen jetzt den
+ganzen Step (`notes = [n]`), vorher blieben die übrigen Akkordtöne liegen. Wahl im ▾-Menü neben
+RND (`PadChordMenu`, alle Step-Spuren außer Drum).
 
 **Pad-Akkorde.** `PadChords` (Main, nur im Randomize-Befehl): 17 Folgen aus Lizzio, „Chord
 Progression Codex“, und Callipari, „Illustrierte Harmonie“ (Auswahl und Seitenangaben wie
@@ -78,7 +1035,8 @@ Vorgänger. Quelle/Folge stehen in UserDefaults (`padChordSource`, `padChordFami
 
 **Presetformat.** Drei neue optionale Schlüssel, nur geschrieben wenn gesetzt. Ältere
 Versionen ignorieren sie: Pad-Lanes laden dort als normale Spur mit langen Steps (zeitgetreu
-breit), Halte-Steps spielen ihre eigenen Noten, der feste Ton entfällt.
+breit), Halte-Steps spielen ihre eigenen Noten, der feste Ton entfällt. Seit v1.17.0 kommt
+`fixedNotes` (fester Akkord) hinzu; Versionen vor 1.17.0 ignorieren ihn und spielen die Step-Noten.
 
 ## AU-Hosting — Ereignisgrenze und Rack (v1.13.0)
 
@@ -274,6 +1232,39 @@ Dateien: `Views/MixerView.swift` (Dock, Züge, Summe), `Views/MixerControls.swif
   `onRoutingChange`. Tick-Pfad: `AUEventQueue.pushParameterFromTick` (Ereignis mit `isParameter`, Wert als
   Float-Bitmuster); der Render-Observer gibt es über `scheduleParameterBlock` aus. Kein Heap, kein Lock. Die
   Parameterliste liest `rack.parameters(for:)` einmal je geladenem Instrument aus dem Parameterbaum (Main, Cache).
+- **CC-Lane → Effekt-Parameter (v1.17.1):** `ParameterRef.effect` = laufende Nummer unter den Effekten mit derselben
+  `component` in der Kette (nil = Instrument; Effekte haben keine dauerhafte Kennung). Jeder GELADENE Effekt belegt
+  einen Platz im festen Block `rack.effectQueues` (`maxChannels × maxEffectsPerChannel` = 64 `AUEventQueue`, in
+  `init` angelegt, nie freigegeben); `assignEffectQueue` beim Laden (Belegung neu, aktiv, Render-Observer am Effekt),
+  `releaseEffectQueue` vor dem Abhängen bei Entfernen/Kanal weg (Observer ab, Belegung neu, Platz zurück). Der
+  Observer ist derselbe wie beim Instrument, nur Parameter: Vor-Render, `scheduleParameterBlock` mit Sample-Offset
+  — der Effekt rendert danach denselben Block. `ParameterTarget.queue/epoch` im Snapshot; der Tick schreibt über
+  `TickOutputs.effectQueues[queue]` mit dieser Belegung (kein Rack-Zugriff). Latenzausgleich je Effekt = Latenz
+  des Effekts und aller späteren der Kette. Laden/Entfernen/Verschieben ruft `onRoutingChange`; `silenceAll`
+  leert auch Effekt-Warteschlangen; `ChannelDirectory.Entry.readyEffects` hält das „?" im Kopf aktuell. Auswahl:
+  `CCTargetPicker` (Fenster: MIDI-CC, Plug-in, Suche, alphabetisch mit natürlicher Zahlenfolge, Gruppe daneben)
+  statt des langen Menüs. Nachweis: `effectParameterTargetReachesTheEffectQueue`, `parameterEventReachesTheRealEffect`
+  (Apple AUDelay ausgelagert).
+- **Host-Takt für Plug-ins (v1.17.2):** AUs synchronisieren über den Host, nicht über MIDI-Clock. Jedes Instrument
+  und jeder Effekt bekommt vor dem Einhängen `musicalContextBlock` und `transportStateBlock` (`rack.setHostBlocks`).
+  Quelle `HostSync` (Seqlock, ein Platz): der Tick schreibt je Puls `publish(pulse:host:bpm:)` auf `outTime` (derselbe
+  Zeitpunkt wie Noten/Taktanker), `beginSession` beim Sitzungsbeginn; Main nur `stop(at:)` (über
+  `transportStopped`, beim Songende auf dem Endpuls) und `setIdleTempo` (bei jedem Publizieren). Die Blöcke laufen
+  auf dem Audio-Thread des Plug-ins, lesen nur Atomics: Host-Zeit des laufenden Blocks aus `renderStamps[i]` (vom
+  Vor-Render-Observer gesetzt; Instrument i = Kanal-Slot, Effekt i = 16 + Effekt-Platz) plus Latenzausgleich der
+  Warteschlange → Beat = Puls/24 + Zeit × Tempo. Taktart 4/4; vor dem ersten Puls und nach dem Ende „steht" der
+  Transport, die Position bleibt am Ende. EXT: Tempo = `bundle.bpm` (gemessenes Tempo), Position aus den Pulsen.
+  Nicht enthalten: MIDI-Clock (0xF8) an Plug-ins; Loop-/Zyklusbereich (0).
+  **Absicherung `ensureHostBlocks`:** In drei von sechs Volltests meldete ein unter Last (27–53 s Ladezeit)
+  ausgelagert geladenes DLS-Instrument den vor dem Einhängen gesetzten `musicalContextBlock` danach dauerhaft als nil
+  (kein Ungültigwerden, kein Neuladen; der Effekt im selben Kanal behielt ihn). Ursache nicht belegt — vermutlich
+  schließt der XPC-Stellvertreter seine Einrichtung nach unserem Setzen ab. Deshalb prüft das Rack nach jedem Laden
+  und je Wächter-Durchlauf (4 Hz) alle Plug-ins und setzt fehlende Blöcke neu (Diagnose-Ereignis
+  `hostBlocksReapplied`). Danach zwei Volltests grün. Offen: ob ein nach dem Anlegen der Renderressourcen neu
+  gesetzter Block im Plug-in-Prozess ankommt — Nachweis per Hörprobe mit einem tempo-synchronen Plug-in.
+- **Gate-Anzeige (v1.17.1):** `Step.gate` bleibt in Steps. Die Stufen des Gate-Reglers sind echte Notenlängen
+  (1/64 … 8 Takte, `Step.gateSteps(stepSixteenths:)`), umgerechnet über `LaneData.stepSixteenths`; Obergrenze ein
+  Takt oder ein Step. Vorher galt 1 Step = 1/16 — falsch bei Pad-Steps und anderen Steplängen.
 - **Klickflächen (v1.13.9):** Materialflächen sind nicht treffbar. Tastenstile setzen deshalb
   `.contentShape(Rectangle())`; statt `.buttonStyle(.plain)` gilt in Views `.buttonStyle(.fullArea)`.
 - **Sandbox und Plug-ins (v1.13.17):** FoF bleibt in der App-Sandbox (Container-Pfade für
@@ -514,6 +1505,10 @@ Quelle der Bausteine: `Theme/VintageMaterials.swift` (Namensraum `Mat`, `Materia
 - **Helles Metall:** Text darauf immer `Mat.inkOnLight*` (dunkel); `KnobView(onLight:)` schaltet Beschriftung und Bogenspur.
 - **WIDTH-Fader:** Wert ist Quelle der Wahrheit (`StepWidthState.size`, 30…120, Schritt 1); Position = Anteil × Verfahrweg
   (Resize ändert den Wert nie). Drag ist relativ zum Startwert (kein Sprung beim Greifen), Klemmung am Verfahrweg.
+  Startwert seit v1.16.2: `StepWidthState.startSize` (Bereichsmitte, 75 px) bei jedem Start; keine Persistenz.
+- **Menütasten im Spurkopf (v1.16.2):** Kein SwiftUI-`Menu` (borderless) als Taste — es nimmt Klicks nur auf
+  seiner Titelfläche an. Muster: `MenuKey` (ButtonStyles.swift) = Button `.fullArea` + beim Klick gebautes `NSMenu`;
+  so auch `CCTargetButton`, `TrackOutputMenu`, Akkordquelle, Mixer-Platzwahl, „+ Spur“, Loop-Taktzahl.
 - **Bestehende Layoutgrenze (unverändert):** Bei 920 pt Mindestbreite wird Transporttext umgebrochen/gekürzt (Logo, „PATTERN“).
   GUI-01 hält BPM, TAP, SWING, INT/EXT, LEARN, WIDTH vollständig sichtbar (zuvor wurden „INT“/„SWING“ umgebrochen).
 

@@ -65,7 +65,7 @@ struct QuickCaptureView: View {
                 TextEditor(text: $text)
                     .font(VintageTheme.monoMedium)
                     .foregroundColor(VintageTheme.textPrimary)
-                    .scrollContentBackground(.hidden)
+                    .hiddenScrollBackground()
                     .background(.clear)
                     .focused($textFocused)
                     .padding(4)

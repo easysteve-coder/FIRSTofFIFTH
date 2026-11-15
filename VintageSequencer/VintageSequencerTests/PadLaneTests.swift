@@ -3,7 +3,7 @@ import Foundation
 @testable import VintageSequencer
 
 /// Pad-Lane, Halte-Steps und Pad-Akkorde (v1.13.16).
-struct PadLaneTests {
+@Suite(.serialized) struct PadLaneTests {
 
     private func drain(_ q: AUEventQueue) -> [(b0: UInt8, b1: UInt8)] {
         var out: [(UInt8, UInt8)] = []
@@ -82,183 +82,139 @@ struct PadLaneTests {
         #expect(try JSONDecoder().decode(Step.self, from: JSONEncoder().encode(s)).isHold)
     }
 
-    // MARK: Pad-Lane
+    // MARK: Lange Steps (v1.18.29, vorher Pad-Lane)
 
-    @Test func padFlagRoundTripsCopiesAndClamps() throws {
+    /// Frühere Pad-Spuren laden als normale Spur: Länge, Breite und Akkord-RND bleiben; der
+    /// Schlüssel `pad` wird nicht mehr geschrieben.
+    @Test func legacyPadLoadsAsLongStepLane() throws {
         let lane = LaneData(stepCount: 4)
-        let plain = try JSONEncoder().encode(lane)
-        #expect(!String(decoding: plain, as: UTF8.self).contains("\"pad\""))
-        #expect(try JSONDecoder().decode(LaneData.self, from: plain).isPad == false)
+        lane.stepLengthNumerator = 32
+        var json = String(decoding: try JSONEncoder().encode(lane), as: UTF8.self)
+        json = json.replacingOccurrences(of: "{", with: "{\"pad\":true,\"padWidth\":3,", options: [], range: json.range(of: "{"))
+        let old = try JSONDecoder().decode(LaneData.self, from: Data(json.utf8))
+        #expect(old.isLongStep && old.stepLengthNumerator == 32)
+        #expect(old.stepWidth == 3 && old.rndMode == .chords)
+        let again = String(decoding: try JSONEncoder().encode(old), as: UTF8.self)
+        #expect(!again.contains("\"pad\"") && !again.contains("padWidth"))
+        #expect(again.contains("\"width\":3") && again.contains("\"rnd\":\"chords\""))
+        // Pad ohne padWidth: Breite 1 wie bisher.
+        var bare = String(decoding: try JSONEncoder().encode(lane), as: UTF8.self)
+        bare = bare.replacingOccurrences(of: "{", with: "{\"pad\":true,", options: [], range: bare.range(of: "{"))
+        #expect(try JSONDecoder().decode(LaneData.self, from: Data(bare.utf8)).stepWidth == 1)
+    }
 
-        lane.isPad = true; lane.stepLengthNumerator = 32
-        let decoded = try JSONDecoder().decode(LaneData.self, from: JSONEncoder().encode(lane))
-        #expect(decoded.isPad && decoded.stepLengthNumerator == 32)
-
+    @Test func plainLaneWritesNoNewKeysAndCopies() throws {
+        let lane = LaneData(stepCount: 4)
+        let plain = String(decoding: try JSONEncoder().encode(lane), as: UTF8.self)
+        #expect(!plain.contains("\"width\"") && !plain.contains("\"rnd\"") && !plain.contains("\"pad\""))
+        lane.stepWidth = 2; lane.rndMode = .mixed; lane.stepLengthNumerator = 16
         let td = TrackData(name: "P", lane: lane)
-        #expect(td.freshCopy().lane.isPad)
-
-        lane.stepLengthNumerator = 3; lane.stepLengthDenominator = 2   // keine Pad-Länge
-        lane.clampToValidRanges()
-        #expect(lane.stepLengthNumerator == 16 && lane.stepLengthDenominator == 1)
+        let copy = td.freshCopy().lane
+        #expect(copy.stepWidth == 2 && copy.rndMode == .mixed && copy.stepLengthNumerator == 16)
+        lane.stepLengthNumerator = 99_999; lane.clampToValidRanges()
+        #expect(lane.stepLengthNumerator == TrackData.maxLongSixteenths)
     }
 
-    @Test func padRatiosAndLabels() {
-        #expect(TrackData.padRatios.map { TrackData.ratioLabel(num: $0.num, den: $0.den) }
-                == ["1/4", "1/2", "3/4", "1 T", "2 T", "3 T", "4 T", "8 T"])
-        #expect(TrackData.ratioLabel(num: 3, den: 2) == "3/2")
-        let lane = LaneData(stepCount: 4); lane.isPad = true; lane.stepLengthNumerator = 64
-        #expect(lane.displayNumerator == lane.padWidth && lane.displayDenominator == 1)
-        #expect(lane.ratioOptions.count == TrackData.padRatios.count)
+    /// v1.18.31: Längen als Bruch der ganzen Note, Zeilen gerade/punktiert/Tolen, Takte.
+    @Test func stepRatiosAndLabels() {
+        let de = Str("de"), en = Str("en")
+        let m = TimeSignature.common
+        #expect(TrackData.ratio(whole: 1, 12) == (4, 3))            // Achteltriole = bisher 4:3
+        #expect(TrackData.ratio(whole: 3, 8) == (6, 1))
+        #expect(TrackData.wholeFraction(num: 1, den: 1) == (1, 16))
+        #expect(TrackData.wholeFraction(num: 5, den: 4) == (5, 64))   // frühere Zwischenwerte bleiben lesbar
+        #expect(en.noteValue(num: 1, den: 1, meter: m) == "1/16")
+        #expect(en.noteValue(num: 4, den: 3, meter: m) == "1/12")
+        #expect(de.noteValue(num: 32, den: 1, meter: m) == "2 T")
+        let seven = TimeSignature(numerator: 7, denominator: 8)
+        #expect(en.noteValue(num: 16, den: 1, meter: seven) == "1/1", "eine Ganze ist in 7/8 kein Takt")
+        #expect(en.noteValue(num: 14, den: 1, meter: seven) == "1 bar")
+        #expect(TrackData.barRatios(seven).map(\.num) == [14, 28, 42, 56, 112])
+        #expect(en.noteValueHelp(p: 1, q: 12).contains("3 steps fill a quarter"))
+        #expect(de.noteValueHelp(p: 1, q: 20).contains("5 Steps füllen eine Viertel"))
+        // Eigener Bruch
+        #expect(TrackData.parseFraction("5/16")! == (5, 1))
+        #expect(TrackData.parseFraction(" 1 / 9 ")! == (16, 9))
+        #expect(TrackData.parseFraction("2")! == (32, 1))
+        #expect(TrackData.parseFraction("1/200") == nil && TrackData.parseFraction("x") == nil)
+        #expect(TrackData.parseFraction("200") == nil)
+        // Liste des Anfassers: aufsteigend, ohne Doppelte (1/1 = 1 Takt in 4/4).
+        let all = LaneData(stepCount: 4).ratioOptions(m)
+        let values = all.map { Double($0.num) / Double($0.den) }
+        #expect(values == values.sorted() && Set(values).count == values.count)
+        #expect(all.first! == (1, 2) && all.last! == (128, 1))
+        // Breite: kurze Steps zeitgetreu, lange in eigener Breite (Auto nach Länge).
+        let lane = LaneData(stepCount: 4)
+        lane.stepLengthNumerator = 3; lane.stepLengthDenominator = 2
+        #expect(!lane.isLongStep && lane.displayNumerator == 3 && lane.displayDenominator == 2)
+        lane.stepLengthNumerator = 2; lane.stepLengthDenominator = 1
+        #expect(!lane.isLongStep, "Achtel bleibt zeitgetreu")
+        lane.stepLengthNumerator = 16; lane.stepLengthDenominator = 3        // 1/3, kein ganzes Vielfaches
+        #expect(lane.isLongStep && lane.displayNumerator == 1)
+        lane.stepLengthNumerator = 16; lane.stepLengthDenominator = 1
+        #expect(lane.displayNumerator == 2)
+        lane.stepLengthNumerator = 64
+        #expect(lane.displayNumerator == 3)
+        lane.stepWidth = 5
+        #expect(lane.displayNumerator == 5)
     }
 
-    @MainActor @Test func addPadTrackCreatesLongLegatoSteps() throws {
-        let engine = SequencerEngine()
-        let placed = engine.addTrack(kind: .step, pad: true)
-        let td = try #require(placed.first?.track)
-        #expect(td.lane.isPad && td.lane.stepCount == 4)
-        #expect(td.lane.stepLengthNumerator == 16 && td.lane.stepLengthDenominator == 1)
-        #expect(td.lane.steps.allSatisfy { $0.gate == 1.0 })
-        engine.publishSnapshot()
-        let snap = try #require(engine._rt1PublishedBundle()?.snapshot)
-        let lane = try #require(snap.tracks.last?.lane)
-        #expect(lane.pulsesPerStep == 96, "1 Takt = 4 Viertel × 24 Pulse")
-    }
-
-    // MARK: Pad-Akkorde
-
-    @Test func everyFamilyFillsTheRequestedStepCountWithPlayableVoicings() {
-        var rng = SystemRandomNumberGenerator()
-        for family in PadChords.families {
-            for count in [1, 4, 7, 12] {
-                let chords = PadChords.progression(family, count: count, using: &rng)
-                #expect(chords.count == count, "\(family.id) \(count)")
-                let voiced = PadChords.voice(chords, tonic: 2)
-                for (c, notes) in zip(chords, voiced) {
-                    #expect(notes.count == c.quality.intervals.count + 1, "\(family.id): Bass + Akkord")
-                    #expect(notes.allSatisfy { (36...79).contains($0) })
-                    #expect(notes.min()! % 12 == (c.root + 2) % 12, "\(family.id): Bass ist Grundton")
-                    let pcs = Set(notes.map { $0 % 12 })
-                    #expect(pcs == Set(c.quality.intervals.map { (c.root + 2 + $0) % 12 }))
-                }
-            }
-            #expect(family.source.contains("Lizzio") || family.source.contains("Callipari"))
+    /// Der Anfasser zieht kurze Längen zeitgetreu, lange stufenweise (eine Step-Breite je Stufe).
+    @Test func ratioDragIsTrueToTimeThenStepwise() {
+        let ratios = TrackData.stepRatios(.common)
+        let unit: CGFloat = 160, px: CGFloat = 40                    // 4 Steps à 40 px
+        let one = ratios.firstIndex { $0 == (1, 1) }!
+        let eighth = ratios.firstIndex { $0 == (2, 1) }!
+        let bar = ratios.firstIndex { $0 == (16, 1) }!
+        func session(_ base: Int) -> RatioDragSession {
+            RatioDragSession(trackID: UUID(), snapshotNumerator: ratios[base].num, snapshotDenominator: ratios[base].den,
+                             baseRatioIndex: base, contentUnit: unit, scrollOffsetAtStart: 0,
+                             ratios: ratios, pxPerLongStep: px)
         }
+        let s1 = session(one)
+        #expect(s1.proposedRatio(translationX: 0, currentScrollOffset: 0) == (1, 1))
+        #expect(s1.proposedRatio(translationX: unit, currentScrollOffset: 0) == (2, 1))       // zeitgetreu
+        #expect(s1.proposedRatioIndex(translationX: unit + px, currentScrollOffset: 0) == eighth + 1)  // erste lange Stufe
+        #expect(s1.proposedRatio(translationX: 9_000, currentScrollOffset: 0) == (128, 1))
+        let s2 = session(bar)
+        #expect(s2.proposedRatioIndex(translationX: px + 1, currentScrollOffset: 0) == bar + 1)
+        #expect(s2.proposedRatioIndex(translationX: -2 * px, currentScrollOffset: 0) == bar - 2)
+        #expect(s2.proposedRatio(translationX: -9_000, currentScrollOffset: 0) == (1, 2))
     }
 
-    @Test func andalusianInAIsAmGFE() throws {
-        var rng = SystemRandomNumberGenerator()
-        let f = try #require(PadChords.family(id: "andalusian"))
-        let voiced = PadChords.voice(PadChords.progression(f, count: 4, using: &rng), tonic: 9)
-        #expect(voiced.map { $0.min()! } == [45, 43, 41, 40])      // A2, G2, F2, E2
-        #expect(Set(voiced[0].map { $0 % 12 }) == [9, 0, 4])           // A-Moll
-        #expect(Set(voiced[3].map { $0 % 12 }) == [4, 8, 11])          // E-Dur
-    }
+    // MARK: Breite und RND je Spur
 
-    @Test func freeProgressionStaysInTheScale() {
-        var rng = SystemRandomNumberGenerator()
-        let dorian = TrackData.scales.firstIndex { $0.shortName == "DOR" }!
-        let scale = Set(TrackData.scales[dorian].intervals)
-        for _ in 0..<20 {
-            let chords = PadChords.freeProgression(scaleIndex: dorian, count: 8, using: &rng)
-            #expect(chords.count == 8 && chords[0].root == 0)
-            for c in chords {
-                #expect(c.quality.intervals.allSatisfy { scale.contains((c.root + $0) % 12) },
-                        "\(c.root) \(c.quality) leitereigen")
-            }
-        }
-    }
-
-    @MainActor @Test func padRandomizeIsOneUndoStep() throws {
-        let engine = SequencerEngine()
-        let um = UndoManager(); engine.undoManager = um
-        let td = try #require(engine.addTrack(kind: .step, pad: true).first?.track)
-        UserDefaults.standard.set(PadChordSource.books.rawValue, forKey: SequencerEngine.padChordSourceKey)
-        UserDefaults.standard.set("epic", forKey: SequencerEngine.padChordFamilyKey)
-        defer {
-            UserDefaults.standard.removeObject(forKey: SequencerEngine.padChordSourceKey)
-            UserDefaults.standard.removeObject(forKey: SequencerEngine.padChordFamilyKey)
-        }
-        let before = td.lane.steps.map(\.notes)
-        engine.randomize(track: td)
-        let rolled = td.lane.steps.prefix(4)
-        #expect(rolled.allSatisfy { $0.isActive && $0.notes.count >= 4 && $0.gate == 1.0 })
-        #expect(rolled.first!.notes.min()! % 12 == td.scaleRoot)
-        um.undo()
-        #expect(td.lane.steps.map(\.notes) == before)
-    }
-
-    // MARK: Fester Ton
-
-    /// Fester Ton: der Snapshot spielt ihn auf jedem Step; die Steps behalten ihre Noten;
-    /// Setzen ist rückgängig zu machen und übersteht Speichern/Laden.
-    @MainActor @Test func fixedNoteReplacesStepNotesInSnapshotAndIsUndoable() throws {
-        let engine = SequencerEngine()
-        let um = UndoManager(); engine.undoManager = um
-        let td = engine.patterns[0].tracks[0]
-        td.lane.steps[0].isActive = true; td.lane.steps[0].notes = [60, 64, 67]
-        td.lane.steps[1].isActive = true; td.lane.steps[1].notes = [72]
-        ModelWriter().apply(.setFixedNote(trackID: td.id, old: nil, new: 36), to: td, undoManager: um)
-        engine.publishSnapshot()
-        let snap = try #require(engine._rt1PublishedBundle()?.snapshot)
-        guard case let .step(steps) = snap.tracks[0].lane.payload else { Issue.record("keine Step-Lane"); return }
-        #expect(steps[0].notes == [36] && steps[1].notes == [36])
-        #expect(td.lane.steps[0].notes == [60, 64, 67], "Step-Noten bleiben erhalten")
-
-        let decoded = try JSONDecoder().decode(LaneData.self, from: JSONEncoder().encode(td.lane))
-        #expect(decoded.fixedNote == 36)
-
-        um.undo()
-        #expect(td.lane.fixedNote == nil)
-        let plain = try JSONEncoder().encode(td.lane)
-        #expect(!String(decoding: plain, as: UTF8.self).contains("fixedNote"))
-    }
-
-    // MARK: Länge ziehen
-
-    /// Pad-Lanes: der Anfasser zieht stufenweise (eine Step-Breite je Längenstufe).
-    @Test func padRatioDragMovesOneLengthPerStepWidth() {
-        let session = RatioDragSession(trackID: UUID(), snapshotNumerator: 16, snapshotDenominator: 1,
-                                       baseRatioIndex: 3, contentUnit: 160, scrollOffsetAtStart: 0,
-                                       ratios: TrackData.padRatios, pxPerRatioStep: 40)
-        #expect(session.proposedRatio(translationX: 0, currentScrollOffset: 0) == (16, 1))
-        #expect(session.proposedRatio(translationX: 41, currentScrollOffset: 0) == (32, 1))
-        #expect(session.proposedRatio(translationX: -80, currentScrollOffset: 0) == (8, 1))
-        #expect(session.proposedRatio(translationX: 4000, currentScrollOffset: 0) == (128, 1))
-        #expect(session.proposedRatio(translationX: -4000, currentScrollOffset: 0) == (4, 1))
-    }
-
-    // MARK: Pad-Breite
-
-    /// Pad-Breite: bestimmt nur die Rasterbreite, nicht die Steplänge; optionaler Key,
-    /// geklemmt auf 1…8, rückgängig zu machen, wird kopiert.
-    @MainActor @Test func padWidthDrivesDisplayRoundTripsClampsAndIsUndoable() throws {
-        let lane = LaneData(stepCount: 4); lane.isPad = true; lane.stepLengthNumerator = 64
-        #expect(!String(decoding: try JSONEncoder().encode(lane), as: UTF8.self).contains("padWidth"))
-
+    @MainActor @Test func stepWidthAndRndModeAreUndoable() throws {
+        let lane = LaneData(stepCount: 4); lane.stepLengthNumerator = 64
         let td = TrackData(name: "P", lane: lane)
         let um = UndoManager()
-        ModelWriter().apply(.setPadWidth(trackID: td.id, old: 1, new: 3), to: td, undoManager: um)
-        #expect(lane.displayNumerator == 3 && lane.displayDenominator == 1)
-        #expect(lane.stepLengthNumerator == 64, "Steplänge unberührt")
-        #expect(try JSONDecoder().decode(LaneData.self, from: JSONEncoder().encode(lane)).padWidth == 3)
-        #expect(td.freshCopy().lane.padWidth == 3)
-
+        ModelWriter().apply(.setStepWidth(trackID: td.id, old: 0, new: 3), to: td, undoManager: um)
+        #expect(lane.displayNumerator == 3 && lane.stepLengthNumerator == 64)
         um.undo()
-        #expect(lane.padWidth == 1)
-
-        lane.padWidth = 99; lane.clampToValidRanges()
-        #expect(lane.padWidth == 8)
-        lane.padWidth = 0; lane.clampToValidRanges()
-        #expect(lane.padWidth == 1)
-
-        let step = LaneData(stepCount: 4); step.padWidth = 5
-        #expect(step.displayNumerator == 1, "Step-Lanes ignorieren die Pad-Breite")
-        #expect(!String(decoding: try JSONEncoder().encode(step), as: UTF8.self).contains("padWidth"))
+        #expect(lane.stepWidth == 0)
+        ModelWriter().apply(.setRndMode(trackID: td.id, old: nil, new: .chords), to: td, undoManager: um)
+        #expect(lane.rndMode == .chords)
+        um.undo()
+        #expect(lane.rndMode == nil)
+        lane.stepWidth = 99; lane.clampToValidRanges()
+        #expect(lane.stepWidth == 8)
     }
 
-    @MainActor @Test func newPadTrackIsTwoStepsWide() throws {
+    /// RND auf langen Steps: jeder Step klingt, legato; auf kurzen wie bisher zufällig.
+    @MainActor @Test func randomizeLongStepsPlaysEveryStepLegato() {
         let engine = SequencerEngine()
-        let td = try #require(engine.addTrack(kind: .step, pad: true).first?.track)
-        #expect(td.lane.padWidth == 2 && td.lane.displayNumerator == 2)
+        let td = engine.patterns[0].tracks[0]
+        td.lane.stepCount = 4; td.lane.stepLengthNumerator = 16; td.lane.rndMode = .chords
+        engine.randomize(track: td)
+        for i in 0..<4 {
+            #expect(td.lane.steps[i].isActive && td.lane.steps[i].gate == 1.0)
+            #expect(td.lane.steps[i].notes.count >= 2, "Akkord")
+        }
+    }
+
+    @MainActor @Test func newTrackHasNoPadOption() {
+        let engine = SequencerEngine()
+        let td = engine.addTrack(kind: .step).first!.track
+        #expect(td.lane.stepCount == 16 && !td.lane.isLongStep && td.lane.rndMode == nil)
     }
 }

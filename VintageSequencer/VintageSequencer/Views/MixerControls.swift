@@ -206,19 +206,6 @@ struct ControlScrollAction: ViewModifier {
     private func remove() { if let monitor { NSEvent.removeMonitor(monitor) }; monitor = nil }
 }
 
-/// Menüeintrag mit Häkchen; auch die Wahl des schon gewählten Eintrags löst aus.
-struct SelectionMenuItem: View {
-    let title: String
-    let selected: Bool
-    let choose: () -> Void
-    init(_ title: String, selected: Bool, choose: @escaping () -> Void) {
-        self.title = title; self.selected = selected; self.choose = choose
-    }
-    var body: some View {
-        Toggle(title, isOn: Binding(get: { selected }, set: { _ in choose() }))
-    }
-}
-
 // MARK: - Platz (Instrument / Insert)
 
 struct MixerSlotChoice: Identifiable {
@@ -260,21 +247,13 @@ struct MixerSlotRow: View {
                     .disabled(!canOpen)
                     .help(s.mixerOpenEditorHelp(title))
                     .accessibilityLabel(s.mixerOpenEditorHelp(title))
-                Menu {
-                    if choices.isEmpty {
-                        Text(s.mixerNoAudioUnits)
-                    } else {
-                        ForEach(choices) { choice in
-                            SelectionMenuItem(choice.title, selected: choice.selected, choose: choice.action)
-                        }
-                    }
-                } label: {
+                MenuKey(menu: {
+                    .of(choices.isEmpty ? [.note(s.mixerNoAudioUnits)]
+                        : choices.map { c in ClosureMenuItem(title: c.title, checked: c.selected, handler: c.action) })
+                }) {
                     part("chevron.up.chevron.down", .choice, width: 20)
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
                 .frame(width: 20, height: Self.height)
-                .contentShape(Rectangle())
                 .help(s.mixerChooseHelp)
                 .accessibilityLabel(s.mixerChooseHelp)
             }
@@ -636,7 +615,7 @@ struct RenameEntryField: View {
             .focused($focused)
             .onSubmit { finish(save: true) }
             .onExitCommand { finish(save: false) }
-            .onChange(of: focused) { _, isFocused in if !isFocused { finish(save: true) } }
+            .onValueChange(of: focused) { isFocused in if !isFocused { finish(save: true) } }
             .onAppear {
                 draft = initial
                 DispatchQueue.main.async { focused = true }

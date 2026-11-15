@@ -113,13 +113,23 @@ final class ChannelDirectory: ObservableObject {
         let name: String
         /// `PluginRef.componentKey` des Instruments, sobald es geladen ist; sonst nil.
         var readyInstrument: String? = nil
+        /// Audio-Loop-Kanal (v1.15.0).
+        var isAudioLoop = false
+        /// `componentKey` je Effekt der Kette, sobald geladen; sonst nil (v1.17.1: Effekt als
+        /// Ziel einer CC-Lane — der Kopf zeigt „?" bis zum Laden).
+        var readyEffects: [String?] = []
     }
     @Published private(set) var entries: [Entry] = []
 
-    fileprivate func update(_ channels: [InstrumentChannelData], status: [UUID: InstrumentRack.SlotStatus]) {
-        let new = channels.map {
-            Entry(id: $0.id, name: $0.name,
-                  readyInstrument: status[$0.id] == .ready ? $0.instrument?.componentKey : nil)
+    fileprivate func update(_ channels: [InstrumentChannelData], status: [UUID: InstrumentRack.SlotStatus],
+                            effects: [UUID: [InstrumentRack.SlotStatus]]) {
+        let new = channels.map { c -> Entry in
+            let st = effects[c.id] ?? []
+            return Entry(id: c.id, name: c.name,
+                         readyInstrument: status[c.id] == .ready ? c.instrument?.componentKey : nil,
+                         isAudioLoop: c.audioLoop != nil,
+                         readyEffects: c.effects.indices.map { st.indices.contains($0) && st[$0] == .ready
+                                                               ? c.effects[$0].componentKey : nil })
         }
         if new != entries { entries = new }
     }
@@ -156,7 +166,9 @@ final class ChannelDirectory: ObservableObject {
 /// bleibt stumm und zeigt den Status `.missing`. Nichts wird stillschweigend ersetzt.
 final class InstrumentRack: ObservableObject {
 
-    static let maxChannels = 16
+    /// v1.17.3: 64 (vorher 16). Je Kanal fest angelegt: Instrument-Warteschlange (~100 KB),
+    /// Loop-Kern, Notenbuch-Port, vier Effekt-Warteschlangen (je ~25 KB).
+    static let maxChannels = 64
     static let maxEffectsPerChannel = 4
     /// Fader reichen bis +6 dB (wie Planarium). Pegel werden als linearer Gain gespeichert.
     static let maxGainDecibels: Float = 6
@@ -172,15 +184,64 @@ final class InstrumentRack: ObservableObject {
     // MARK: - Beobachtbarer Zustand (Main)
 
     @Published private(set) var channels: [InstrumentChannelData] = [] {
-        didSet { directory.update(channels, status: instrumentStatus) }
+        didSet { directory.update(channels, status: instrumentStatus, effects: effectStatus) }
     }
     /// Kanalliste (ID + Name) für die Ausgangswahl der Spuren. Eigenes Objekt, damit
     /// Spurköpfe nur Anlegen/Löschen/Umbenennen sehen — nicht jede Faderbewegung.
     let directory = ChannelDirectory()
     @Published private(set) var instrumentStatus: [UUID: SlotStatus] = [:] {
-        didSet { directory.update(channels, status: instrumentStatus) }
+        didSet { directory.update(channels, status: instrumentStatus, effects: effectStatus); updateRouteLatencies() }
     }
-    @Published private(set) var effectStatus: [UUID: [SlotStatus]] = [:]
+    @Published private(set) var effectStatus: [UUID: [SlotStatus]] = [:] {
+        didSet { directory.update(channels, status: instrumentStatus, effects: effectStatus); updateRouteLatencies() }
+    }
+
+    // MARK: - Routenlatenz (v1.15.2, Codex T7)
+
+    /// Deklarierte Latenz je Kanal (Instrument + Effekte + Gates, `AUAudioUnit.latency`) in
+    /// Sekunden. AVAudioEngine gleicht Plug-in-Latenzen nicht aus; ohne Ausgleich klänge ein
+    /// Kanal mit Lookahead-Effekt um dessen Latenz später als ein trockener.
+    private(set) var routeLatency: [UUID: Double] = [:]
+    /// Größte Routenlatenz (Sekunden): so weit muss die Clock zusätzlich vorausplanen.
+    private(set) var maxRouteLatency: Double = 0
+    /// Obergrenze des Ausgleichs (darüber wird nur bis hier ausgeglichen).
+    static let maxRouteCompensation: Double = 0.1
+
+    /// Liest die deklarierten Latenzen neu, setzt den Ausgleich je Slot und meldet eine
+    /// geänderte Höchstlatenz an die Clock (Main; billig, auch aus dem Wächter).
+    func updateRouteLatencies() {
+        var lat: [UUID: Double] = [:]
+        for (id, l) in live {
+            var units: [AVAudioUnit] = l.effects.compactMap { $0 }
+            if let i = l.instrument { units.append(i) }
+            if let g = l.gatePre { units.append(g) }
+            if let g = l.gatePost { units.append(g) }
+            let sum = units.reduce(0.0) { $0 + max(0, $1.auAudioUnit.latency) }
+            let v = min(Self.maxRouteCompensation, sum.isFinite ? sum : 0)
+            lat[id] = v
+            let host = UInt64(v * Self.hostTicksPerSecond)
+            if queue(l.slot).latencyAdvance != host { queue(l.slot).setLatencyAdvance(host) }
+            // Loop-Quelle: Instrument gibt es nicht, die Kette hinter der Quelle zählt.
+            if l.source != nil, loopCore(l.slot).outputAdvanceHost != host { loopCore(l.slot).setOutputAdvance(host) }
+            // Effekt-Parameter (v1.17.1): Audio am Ausgang hat diesen Effekt um die Latenz von
+            // ihm selbst und allen späteren Effekten früher durchlaufen.
+            var later = 0.0
+            for (i, unit) in l.effects.enumerated().reversed() {
+                later += max(0, unit?.auAudioUnit.latency ?? 0)
+                guard let q = l.effectQueueSlots[l.effectTokens[i]] else { continue }
+                let v = min(Self.maxRouteCompensation, later.isFinite ? later : 0)
+                let h = UInt64(v * Self.hostTicksPerSecond)
+                if effectQueue(q).latencyAdvance != h { effectQueue(q).setLatencyAdvance(h) }
+            }
+        }
+        routeLatency = lat
+        let m = lat.values.max() ?? 0
+        if abs(m - maxRouteLatency) > 0.000_5 {
+            maxRouteLatency = m
+            onOutputConfigChange?()
+        }
+    }
+
     /// Letzter Fehler der Audio-Engine (Start fehlgeschlagen o. Ä.), sonst nil.
     @Published private(set) var engineError: String?
     /// Läuft die Audio-Engine? (Pegelanzeigen stehen sonst still.)
@@ -208,17 +269,89 @@ final class InstrumentRack: ObservableObject {
     @inline(__always)
     func queue(_ slot: Int) -> AUEventQueue { queues[slot].takeUnretainedValue() }
 
+    // MARK: - Audio-Loops (v1.15.0)
+
+    /// Loop-Kerne, Taktanker, Material, Eingang, Anzeigen (eigener Besitzer, v1.18.4).
+    let loops = AudioLoopController(count: InstrumentRack.maxChannels)
+    /// Taktanker vom Tick-Thread für die Loop-Kerne.
+    var barClock: BarClock { loops.barClock }
+    /// Fester Block von Loop-Kernen, einer je Slot (Zugang aus Tick-, Eingangs- und
+    /// Ausgangs-Render über den Slot-Index, wie `queues`).
+    var loopCores: UnsafeMutablePointer<Unmanaged<AudioLoopCore>> { loops.cores }
+    func loopCore(_ slot: Int) -> AudioLoopCore { loops.core(slot) }
+    /// Was der Tick-Pfad vom Rack erreicht (v1.16.1, Codex V16-6): feste Blöcke und Taktanker.
+    var tickOutputs: TickOutputs {
+        TickOutputs(queues: queues, effectQueues: effectQueues, loopCores: loopCores, barClock: barClock,
+                    hostSync: hostSync, owner: self)
+    }
+
+    // MARK: - Effekt-Warteschlangen (v1.17.1)
+
+    /// Ein Platz je möglichem Effekt (`maxChannels × maxEffectsPerChannel`). Ein geladener
+    /// Effekt belegt einen Platz, solange er geladen ist; der Tick-Pfad erreicht ihn über
+    /// `ParameterTarget.queue` und die Belegung `ParameterTarget.epoch`, wie die Kanäle.
+    static let effectQueueCount = maxChannels * maxEffectsPerChannel
+    let effectQueues: UnsafeMutablePointer<Unmanaged<AUEventQueue>>
+    @inline(__always)
+    func effectQueue(_ i: Int) -> AUEventQueue { effectQueues[i].takeUnretainedValue() }
+    private var freeEffectQueues: [Int] = Array((0..<InstrumentRack.effectQueueCount).reversed())
+
+    // MARK: - Host-Takt für Plug-ins (v1.17.2)
+
+    /// Tempo, Position, Transport für `musicalContextBlock`/`transportStateBlock` aller
+    /// Instrumente und Effekte. Der Tick-Pfad schreibt (`TickOutputs.hostSync`). Liegt beim
+    /// Loop-Controller (v1.18.13): die Zeitdehnung der Loops liest dieselbe Position.
+    var hostSync: HostSync { loops.hostSync }
+    /// Parameterkataloge und Zielauflösung (eigener Besitzer, v1.18.0).
+    let catalog = ParameterCatalog()
+    /// Laden, Klangzustand, Host-Bindung, Render-Observer, Editoren (eigener Besitzer, v1.18.5).
+    private lazy var plugins = PluginLifecycle(hostSync: hostSync, recorder: diagnostics)
+
+    /// Nutzung der Host-Blöcke je geladenem Plug-in (Diagnose, Tests).
+    func hostBindingCalls(_ id: UUID) -> (instrument: Int, effects: [Int])? {
+        guard let l = live[id] else { return nil }
+        let inst = l.hostBinding.map { $0.musicCalls.load(ordering: .relaxed) + $0.transportCalls.load(ordering: .relaxed) } ?? 0
+        let fx = l.effectTokens.map { t in
+            l.effectHostBindings[t].map { $0.musicCalls.load(ordering: .relaxed) + $0.transportCalls.load(ordering: .relaxed) } ?? 0
+        }
+        return (inst, fx)
+    }
+    /// Loop-Kern eines Audio-Loop-Kanals (nil bei anderen Kanälen).
+    func loopCore(for id: UUID?) -> AudioLoopCore? { loops.core(for: id) }
+    func preencodeIdleLoops() { loops.preencodeIdle() }
+    #if DEBUG
+    var _preencodedCount: Int { loops.assets._preencodedCount }
+    var _encodingCount: Int { loops.assets._encodingCount }
+    var _loopStatusPolling: Bool { loops._statusPolling }
+    #endif
+    var inputEngine: AudioInputEngine { loops.inputEngine }
+    func loopDisplay(_ id: UUID?) -> AudioLoopDisplay? { loops.display(id) }
+    @discardableResult
+    func refreshLoopDisplays() -> Bool { loops.refreshDisplays() }
+    func kickLoopDisplays() { loops.kickDisplays() }
+
     // MARK: - Live-Zustand (Main)
 
     private final class Live {
         let slot: Int
         /// Gain-Stufe des Faders (−96 … +6 dB); der Mixer dahinter macht Panorama und Stumm.
-        let gain = AVAudioUnitEQ(numberOfBands: 0)
+        /// Trägt auch den Kanal-EQ (v1.18.11): Bänder nach `ChannelEQ.unitBands`.
+        let gain = AVAudioUnitEQ(numberOfBands: ChannelEQ.unitBandCount)
         let mixer = AVAudioMixerNode()
         /// Pegel des Kanals nach Fader/Mute (vor dem Panorama).
         let meter = LevelMeter()
         var tapInstalled = false
+        /// Kanalausgang hängt an der Summe (siehe `hook`).
+        var hooked = false
         var instrument: AVAudioUnit?
+        /// Umrechnung von der eigenen Rate des Instruments auf die Geräterate (v1.18.9),
+        /// nur wenn `renderRate` von ihr abweicht.
+        var rateStage: AVAudioMixerNode?
+        /// Quelle eines Audio-Loop-Kanals (statt eines Instruments).
+        var source: AVAudioSourceNode?
+        /// Gate vor bzw. nach dem Fader (Audio-Loop-Kanäle, v1.15.0).
+        var gatePre:  AVAudioUnit?
+        var gatePost: AVAudioUnit?
         /// Laufender Ladeauftrag des Instruments. Nie wiederverwendet: ein verspäteter
         /// Abschluss trifft weder einen späteren Auftrag noch eine neue Live-Instanz
         /// desselben Kanals (H4, v1.13.13).
@@ -227,31 +360,41 @@ final class InstrumentRack: ObservableObject {
         /// Parallel zu `InstrumentChannelData.effects`.
         var effects: [AVAudioUnit?] = []
         var effectTokens: [UUID] = []
-        var instrumentWindow: NSWindow?
-        var effectWindows: [UUID: NSWindow] = [:]
+        /// Je geladenem Effekt (nach Token): Platz im Block `effectQueues`, Render-Observer,
+        /// Parameterliste (v1.17.1).
+        var effectQueueSlots: [UUID: Int] = [:]
+        var effectObserverTokens: [UUID: Int] = [:]
+        /// Host-Takt-Bindung je Installation (v1.17.6): Instrument und Effekte (Token).
+        var hostBinding: HostBinding?
+        var effectHostBindings: [UUID: HostBinding] = [:]
         /// Editor nach dem Laden öffnen (ausdrückliche Wahl im Kanalzug).
         var openInstrumentWhenLoaded = false
         var openEffectWhenLoaded: Set<UUID> = []
-        /// Schreibbare Parameter des geladenen Instruments (bei Bedarf gelesen, Main).
-        var parameterCache: [ParameterInfo]?
-        /// Audio-Diagnose: Beobachtung von Preset/Parameterbaum des Instruments.
-        var diagnosticObservations: [NSKeyValueObservation] = []
         init(slot: Int) { self.slot = slot }
     }
 
     private var live: [UUID: Live] = [:]
     private var freeSlots: [Int] = Array((0..<InstrumentRack.maxChannels).reversed())
-    private var engineStorage: AVAudioEngine?
-    private var configObserver: NSObjectProtocol?
+    /// Audio-Engine, Summe, Format, Lauf (eigener Besitzer, v1.18.3).
+    private lazy var graph: AudioGraph = {
+        let g = AudioGraph(masterMeter: masterMeter)
+        g.onStarted = { [weak self] in self?.graphStarted() }
+        g.onWillStart = { [weak self] in self?.reaffirmHostBindings(force: true) }
+        g.onConfigurationChange = { [weak self] e in
+            guard let self else { return }
+            self.diagnostics.event("config", ["running": e.isRunning,
+                                              "output": Self.describe(e.outputNode.outputFormat(forBus: 0)),
+                                              "device": AudioDiagnostics.defaultOutputDevice()])
+            self.rebuildGraph()
+        }
+        return g
+    }()
+    private var engineStorage: AVAudioEngine? { graph.engineIfCreated }
     private var invalidationObserver: NSObjectProtocol?
     /// Audio-Diagnose (Aufzeichnung im Betrieb, Menü „Hilfe").
     let diagnostics = AudioDiagnostics()
-    private var masterTapInstalled = false
-    /// Gain-Stufe der Summe zwischen Main-Mixer und Ausgang (nur verdrahtet, wenn ein
-    /// Ausgabeformat bekannt ist; sonst begrenzt der Main-Mixer auf 0 dB).
-    private let masterGain = AVAudioUnitEQ(numberOfBands: 0)
-    private var masterGainWired = false
-    private var masterTapNode: AVAudioNode?
+    /// Messproben und Plug-in-Beobachtung (eigener Besitzer, v1.18.1).
+    private lazy var rackDiagnostics = RackDiagnostics(recorder: diagnostics)
 
     private static let hostTicksPerSecond: Double = {
         var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
@@ -263,25 +406,62 @@ final class InstrumentRack: ObservableObject {
     init() {
         queues = .allocate(capacity: Self.maxChannels)
         for i in 0..<Self.maxChannels { (queues + i).initialize(to: .passRetained(AUEventQueue())) }
-        diagnostics.header = { [weak self] in self?.diagnosticHeader() ?? [:] }
+        effectQueues = .allocate(capacity: Self.effectQueueCount)
+        for i in 0..<Self.effectQueueCount { (effectQueues + i).initialize(to: .passRetained(
+            AUEventQueue(ringCapacity: 256, pendingCapacity: 128))) }
+        catalog.host = self
+        loops.host = self
+        loops.devices.probe = { [weak self] in
+            guard let self else { return (.init(), .init()) }
+            let inp = self.loops.inputEngine
+            let input = AudioDeviceState.endpoint(unit: inp.inputUnit, running: inp.isRunning, format: inp.format,
+                                                  input: true, error: inp.isRunning ? nil : inp.lastError)
+            let e = self.engineStorage
+            let output = AudioDeviceState.endpoint(unit: e?.outputNode.audioUnit, running: self.graph.isRunning,
+                                                   format: e?.outputNode.outputFormat(forBus: 0), input: false,
+                                                   error: self.graph.isRunning ? nil : self.graph.startError)
+            return (input, output)
+        }
+        loops.devices.refresh()
+        catalog.onChange = { [weak self] in self?.onRoutingChange?() }
+        GateAudioUnit.register()
+        diagnostics.header = { [weak self] in
+            guard let self else { return [:] }
+            return self.rackDiagnostics.header(self.diagnosticProbe())
+        }
         diagnostics.onRecordingChange = { [weak self] _ in
             guard let self else { return }
             self.updateWatchdog(needed: self.live.values.contains { $0.instrument != nil })
         }
         // Ein ausgelagertes Plug-in hat seinen Prozess verloren (Absturz des AU-Hosts).
+        // Nie `queue: .main` (v1.18.20, iMac-Hänger): mit Warteschlange wartet der Absender, bis
+        // Main den Block ausgeführt hat. Absender ist die XPC-Warteschlange des Plug-ins — dieselbe,
+        // die einem synchronen Aufruf von Main (z. B. `detach` beim Instrumentwechsel) antworten
+        // müsste. Beide warten aufeinander. Darum hier sofort zurückkehren, Main bekommt es später.
         invalidationObserver = NotificationCenter.default.addObserver(
-            forName: NSNotification.Name(rawValue: kAudioComponentInstanceInvalidationNotification as String),
-            object: nil, queue: .main
-        ) { [weak self] note in self?.pluginInvalidated(note.object as AnyObject?) }
+            forName: Self.invalidationName, object: nil, queue: nil
+        ) { [weak self] note in
+            let object = note.object as AnyObject?
+            DispatchQueue.main.async { self?.pluginInvalidated(object) }
+        }
     }
 
     deinit {
-        if let o = configObserver { NotificationCenter.default.removeObserver(o) }
+        // Erst die Engine anhalten: Render-Observer und Loop-Quellen lesen Warteschlangen und
+        // Kerne, die danach freigegeben werden (Rack-Block hier, Loop-Kerne mit `loops`).
+        graph.stop()
+        loops.inputEngine.stop()
         if let o = invalidationObserver { NotificationCenter.default.removeObserver(o) }
-        for l in live.values { removeObserver(l) }
-        engineStorage?.stop()
+        for l in live.values {
+            removeObserver(l)
+            for (token, t) in l.effectObserverTokens {
+                plugins.removeObserver(t, from: l.effectTokens.firstIndex(of: token).flatMap { l.effects[$0] })
+            }
+        }
         for i in 0..<Self.maxChannels { queues[i].release() }
         queues.deinitialize(count: Self.maxChannels); queues.deallocate()
+        for i in 0..<Self.effectQueueCount { effectQueues[i].release() }
+        effectQueues.deinitialize(count: Self.effectQueueCount); effectQueues.deallocate()
     }
 
     // MARK: - Abfragen
@@ -329,56 +509,28 @@ final class InstrumentRack: ObservableObject {
         return out.sorted { ($0.manufacturer, $0.ref.name) < ($1.manufacturer, $1.ref.name) }
     }
 
-    // MARK: - Instrument-Parameter (Ziel von CC-Lanes)
+    // MARK: - Parameter (Fassade über `ParameterCatalog`, v1.18.0)
 
-    struct ParameterInfo: Identifiable, Equatable {
-        let address: UInt64
-        let name: String
-        /// Gruppe im Parameterbaum des Plug-ins ("" = ohne Gruppe).
-        let group: String
-        let min: Float
-        let max: Float
-        var id: UInt64 { address }
+    typealias ParameterInfo = ParameterCatalog.Info
+    typealias ParameterSource = ParameterCatalog.Source
+
+    func parameters(for id: UUID) -> [ParameterInfo] { catalog.parameters(for: id) }
+    func effectParameters(for id: UUID, at index: Int) -> [ParameterInfo] {
+        catalog.effectParameters(for: id, at: index)
     }
-
-    /// Schreibbare Parameter des Instruments eines Kanals, in der Reihenfolge des Plug-ins.
-    /// Leer, solange kein Instrument geladen ist.
-    func parameters(for id: UUID) -> [ParameterInfo] {
-        guard let l = live[id] else { return [] }
-        if let cached = l.parameterCache { return cached }
-        guard let unit = l.instrument else { return [] }
-        var list: [ParameterInfo] = []
-        // Baum in Plug-in-Reihenfolge durchlaufen; die innerste Gruppe benennt den Abschnitt.
-        func walk(_ nodes: [AUParameterNode], group: String) {
-            for node in nodes {
-                if let g = node as? AUParameterGroup {
-                    walk(g.children, group: g.displayName)
-                } else if let p = node as? AUParameter,
-                          p.flags.contains(.flag_IsWritable), p.maxValue > p.minValue {
-                    list.append(ParameterInfo(address: p.address, name: p.displayName, group: group,
-                                              min: p.minValue, max: p.maxValue))
-                }
-            }
-        }
-        walk(unit.auAudioUnit.parameterTree?.children ?? [], group: "")
-        l.parameterCache = list
-        return list
-    }
-
     func parameterRange(_ address: UInt64, in id: UUID) -> (min: Float, max: Float)? {
-        parameters(for: id).first { $0.address == address }.map { ($0.min, $0.max) }
+        catalog.parameterRange(address, in: id)
     }
-
-    /// Löst ein gespeichertes Parameterziel gegen das geladene Instrument eines Kanals auf.
-    /// nil, wenn kein Instrument bereit ist, ein anderes Plug-in als das gebundene geladen
-    /// ist oder der Parameter dort fehlt (v1.13.13).
-    func resolveParameter(_ ref: ParameterRef, in id: UUID) -> ParameterTarget? {
-        guard instrumentStatus[id] == .ready, let inst = channel(id)?.instrument else { return nil }
-        if let bound = ref.component, bound != inst.componentKey { return nil }
-        return parameterRange(ref.address, in: id).map {
-            ParameterTarget(address: ref.address, min: $0.min, max: $0.max)
-        }
+    func parameterSources(for id: UUID) -> [ParameterSource] { catalog.sources(for: id) }
+    func parameters(for id: UUID, source: ParameterSource) -> [ParameterInfo] {
+        catalog.parameters(for: id, source: source)
     }
+    static func parameterRef(_ p: ParameterInfo, of source: ParameterSource) -> ParameterRef {
+        ParameterCatalog.ref(p, of: source)
+    }
+    func parameterSource(of ref: ParameterRef, in id: UUID) -> ParameterSource? { catalog.source(of: ref, in: id) }
+    func bindEffectInstance(_ ref: ParameterRef, in id: UUID) -> ParameterRef { catalog.bindEffectInstance(ref, in: id) }
+    func resolveParameter(_ ref: ParameterRef, in id: UUID) -> ParameterTarget? { catalog.resolve(ref, in: id) }
 
     /// Kennung des geladenen Instruments eines Kanals (für neue Parameterbindungen).
     func readyInstrumentKey(_ id: UUID) -> String? {
@@ -417,6 +569,7 @@ final class InstrumentRack: ObservableObject {
         copy.id = UUID(); copy.name = name; copy.isSoloed = false
         install(copy, slot: slot)
         channels.append(copy)
+        if copy.audioLoop != nil { loops.copyMaterial(from: id, to: copy.id) }
         if let ref = copy.instrument { loadInstrument(ref, into: copy.id) }
         for (i, ref) in copy.effects.enumerated() { loadEffect(ref, into: copy.id, at: i) }
         onRoutingChange?(); onProjectChange?()
@@ -431,15 +584,7 @@ final class InstrumentRack: ObservableObject {
         onProjectChange?()
     }
 
-    private func applyMasterVolume() {
-        guard let e = engineStorage else { return }
-        if masterGainWired {
-            masterGain.globalGain = Self.decibels(masterVolume)
-            e.mainMixerNode.outputVolume = masterVolume > 0 ? 1 : 0
-        } else {
-            e.mainMixerNode.outputVolume = min(1, masterVolume)
-        }
-    }
+    private func applyMasterVolume() { graph.applyMasterVolume(masterVolume) }
 
     /// Ersetzt das gesamte Rack (Laden / Neues Projekt). Lädt alle Plug-ins neu.
     func replaceAll(_ new: [InstrumentChannelData], masterVolume master: Float = 1) {
@@ -452,6 +597,12 @@ final class InstrumentRack: ObservableObject {
             guard let slot = freeSlots.popLast() else { break }
             data.clampToValidRanges()
             data.effects = Array(data.effects.prefix(Self.maxEffectsPerChannel))
+            // Effekt-Instanzen: fehlende (ältere Dateien) und doppelte neu vergeben.
+            var seen = Set<UUID>()
+            for i in data.effects.indices {
+                if let inst = data.effects[i].instance, seen.insert(inst).inserted { continue }
+                let fresh = UUID(); data.effects[i].instance = fresh; seen.insert(fresh)
+            }
             install(data, slot: slot)
             accepted.append(data)
         }
@@ -473,13 +624,21 @@ final class InstrumentRack: ObservableObject {
         instrumentStatus[data.id] = data.instrument == nil ? .empty : .loading
         effectStatus[data.id]     = data.effects.map { _ in .loading }
         let q = queue(slot)
+        q.prefault()                                      // Puffer des Kanals real belegen (Main)
         q.setActive(false); q.invalidate(); q.beginOccupancy()
+        // Loop-Kern folgt derselben Belegung.
+        loops.occupy(slot: slot, epoch: q.occupancyEpoch, loop: data.audioLoop.map { (data.id, $0) })
         let e = engine()
         e.attach(l.gain); e.attach(l.mixer)
         e.connect(l.gain, to: l.mixer, format: mixFormat())
-        e.connect(l.mixer, to: e.mainMixerNode, format: mixFormat())
+        hook(l)
         installMeterTap(l)
+        Self.apply(data.eq, to: l.gain)
         applyMix(data, to: l)
+        if let settings = data.audioLoop {
+            installLoopSource(l)
+            loops.configure(data.id, settings)
+        }
     }
 
     private func uninstall(_ id: UUID) {
@@ -488,11 +647,16 @@ final class InstrumentRack: ObservableObject {
         let q = queue(l.slot)
         q.setActive(false); q.invalidate(); q.beginOccupancy()
         removeObserver(l)
-        l.instrumentWindow?.close()
-        l.effectWindows.values.forEach { $0.close() }
+        for token in l.effectTokens { releaseEffectQueue(l, token: token); plugins.closeEditor(.effect(token)) }
+        plugins.closeEditor(.instrument(id))
         removeMeterTap(l)
+        loops.vacate(id, slot: l.slot, epoch: q.occupancyEpoch)
         if let e = engineStorage {
+            if let n = l.source { e.detach(n) }
+            if let n = l.gatePre { e.detach(n) }
+            if let n = l.gatePost { e.detach(n) }
             if let n = l.instrument { e.detach(n) }
+            if let n = l.rateStage { e.detach(n) }
             l.effects.compactMap { $0 }.forEach { e.detach($0) }
             e.detach(l.gain); e.detach(l.mixer)
         }
@@ -511,13 +675,46 @@ final class InstrumentRack: ObservableObject {
     func setMuted(_ id: UUID, _ m: Bool)   { mutate(id) { $0.isMuted = m } }
     func setSoloed(_ id: UUID, _ on: Bool) { mutate(id) { $0.isSoloed = on } }
 
+    // MARK: Kanal-EQ (v1.18.11) — Schreibweg Rack, kein Undo (wie Pegel/Pan)
+
+    func setEQ(_ eq: ChannelEQ, for id: UUID) {
+        var e = eq; e.clamp()
+        mutate(id) { $0.eq = e }
+    }
+    func setEQOn(_ on: Bool, for id: UUID) { mutate(id) { $0.eq.isOn = on } }
+    func setEQBand(_ band: ChannelEQ.Band, at index: Int, for id: UUID) {
+        guard ChannelEQ.defaultBands.indices.contains(index), band.kind == ChannelEQ.defaultBands[index].kind else { return }
+        var b = band; b.clamp()
+        mutate(id) { $0.eq.bands[index] = b }
+    }
+    func setEQBandOn(_ on: Bool, band index: Int, for id: UUID) {
+        guard ChannelEQ.defaultBands.indices.contains(index) else { return }
+        mutate(id) { $0.eq.bands[index].isOn = on }
+    }
+
+    /// Setzt die Stufen des EQ in die Gain-Stufe eines Kanals (Main). Nur geänderte Werte
+    /// werden geschrieben; der Fader (`globalGain`) bleibt unberührt.
+    static func apply(_ eq: ChannelEQ, to unit: AVAudioUnitEQ) {
+        for (b, u) in zip(unit.bands, eq.unitBands) {
+            if u.bypass { if !b.bypass { b.bypass = true }; continue }
+            if b.filterType != u.type { b.filterType = u.type }
+            if b.frequency != u.frequency { b.frequency = u.frequency }
+            if b.gain != u.gain { b.gain = u.gain }
+            if b.bandwidth != u.bandwidth { b.bandwidth = u.bandwidth }
+            if b.bypass { b.bypass = false }
+        }
+    }
+
     private func mutate(_ id: UUID, _ change: (inout InstrumentChannelData) -> Void) {
         guard let idx = channels.firstIndex(where: { $0.id == id }) else { return }
         var data = channels[idx]
         change(&data)
         guard data != channels[idx] else { return }
         let soloChanged = data.isSoloed != channels[idx].isSoloed
+        let eqChanged = data.eq != channels[idx].eq
         channels[idx] = data
+        if eqChanged, let l = live[id] { Self.apply(data.eq, to: l.gain) }
+        if let a = data.audioLoop { loops.settingsChanged(id, a) }
         // Solo eines Kanals ändert, was alle anderen hören lassen.
         if soloChanged { applyMixToAll() } else if let l = live[id] { applyMix(data, to: l) }
         onProjectChange?()
@@ -551,6 +748,28 @@ final class InstrumentRack: ObservableObject {
         updateEngineRunning()
     }
 
+    /// Lädt eine Instrumentdatei (EXS, SoundFont, DLS, aupreset) in einen Apple Sampler auf dem
+    /// Kanal (v1.18.16): Umwandlung im App-Prozess, dann wie jedes Instrument mit Zustand.
+    /// Abschluss auf Main: nil = geladen bzw. Laden begonnen.
+    func loadSamplerInstrument(_ url: URL, for id: UUID, completion: @escaping (AppleSampler.Failure?) -> Void) {
+        AppleSampler.convert(url) { [weak self] result in
+            guard let self, self.live[id] != nil else { return }
+            switch result {
+            case .failure(let f):
+                self.diagnostics.event("samplerLoad", ["file": url.lastPathComponent, "ok": false, "error": "\(f)"])
+                completion(f)
+            case .success(let converted):
+                let name = "Apple Sampler · " + url.deletingPathExtension().lastPathComponent
+                var ref = PluginRef(description: AppleSampler.description, name: name, state: converted.state)
+                ref.drumMap = converted.drumMap
+                self.setInstrument(ref, for: id)
+                self.diagnostics.event("samplerLoad", ["file": url.lastPathComponent, "ok": true,
+                                                       "drumGroups": converted.drumMap?.hasGroups ?? false])
+                completion(nil)
+            }
+        }
+    }
+
     /// Schaltet das Instrument eines Kanals aus oder ein (Ein/Aus-Feld im Kanalzug). Aus:
     /// klingende Noten enden, neue werden verworfen; das Plug-in bleibt geladen.
     func setInstrumentEnabled(_ enabled: Bool, for id: UUID) {
@@ -580,13 +799,17 @@ final class InstrumentRack: ObservableObject {
         l.openInstrumentWhenLoaded = false
         l.instrumentRequest = nil
         let q = queue(l.slot)
-        q.setActive(false); q.invalidate(); q.beginOccupancy()
+        q.setActive(false); q.invalidate(); q.beginOccupancy(); q.setDrumMap(nil)
         removeObserver(l)
-        l.instrumentWindow?.close(); l.instrumentWindow = nil
         if let n = l.instrument, let e = engineStorage { e.detach(n) }
+        if let m = l.rateStage, let e = engineStorage { e.disconnectNodeOutput(m); e.detach(m); l.rateStage = nil }
         l.instrument = nil
-        l.parameterCache = nil
-        l.diagnosticObservations = []
+        l.hostBinding = nil
+        if let id = live.first(where: { $0.value === l })?.key {
+            plugins.closeEditor(.instrument(id))
+            catalog.instrumentUnloaded(channel: id)
+            rackDiagnostics.forget(channel: id)
+        }
         rewire(l)
     }
 
@@ -603,16 +826,20 @@ final class InstrumentRack: ObservableObject {
                 self.diagnostics.event("load", ["channel": self.channel(id)?.name ?? "?", "plugin": ref.name, "ok": false])
                 return
             }
-            self.restoreState(ref.state, into: unit)
+            PluginLifecycle.restoreState(ref.state, into: unit)
+            l.hostBinding = self.plugins.bindHost(unit, queue: self.queues[l.slot])
             self.engine().attach(unit)
             l.instrument = unit
             self.rewire(l)
             self.installObserver(l)
+            if !self.graph.isRunning { self.plugins.confirm(l.hostBinding, unit) }   // nie beim Rendern
             let q = self.queue(l.slot)
             q.invalidate(); q.beginOccupancy()
+            q.setDrumMap(AppleSampler.isSampler(ref) ? ref.drumMap : nil)
             q.setActive(!(self.channel(id)?.instrument?.bypassed ?? false))
             self.instrumentStatus[id] = .ready
-            self.observeForDiagnostics(l, id: id)
+            self.rackDiagnostics.observe(unit, channel: id) { [weak self] in self?.channel(id)?.name }
+            self.catalog.instrumentLoaded(unit, channel: id)
             self.diagnostics.event("load", ["channel": self.channel(id)?.name ?? "?", "plugin": ref.name, "ok": true,
                                             "format": Self.describe(unit.outputFormat(forBus: 0)),
                                             "inProcess": unit.auAudioUnit.isLoadedInProcess,
@@ -645,6 +872,8 @@ final class InstrumentRack: ObservableObject {
               channels[idx].effects.count < Self.maxEffectsPerChannel else { return }
         let at = max(0, min(index, channels[idx].effects.count))
         let token = UUID()
+        var ref = ref
+        ref.instance = UUID()                 // neue Instanz (auch beim Austausch auf einem Platz)
         channels[idx].effects.insert(ref, at: at)
         l.effects.insert(nil, at: at); l.effectTokens.insert(token, at: at)
         var st = effectStatus[id] ?? []
@@ -659,12 +888,14 @@ final class InstrumentRack: ObservableObject {
               channels[idx].effects.indices.contains(index) else { return }
         let token = l.effectTokens[index]
         l.openEffectWhenLoaded.remove(token)
-        l.effectWindows.removeValue(forKey: token)?.close()
+        plugins.closeEditor(.effect(token))
+        releaseEffectQueue(l, token: token)               // vor dem Abhängen: Observer zuerst weg
         if let n = l.effects[index], let e = engineStorage { e.detach(n) }
         channels[idx].effects.remove(at: index)
         l.effects.remove(at: index); l.effectTokens.remove(at: index)
         effectStatus[id]?.remove(at: index)
         rewire(l)
+        onRoutingChange?()           // Effekt-Ziele: Platz frei, laufende Nummern verschoben
         onProjectChange?()
     }
 
@@ -680,6 +911,8 @@ final class InstrumentRack: ObservableObject {
             st.insert(st.remove(at: index), at: target); effectStatus[id] = st
         }
         rewire(l)
+        updateRouteLatencies()       // Latenz der späteren Effekte je Effekt neu
+        onRoutingChange?()           // laufende Nummer gleicher Plug-ins kann sich ändern
         onProjectChange?()
     }
 
@@ -700,14 +933,21 @@ final class InstrumentRack: ObservableObject {
             guard let self, let l = self.live[id],
                   let i = l.effectTokens.firstIndex(of: token) else { return }
             guard let unit else { self.effectStatus[id]?[i] = .missing; return }
-            self.restoreState(ref.state, into: unit)
+            PluginLifecycle.restoreState(ref.state, into: unit)
             // Aktuellen Bypass-Stand anwenden (kann sich während des Ladens geändert haben).
             let bypassed = self.channel(id).flatMap { $0.effects.indices.contains(i) ? $0.effects[i].bypassed : nil }
             unit.auAudioUnit.shouldBypassEffect = bypassed ?? ref.bypassed
+            if let slot = self.reserveEffectQueue(l, token: token) {
+                l.effectHostBindings[token] = self.plugins.bindHost(unit, queue: self.effectQueues[slot])
+            }
             self.engine().attach(unit)
             l.effects[i] = unit
             self.rewire(l)
+            self.installEffectObserver(l, token: token, unit: unit)
+            if !self.graph.isRunning { self.plugins.confirm(l.effectHostBindings[token], unit) }
+            self.catalog.effectLoaded(unit, token: token)
             self.effectStatus[id]?[i] = .ready
+            self.onRoutingChange?()      // Parameterziele dieses Effekts werden auflösbar
             if l.openEffectWhenLoaded.remove(token) != nil { self.openEffectEditor(id, index: i) }
         }
     }
@@ -720,27 +960,15 @@ final class InstrumentRack: ObservableObject {
     func captureStates() {
         for idx in channels.indices {
             guard let l = live[channels[idx].id] else { continue }
-            if let unit = l.instrument, let s = Self.stateData(of: unit) {
+            if let unit = l.instrument, let s = PluginLifecycle.stateData(of: unit) {
                 channels[idx].instrument?.state = s
             }
             for i in channels[idx].effects.indices where l.effects.indices.contains(i) {
-                if let unit = l.effects[i], let s = Self.stateData(of: unit) {
+                if let unit = l.effects[i], let s = PluginLifecycle.stateData(of: unit) {
                     channels[idx].effects[i].state = s
                 }
             }
         }
-    }
-
-    private static func stateData(of unit: AVAudioUnit) -> Data? {
-        guard let state = unit.auAudioUnit.fullState else { return nil }
-        return try? PropertyListSerialization.data(fromPropertyList: state, format: .binary, options: 0)
-    }
-
-    private func restoreState(_ data: Data?, into unit: AVAudioUnit) {
-        guard let data,
-              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
-              let dict = plist as? [String: Any] else { return }
-        unit.auAudioUnit.fullState = dict
     }
 
     // MARK: - Ereignisse von Main (Vorhören, Panik)
@@ -759,6 +987,25 @@ final class InstrumentRack: ObservableObject {
         return r < 0 ? 0 : queue(r).occupancyEpoch
     }
 
+    /// Route einer Spur nach ihrem Ausgang (v1.16.0, Codex M4): eine Noten-/CC-Spur erreicht
+    /// nur Instrumentenkanäle, eine Loop-Spur nur Loop-Kanäle. Alles andere ist MIDI (−1) —
+    /// geprüft an einer Stelle statt nachträglich geklemmt.
+    func route(for output: TrackOutput) -> Int {
+        switch output {
+        case .midi: return -1
+        case .instrument(let id):
+            guard channel(id)?.source.isAudioLoop == false else { return -1 }
+            return route(for: id)
+        case .audioLoop(let id):
+            guard channel(id)?.source.isAudioLoop == true else { return -1 }
+            return route(for: id)
+        }
+    }
+    func routeEpoch(for output: TrackOutput) -> UInt32 {
+        let r = route(for: output)
+        return r < 0 ? 0 : queue(r).occupancyEpoch
+    }
+
     /// Verwirft alle geplanten Ereignisse aller Kanäle und beendet klingende Noten
     /// (All Notes Off auf allen 16 MIDI-Kanälen). Für Stop.
     func silenceAll() {
@@ -766,95 +1013,36 @@ final class InstrumentRack: ObservableObject {
             let q = queue(l.slot)
             q.invalidate()
             for ch in 0..<16 { q.pushFromMain(0xB0 | UInt8(ch), 123, 0) }
+            for slot in l.effectQueueSlots.values { effectQueue(slot).invalidate() }
         }
     }
 
     // MARK: - Editor-Fenster
 
     func openInstrumentEditor(_ id: UUID) {
-        guard let l = live[id], let unit = l.instrument else { return }
-        if let w = l.instrumentWindow { w.makeKeyAndOrderFront(nil); return }
-        let title = "\(channel(id)?.name ?? "") — \(channel(id)?.instrument?.name ?? "")"
-        makeEditorWindow(for: unit, title: title) { [weak l] w in l?.instrumentWindow = w }
+        guard let unit = live[id]?.instrument else { return }
+        plugins.openEditor(.instrument(id), unit: unit,
+                           title: "\(channel(id)?.name ?? "") — \(channel(id)?.instrument?.name ?? "")")
     }
 
     func openEffectEditor(_ id: UUID, index: Int) {
         guard let l = live[id], l.effects.indices.contains(index), let unit = l.effects[index] else { return }
-        let token = l.effectTokens[index]
-        if let w = l.effectWindows[token] { w.makeKeyAndOrderFront(nil); return }
         let name = channel(id)?.effects[index].name ?? ""
-        makeEditorWindow(for: unit, title: "\(channel(id)?.name ?? "") — \(name)") { [weak l] w in
-            l?.effectWindows[token] = w
-        }
-    }
-
-    /// Baut das Editor-Fenster eines Plug-ins.
-    ///
-    /// `requestViewController` liefert bei out-of-process geladenen AUs immer einen
-    /// (entfernten) Controller — auch für Plug-ins OHNE eigene Oberfläche; dessen View ist
-    /// dann 1 × 1 Punkt groß (z. B. AUMatrixReverb). Ein so kleiner oder fehlender Editor
-    /// wird durch die Parameteransicht des Systems ersetzt. Die Fenstergröße folgt der
-    /// tatsächlichen Editorgröße.
-    private func makeEditorWindow(for unit: AVAudioUnit, title: String, store: @escaping (NSWindow) -> Void) {
-        unit.auAudioUnit.requestViewController { controller in
-            DispatchQueue.main.async {
-                var vc = controller
-                var size = Self.editorSize(of: controller)
-                if size == nil {
-                    let generic = AUGenericView(audioUnit: unit.audioUnit)
-                    var frame = generic.frame
-                    if frame.width < 200 { frame.size.width = 520 }
-                    if frame.height < 80 { frame.size.height = 320 }
-                    frame.size.height = min(frame.height, 640)
-                    let scroll = NSScrollView(frame: NSRect(origin: .zero, size: frame.size))
-                    scroll.hasVerticalScroller = true
-                    scroll.drawsBackground = false
-                    scroll.documentView = generic
-                    let host = NSViewController()
-                    host.view = scroll
-                    vc = host; size = frame.size
-                }
-                guard let vc, let size else { return }
-                let w = NSWindow(contentViewController: vc)
-                w.title = title
-                w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-                w.isReleasedWhenClosed = false
-                w.setContentSize(size)
-                w.center()
-                w.makeKeyAndOrderFront(nil)
-                store(w)
-            }
-        }
-    }
-
-    /// Brauchbare Größe eines gelieferten Editors, nil wenn er fehlt oder leer ist.
-    private static func editorSize(of controller: NSViewController?) -> NSSize? {
-        guard let controller else { return nil }
-        for size in [controller.preferredContentSize, controller.view.frame.size]
-        where size.width >= 40 && size.height >= 40 { return size }
-        return nil
+        plugins.openEditor(.effect(l.effectTokens[index]), unit: unit, title: "\(channel(id)?.name ?? "") — \(name)")
     }
 
     // MARK: - Audio-Engine und Verdrahtung
 
-    private func engine() -> AVAudioEngine {
-        if let e = engineStorage { return e }
-        let e = AVAudioEngine()
-        engineStorage = e
-        e.attach(masterGain)
-        wireMasterGain()
-        // Gerät/Abtastrate gewechselt: Kette mit dem neuen Format neu verbinden und
-        // (die Engine hält dabei selbst an) wieder starten.
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: e, queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.diagnostics.event("config", ["running": e.isRunning,
-                                              "output": Self.describe(e.outputNode.outputFormat(forBus: 0)),
-                                              "device": AudioDiagnostics.defaultOutputDevice()])
-            self.rebuildGraph()
-        }
-        return e
+    private func engine() -> AVAudioEngine { graph.engine() }
+
+    /// Nach jedem (Neu-)Start der Engine: Fehler und Laufzustand veröffentlichen. Die
+    /// Host-Blöcke bestätigt `onWillStart` vorher, solange die Engine steht.
+    private func graphStarted() {
+        if engineError != graph.startError { engineError = graph.startError }
+        scheduleHostBlockCheck()
+        if isAudioRunning != graph.isRunning { isAudioRunning = graph.isRunning }
+        loops.devices.refresh()
+        onOutputConfigChange?()   // Clock-Vorlauf vom Gerät der Engine (v1.18.15)
     }
 
     /// Verbindet alle Kanäle neu und startet die Engine (Geräte-/Formatwechsel, Wächter).
@@ -866,19 +1054,35 @@ final class InstrumentRack: ObservableObject {
                                           "running": e.isRunning,
                                           "output": Self.describe(e.outputNode.outputFormat(forBus: 0))])
         }
-        removeMasterTap()
-        wireMasterGain()
+        graph.removeMasterTap()
+        graph.wireMaster()
         for l in live.values {
             removeMeterTap(l)
             e.disconnectNodeOutput(l.gain)
-            e.disconnectNodeOutput(l.mixer)
-            e.connect(l.gain, to: l.mixer, format: mixFormat())
-            e.connect(l.mixer, to: e.mainMixerNode, format: mixFormat())
+            if let gp = l.gatePost { e.disconnectNodeOutput(gp) }
+            e.disconnectNodeOutput(l.mixer); l.hooked = false
+            wireFader(l)
+            hook(l)
             installMeterTap(l)
+            if l.source != nil { installLoopSource(l) }   // neue Abtastrate → neue Quelle
             rewire(l)
             installObserver(l)
         }
+        loops.resample()
         updateEngineRunning()
+        onOutputConfigChange?()   // Vorläufe der Clock an neuen Puffer anpassen (Codex R8)
+    }
+
+    /// Ausgabeformat/-gerät hat sich geändert (nach dem Umbau des Graphen). Main.
+    var onOutputConfigChange: (() -> Void)?
+
+    /// Ausgabepuffer in Sekunden für den Clock-Vorlauf (v1.18.15): bei laufender Engine vom Gerät,
+    /// an dem ihre Ausgabe-Einheit hängt — der Systemstandard kann ein anderes sein —, sonst vom
+    /// Standardgerät (dort startet die Engine). Main.
+    var outputBufferSeconds: Double {
+        let id = graph.isRunning ? AudioDevices.current(of: engineStorage?.outputNode.audioUnit) : nil
+        return (id ?? AudioDevices.systemDefault(input: false)).flatMap { AudioDevices.bufferSeconds($0, input: false) }
+            ?? 512.0 / 48_000
     }
 
     // MARK: - Wächter der Audioausgabe (v1.13.11, überarbeitet v1.13.14)
@@ -892,274 +1096,291 @@ final class InstrumentRack: ObservableObject {
     // der Sperrfrist bleibt stehen, bis er behandelt ist. Danach wird geprüft, ob die Engine
     // wieder Blöcke liefert („erholt"), sonst „ohne Erfolg".
 
-    enum WatchdogFinding: String { case stopped, stalled, nonFinite }
-    enum RecoveryOutcome: String { case pending, recovered, failed }
-
-    static let watchdogInterval: TimeInterval = 0.25
-    /// Prüfungen ohne neuen Block, ab denen die Engine als stehend gilt (≈ 2 s).
-    static let stallTicks = 8
-
-    /// Reine Entscheidung des Wächters über die Engine.
+    private static let log = Logger(subsystem: "com.firstoffifth.sequencer", category: "audio")
+    typealias WatchdogFinding = OutputWatchdog.Finding
+    typealias RecoveryOutcome = OutputWatchdog.Outcome
+    static var watchdogInterval: TimeInterval { OutputWatchdog.interval }
+    static var stallTicks: Int { OutputWatchdog.stallTicks }
     static func watchdogFinding(needed: Bool, running: Bool, tapInstalled: Bool,
                                 stalledTicks: Int, nonFinite: Bool) -> WatchdogFinding? {
-        guard needed else { return nil }
-        if !running { return .stopped }
-        if nonFinite { return .nonFinite }
-        if tapInstalled, stalledTicks >= stallTicks { return .stalled }
-        return nil
+        OutputWatchdog.finding(needed: needed, running: running, tapInstalled: tapInstalled,
+                               stalledTicks: stalledTicks, nonFinite: nonFinite)
     }
 
-    private var watchdog: Timer?
-    private var watchdogLastBlocks = 0
-    private var watchdogStalledTicks = 0
-    private var watchdogLastRecovery = Date.distantPast
-    private var recoveryCheck: (at: Date, blocks: Int)?
+    /// Wächter (eigener Besitzer, Codex M6). Das Rack liefert Messwerte und führt die
+    /// Wiederherstellung aus.
+    private lazy var watchdog: OutputWatchdog = {
+        let w = OutputWatchdog()
+        w.onTick = { [weak self] in
+            guard let self else { return }
+            if self.diagnostics.isRecording { self.rackDiagnostics.sample(self.diagnosticProbe()) }
+            self.updateRouteLatencies()   // Plug-ins können ihre Latenz zur Laufzeit ändern
+        }
+        w.read = { [weak self] in
+            guard let self, let e = self.engineStorage else { return nil }
+            return OutputWatchdog.Reading(
+                needed: self.live.values.contains { $0.instrument != nil },
+                running: e.isRunning, tapInstalled: self.graph.masterTapInstalled,
+                blocks: self.masterMeter.blockCount,
+                nonFinite: self.masterMeter.hasNonFinite || self.live.values.contains { $0.meter.hasNonFinite })
+        }
+        w.recover = { [weak self] finding in
+            guard let self, self.engineStorage != nil else { return 0 }
+            _ = self.masterMeter.takeNonFinite()
+            self.live.values.forEach { _ = $0.meter.takeNonFinite() }
+            self.diagnostics.event("watchdog", ["finding": finding.rawValue])
+            self.graph.stopAndReset()      // Zustand der Knoten verwerfen (NaN im Filtergedächtnis)
+            self.rebuildGraph()                  // startet neu; Host-Blöcke vor dem Start
+            return self.masterMeter.blockCount
+        }
+        w.onOutcome = { [weak self] ok in self?.diagnostics.event("recovery", ["ok": ok]) }
+        return w
+    }()
     /// Diagnose: Engine-Wiederherstellungen seit Programmstart, letzter Anlass und Ergebnis.
-    private(set) var audioRecoveries = 0
-    private(set) var lastRecoveryFinding: WatchdogFinding?
-    private(set) var lastRecoveryOutcome: RecoveryOutcome?
-    private static let log = Logger(subsystem: "com.firstoffifth.sequencer", category: "audio")
+    var audioRecoveries: Int { watchdog.recoveries }
+    var lastRecoveryFinding: WatchdogFinding? { watchdog.lastFinding }
+    var lastRecoveryOutcome: RecoveryOutcome? { watchdog.lastOutcome }
 
     private func updateWatchdog(needed instrumentsLoaded: Bool) {
         // Läuft auch ohne Instrumente, solange die Diagnose aufzeichnet (Messproben).
-        let needed = instrumentsLoaded || diagnostics.isRecording
-        if needed, watchdog == nil {
-            watchdogLastBlocks = masterMeter.blockCount; watchdogStalledTicks = 0
-            let t = Timer(timeInterval: Self.watchdogInterval, repeats: true) { [weak self] _ in
-                self?.watchdogTick()
-            }
-            RunLoop.main.add(t, forMode: .common)
-            watchdog = t
-        } else if !needed, let t = watchdog {
-            t.invalidate(); watchdog = nil
+        watchdog.update(needed: instrumentsLoaded || diagnostics.isRecording,
+                        currentBlocks: masterMeter.blockCount)
+    }
+
+    // MARK: - Audio-Diagnose (v1.13.14; Besitzer `RackDiagnostics` seit v1.18.1)
+
+    private static func describe(_ f: AVAudioFormat) -> String { RackDiagnostics.describe(f) }
+
+    /// Schreibgeschützte Momentaufnahme für Kopf und Messprobe.
+    private func diagnosticProbe() -> RackDiagnostics.Probe {
+        let chans = channels.compactMap { c -> RackDiagnostics.ChannelProbe? in
+            guard let l = live[c.id] else { return nil }
+            let calls = hostBindingCalls(c.id).map { [$0.instrument] + $0.effects }
+            return .init(data: c, status: instrumentStatus[c.id].map { "\($0)" } ?? "-", meter: l.meter,
+                         queue: queue(l.slot), instrument: l.instrument,
+                         latencySeconds: routeLatency[c.id] ?? 0,
+                         loop: l.source != nil ? loopCore(l.slot) : nil, hostCalls: calls)
         }
+        return .init(engine: engineStorage, recoveries: audioRecoveries, masterMeter: masterMeter,
+                     masterGainDB: graph.masterGainDB, channels: chans)
     }
 
-    private func watchdogTick() {
-        if diagnostics.isRecording { recordDiagnosticSample() }
-        guard let e = engineStorage else { return }
-        let now = Date()
+    static let invalidationName = NSNotification.Name(rawValue: kAudioComponentInstanceInvalidationNotification as String)
 
-        let needed = live.values.contains { $0.instrument != nil }
-        let blocks = masterMeter.blockCount
-        watchdogStalledTicks = blocks == watchdogLastBlocks ? watchdogStalledTicks + 1 : 0
-        watchdogLastBlocks = blocks
+    // MARK: Wiederanlauf nach Absturz des Plug-in-Prozesses (v1.18.32)
+    //
+    // Alle out-of-process geladenen Plug-ins von FoF teilen sich einen AU-Host-Prozess. Stürzt
+    // eines ab (gemessen: Shortcircuit XT 0.9.316 beim Abbau, GUI-Abbau auf dem XPC-Thread),
+    // sind alle übrigen Instanzen tot: jeder Block meldet einen Fehler, der Kanal bleibt still.
+    // FoF lädt jeden betroffenen Platz (Instrument oder Effekt) neu, mit dem zuletzt bekannten
+    // Zustand aus dem Modell (letztes Laden/Speichern; den Zustand der toten Instanz kann
+    // niemand mehr lesen — vorher ging er beim Speichern ebenso verloren). Stürzt derselbe
+    // Platz innerhalb von `recoveryLockout` nach einem Neustart erneut ab, gibt FoF auf
+    // (Status „fehlt"), damit ein Plug-in, das beim Laden abstürzt, keine Schleife erzeugt.
 
-        // Ergebnis einer vorigen Wiederherstellung feststellen.
-        if let check = recoveryCheck, now >= check.at {
-            recoveryCheck = nil
-            let ok = e.isRunning && masterMeter.blockCount > check.blocks
-            lastRecoveryOutcome = ok ? .recovered : .failed
-            if ok { Self.log.notice("Audioausgabe erholt") }
-            else  { Self.log.error("Audioausgabe nach Wiederherstellung ohne Erfolg") }
-            diagnostics.event("recovery", ["ok": ok])
-        }
-
-        // Ungültige Werte nur ansehen, nicht abholen: ein Befund in der Sperrfrist bleibt.
-        let bad = masterMeter.hasNonFinite || live.values.contains { $0.meter.hasNonFinite }
-        guard let finding = Self.watchdogFinding(needed: needed, running: e.isRunning,
-                                                 tapInstalled: masterTapInstalled,
-                                                 stalledTicks: watchdogStalledTicks, nonFinite: bad),
-              now.timeIntervalSince(watchdogLastRecovery) > 3 else { return }
-        watchdogLastRecovery = now
-        watchdogStalledTicks = 0
-        audioRecoveries += 1
-        lastRecoveryFinding = finding
-        lastRecoveryOutcome = .pending
-        _ = masterMeter.takeNonFinite()
-        live.values.forEach { _ = $0.meter.takeNonFinite() }
-        Self.log.error("Audioausgabe: Wiederherstellung versucht (\(finding.rawValue, privacy: .public))")
-        diagnostics.event("watchdog", ["finding": finding.rawValue])
-        e.stop()
-        e.reset()                      // Zustand der Knoten verwerfen (NaN im Filtergedächtnis)
-        rebuildGraph()
-        recoveryCheck = (now.addingTimeInterval(2), masterMeter.blockCount)
-    }
-
-    // MARK: - Audio-Diagnose (v1.13.14)
-
-    private var diagLastMasterBlocks = 0
-    private var diagLastChannelBlocks: [UUID: Int] = [:]
-    private var diagLastQueue: [UUID: (rejected: Int, backlog: Int, pre: Int, post: Int, err: Int)] = [:]
-    private var diagLastSample: Date?
-
-    /// Signalwerte eines Messpunkts seit der letzten Probe (nach Fader bzw. Summen-Gain).
-    private static func signalRow(_ d: LevelMeter.Diagnostics, blocks: Int) -> [String: Any] {
-        ["peak": AudioDiagnostics.num(d.peak), "over1": d.over, "over16": d.over16, "nan": d.nonFinite,
-         "dc": AudioDiagnostics.num(d.dc), "rms": AudioDiagnostics.num(d.rms), "blocks": blocks]
-    }
-
-    private static func describe(_ f: AVAudioFormat) -> String {
-        "\(Int(f.sampleRate))/\(f.channelCount)\(f.isInterleaved ? "i" : "")"
-    }
-
-    private func diagnosticHeader() -> [String: Any] {
-        var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
-        var head: [String: Any] = ["engineRunning": engineStorage?.isRunning ?? false,
-                                   "audioRecoveries": audioRecoveries,
-                                   "hostTime": String(mach_absolute_time()),
-                                   "timebase": "\(tb.numer)/\(tb.denom)", "schema": 1]
-        if let e = engineStorage { head["output"] = Self.describe(e.outputNode.outputFormat(forBus: 0)) }
-        head["channels"] = channels.map { c -> [String: Any] in
-            var d: [String: Any] = ["name": c.name, "status": instrumentStatus[c.id].map { "\($0)" } ?? "-",
-                                    "effects": c.effects.map(\.name)]
-            if let i = c.instrument { d["instrument"] = i.name; d["component"] = i.componentKey }
-            return d
-        }
-        return head
-    }
-
-    /// Eine Messprobe (Main, aus dem Wächter-Timer). Pegel sind Rohwerte nach dem Fader:
-    /// `peak` darf weit über 1 liegen, `over` zählt Samples über 1,0, `nan` NaN/∞-Samples.
-    private func recordDiagnosticSample() {
-        var s: [String: Any] = [:]
-        let now = Date()
-        if let last = diagLastSample { s["dt"] = Int(now.timeIntervalSince(last) * 1000) }   // Timer-Verspätung
-        diagLastSample = now
-        let blocks = masterMeter.blockCount
-        s["sum"] = Self.signalRow(masterMeter.takeDiagnostics(), blocks: blocks &- diagLastMasterBlocks)
-        diagLastMasterBlocks = blocks
-        if let e = engineStorage {
-            s["engine"] = ["running": e.isRunning, "masterGainDB": AudioDiagnostics.num(masterGain.globalGain)]
-        }
-        var chans: [[String: Any]] = []
-        for c in channels {
-            guard let l = live[c.id] else { continue }
-            let b = l.meter.blockCount
-            var row = Self.signalRow(l.meter.takeDiagnostics(), blocks: b &- (diagLastChannelBlocks[c.id] ?? b))
-            diagLastChannelBlocks[c.id] = b
-            let q = queue(l.slot)
-            let now = (rejected: q.rejected.load(ordering: .relaxed), backlog: q.backlog.load(ordering: .relaxed),
-                       pre: q.preRenders.load(ordering: .relaxed), post: q.postRenders.load(ordering: .relaxed),
-                       err: q.renderErrors.load(ordering: .relaxed))
-            let last = diagLastQueue[c.id] ?? now
-            diagLastQueue[c.id] = now
-            row["name"] = c.name
-            row["vol"] = AudioDiagnostics.num(c.volume)
-            row["mute"] = c.isMuted
-            row["rejected"] = now.rejected &- last.rejected
-            row["backlog"] = now.backlog &- last.backlog
-            row["auPre"] = now.pre &- last.pre             // Render-Durchläufe des Instruments
-            row["auPost"] = now.post &- last.post
-            row["auErr"] = now.err &- last.err
-            if let u = l.instrument {
-                row["rr"] = u.auAudioUnit.renderResourcesAllocated
-                row["format"] = Self.describe(u.outputFormat(forBus: 0))
-            }
-            chans.append(row)
-        }
-        s["ch"] = chans
-        var dev = AudioDiagnostics.defaultOutputDevice()
-        dev["overloads"] = diagnostics.takeOverloads()
-        s["device"] = dev
-        diagnostics.event("s", s)
-    }
-
-    /// Plug-in-seitige Änderungen protokollieren: Presetwahl im Editor, neuer Parameterbaum,
-    /// Gesamtzustand (Plug-ins melden einen Presetwechsel meist über `allParameterValues`).
-    private func observeForDiagnostics(_ l: Live, id: UUID) {
-        guard let au = l.instrument?.auAudioUnit else { l.diagnosticObservations = []; return }
-        let report: (String) -> Void = { [weak self] what in
-            DispatchQueue.main.async {
-                guard let self, let d = self.channel(id) else { return }
-                var f: [String: Any] = ["channel": d.name, "what": what]
-                if let u = self.live[id]?.instrument {
-                    f["preset"] = u.auAudioUnit.currentPreset?.name ?? "-"
-                    f["format"] = Self.describe(u.outputFormat(forBus: 0))
-                    f["rr"] = u.auAudioUnit.renderResourcesAllocated
-                }
-                self.diagnostics.event("au", f)
-            }
-        }
-        l.diagnosticObservations = [
-            au.observe(\.currentPreset) { _, _ in report("preset") },
-            au.observe(\.parameterTree) { _, _ in report("parameterTree") },
-            au.observe(\.allParameterValues) { _, _ in report("allParameterValues") },
-        ]
-    }
+    /// Sperrzeit je Platz (Tests setzen sie hoch, damit ein langsamer Volllauf sie nicht überschreitet).
+    var recoveryLockout: TimeInterval = 10
+    private var recoveredAt: [UUID: Date] = [:]          // Kanal (Instrument) bzw. Token (Effekt)
 
     private func pluginInvalidated(_ object: AnyObject?) {
-        let hit = live.first { _, l in
-            (l.instrument?.auAudioUnit).map { $0 === object } == true
-                || l.effects.contains { ($0?.auAudioUnit).map { $0 === object } == true }
+        guard let object else { return }
+        for (id, l) in live {
+            if let unit = l.instrument, unit.auAudioUnit === object {
+                report(id, slot: "instrument")
+                recoverInstrument(id, l)
+                return
+            }
+            if let i = l.effects.firstIndex(where: { $0.map { $0.auAudioUnit === object } == true }) {
+                report(id, slot: "effect \(i + 1)")
+                recoverEffect(id, l, index: i)
+                return
+            }
         }
-        let name = hit.flatMap { channel($0.key)?.name } ?? "?"
-        Self.log.error("Plug-in-Prozess beendet (Kanal \(name, privacy: .public))")
-        diagnostics.event("invalidated", ["channel": name])
+        Self.log.error("Plug-in-Prozess beendet (keiner aktiven Instanz zugeordnet)")
+        diagnostics.event("invalidated", ["channel": "?"])
     }
 
-    /// Main-Mixer → Gain-Stufe der Summe → Ausgang. Ohne bekanntes Ausgabeformat bleibt
-    /// die Standardverbindung (Main-Mixer → Ausgang) bestehen.
-    private func wireMasterGain() {
-        guard let e = engineStorage else { return }
-        if let format = mixFormat() {
-            e.connect(e.mainMixerNode, to: masterGain, format: format)
-            e.connect(masterGain, to: e.outputNode, format: format)
-            masterGainWired = true
-        } else {
-            masterGainWired = false
-        }
-        applyMasterVolume()
+    private func report(_ id: UUID, slot: String) {
+        let name = channel(id)?.name ?? "?"
+        Self.log.error("Plug-in-Prozess beendet (Kanal \(name, privacy: .public), \(slot, privacy: .public))")
+        diagnostics.event("invalidated", ["channel": name, "slot": slot])
     }
 
-    /// Stereo in der Abtastrate des Ausgangs; nil, solange kein Ausgabegerät bekannt ist.
-    private func mixFormat() -> AVAudioFormat? {
-        guard let e = engineStorage else { return nil }
-        let sr = e.outputNode.outputFormat(forBus: 0).sampleRate
-        guard sr > 0 else { return nil }
-        return AVAudioFormat(standardFormatWithSampleRate: sr, channels: 2)
+    /// true: Neustart erlaubt (und vermerkt). false: kurz nach einem Neustart erneut tot.
+    private func mayRecover(_ key: UUID, now: Date = Date()) -> Bool {
+        if let last = recoveredAt[key], now.timeIntervalSince(last) < recoveryLockout { return false }
+        recoveredAt[key] = now
+        return true
     }
+
+    private func recoverInstrument(_ id: UUID, _ l: Live) {
+        guard let ref = channel(id)?.instrument else { return }
+        let name = channel(id)?.name ?? "?"
+        teardownInstrument(l)
+        guard mayRecover(id) else {
+            instrumentStatus[id] = .missing
+            diagnostics.event("pluginRecovery", ["channel": name, "slot": "instrument", "gaveUp": true])
+            updateEngineRunning()
+            return
+        }
+        instrumentStatus[id] = .loading
+        diagnostics.event("pluginRecovery", ["channel": name, "slot": "instrument", "plugin": ref.name])
+        loadInstrument(ref, into: id)
+        onRoutingChange?()           // neue Belegung → Snapshot mit neuer Epoche
+        updateEngineRunning()
+    }
+
+    private func recoverEffect(_ id: UUID, _ l: Live, index i: Int) {
+        guard let data = channel(id), data.effects.indices.contains(i), l.effectTokens.indices.contains(i) else { return }
+        let token = l.effectTokens[i]
+        let ref = data.effects[i]
+        plugins.closeEditor(.effect(token))
+        releaseEffectQueue(l, token: token)                // Observer der toten Instanz zuerst weg
+        if let n = l.effects[i], let e = engineStorage { e.detach(n) }
+        l.effects[i] = nil
+        rewire(l)
+        guard mayRecover(token) else {
+            effectStatus[id]?[i] = .missing
+            diagnostics.event("pluginRecovery", ["channel": data.name, "slot": "effect \(i + 1)", "gaveUp": true])
+            onRoutingChange?()
+            return
+        }
+        effectStatus[id]?[i] = .loading
+        diagnostics.event("pluginRecovery", ["channel": data.name, "slot": "effect \(i + 1)", "plugin": ref.name])
+        loadEffect(ref, into: id, at: i)
+        onRoutingChange?()
+    }
+
+    private func mixFormat() -> AVAudioFormat? { graph.mixFormat }
 
     /// Verbindet Instrument → Effekte (in Reihenfolge, nur geladene) → Gain-Stufe des Kanals.
     private func rewire(_ l: Live) {
         guard let e = engineStorage else { return }
-        let chain: [AVAudioNode] = ([l.instrument] + l.effects).compactMap { $0 }
-        chain.forEach { e.disconnectNodeOutput($0) }
-        e.disconnectNodeInput(l.gain)
-        guard l.instrument != nil else { return }
-        let format = mixFormat()
-        var upstream = chain[0]
-        for node in chain.dropFirst() {
-            e.connect(upstream, to: node, format: format)
-            upstream = node
-        }
-        e.connect(upstream, to: l.gain, format: format)
-        adoptNewNodes(chain)
+        let head: AVAudioNode? = l.instrument ?? l.source
+        // Eigene Rate des Instruments (v1.18.9): Umrechnungsstufe direkt dahinter.
+        let rate = l.instrument != nil ? stageRate(l) : nil
+        if rate != nil, l.rateStage == nil { let m = AVAudioMixerNode(); e.attach(m); l.rateStage = m }
+        if rate == nil, let m = l.rateStage { e.disconnectNodeOutput(m); e.detach(m); l.rateStage = nil }
+        let chain: [AVAudioNode] = ([head, l.rateStage] + l.effects + [l.gatePre]).compactMap { $0 }
+        guard head != nil else { graph.disconnect(chain, from: l.gain); return }
+        graph.connectChain(chain, into: l.gain,
+                           headFormat: rate.flatMap { AVAudioFormat(standardFormatWithSampleRate: $0, channels: 2) })
+        hook(l)
+        if graph.adopt(chain + [l.gain, l.mixer]) { diagnostics.event("restart", ["reason": "newNodes"]) }
     }
 
-    /// Nimmt bei laufender Engine neu verbundene Plug-ins in den Renderweg auf.
+    /// Hängt den Kanalausgang an die Summe (v1.18.10).
     ///
-    /// AVAudioEngine legt für einen Knoten, der an einen bei laufender Engine angelegten
-    /// Kanal gehängt wird, keine Render-Ressourcen an: der Kanal bleibt stumm (gemessen
-    /// v1.13.6, zweiter Kanal), und Plug-ins, die ihre Freischaltung bis dahin aufschieben
-    /// (UADx: unscharfer Editor), bleiben im Ladezustand. Ein Neustart der Engine baut den
-    /// Renderweg vollständig auf. Er unterbricht den Ton der übrigen Kanäle kurz — nur beim
-    /// Laden oder Umstecken eines Plug-ins, nie im Spielbetrieb.
-    private func adoptNewNodes(_ chain: [AVAudioNode]) {
-        guard let e = engineStorage, e.isRunning,
-              chain.contains(where: { !$0.auAudioUnit.renderResourcesAllocated }) else { return }
-        diagnostics.event("restart", ["reason": "newNodes"])
-        e.stop()
-        e.prepare()
-        do { try e.start(); engineError = nil }
-        catch { engineError = error.localizedDescription }
-        if isAudioRunning != e.isRunning { isAudioRunning = e.isRunning }
+    /// Gemessen (macOS 26, AVAudioEngine): bei laufender Engine greift eine Verbindung in den
+    /// Summenmixer nur, wenn der Zweig darüber schon eine Quelle hat — dann bereitet die
+    /// Engine alle Knoten des Zweigs vor, ohne Neustart. Ein Kanal ohne Quelle, der an die
+    /// laufende Summe gehängt wird, kommt dort nie an; ein später darunter gehängtes
+    /// Instrument bleibt stumm (der Befund von v1.13.6, früher mit Neustart der Engine
+    /// gelöst, der alle Kanäle unterbrach). Darum hängt ein leerer Kanal bei laufender Engine
+    /// erst, wenn Instrument oder Loop-Quelle da sind; Effekte in einem hängenden Zweig
+    /// einzufügen oder zu tauschen ist dagegen ohne Weiteres möglich.
+    private func hook(_ l: Live) {
+        guard !l.hooked, let e = engineStorage else { return }
+        if e.isRunning, l.instrument == nil, l.source == nil { return }
+        e.connect(l.mixer, to: e.mainMixerNode, format: mixFormat())
+        l.hooked = true
+    }
+
+    /// Abweichende Rate des Instruments eines Kanals, nil = Geräterate.
+    private func stageRate(_ l: Live) -> Double? {
+        guard let id = live.first(where: { $0.value === l })?.key, let r = channel(id)?.renderRate,
+              let device = mixFormat()?.sampleRate, r != device else { return nil }
+        return r
+    }
+
+    /// Abtastrate, mit der das Instrument eines Kanals rendert (nil = Geräterate). Ein
+    /// laufendes Instrument wird mit neuem Format neu verbunden; die Engine startet dafür
+    /// kurz neu (wie beim Laden eines Plug-ins).
+    func setRenderRate(_ rate: Double?, for id: UUID) {
+        let r = rate.flatMap { InstrumentChannelData.renderRates.contains($0) ? $0 : nil }
+        guard let idx = channels.firstIndex(where: { $0.id == id }), channels[idx].renderRate != r else { return }
+        channels[idx].renderRate = r
+        if let l = live[id], l.instrument != nil, engineStorage != nil {
+            let running = graph.isRunning
+            if running { graph.stop() }
+            removeObserver(l)
+            rewire(l)
+            installObserver(l)                     // Rate des Instruments → Frames je Host-Tick
+            if running { graph.start() }
+            updateRouteLatencies()
+            diagnostics.event("renderRate", ["channel": channels[idx].name, "rate": r ?? 0])
+        }
+        onProjectChange?()
+    }
+
+    /// Abtastrate des Ausgabegeräts (nil, solange keines bekannt ist).
+    var outputSampleRate: Double? { mixFormat()?.sampleRate }
+
+    /// Tatsächliche Rate des Instruments (Anzeige, Tests).
+    func instrumentRenderRate(_ id: UUID) -> Double? { live[id]?.instrument?.outputFormat(forBus: 0).sampleRate }
+
+    /// Bestätigt vor jedem Start der Engine (sie steht) die Host-Blöcke aller geladenen
+    /// Plug-ins (v1.17.10, Codex A17-09; Zeitpunkt v1.18.10). Befund A17-09: ein ausgelagertes
+    /// Instrument verlor sie bei einem Neustart der Engine. Befund v1.18.10 (iMac, macOS 12):
+    /// Setzen, während das Plug-in im Hostprozess rendert, lässt AUHostingServiceXPC abstürzen
+    /// (Odin2 → transportStateProc → leerer Funktionszeiger) — deshalb nur hier. Gesetzt wird
+    /// nur, wenn der Getter leer ist — dieselbe Bindung, vermerkt in der Diagnose.
+    private func reaffirmHostBindings(force: Bool = false) {
+        for l in live.values {
+            if let unit = l.instrument, let b = l.hostBinding { plugins.reaffirm(b, unit, force: force) }
+            for (i, token) in l.effectTokens.enumerated() {
+                if let unit = l.effects[i], let b = l.effectHostBindings[token] { plugins.reaffirm(b, unit, force: force) }
+            }
+        }
+    }
+
+    /// Nachprüfung nach jedem Start (A17-09, v1.18.10): Bindungen, die seither rendern, aber
+    /// nicht gerufen werden, bekommen ihre Blöcke einmal zurück. Ein späterer Start entwertet
+    /// eine noch ausstehende Prüfung.
+    private var hostCheckGeneration = 0
+    private func scheduleHostBlockCheck() {
+        hostCheckGeneration &+= 1
+        let gen = hostCheckGeneration
+        var marks: [(HostBinding, AVAudioUnit, PluginLifecycle.UseMark)] = []
+        for l in live.values {
+            if let u = l.instrument, let b = l.hostBinding { marks.append((b, u, plugins.mark(b))) }
+            for (i, t) in l.effectTokens.enumerated() {
+                if let u = l.effects[i], let b = l.effectHostBindings[t] { marks.append((b, u, plugins.mark(b))) }
+            }
+        }
+        guard !marks.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.hostCheckDelay) { [weak self] in
+            guard let self, gen == self.hostCheckGeneration, self.graph.isRunning else { return }
+            for (b, u, m) in marks where self.isLive(b) { self.plugins.restoreIfUnused(b, u, since: m) }
+        }
+    }
+    static let hostCheckDelay: TimeInterval = 0.3
+
+    /// Gehört die Bindung noch zu einem geladenen Plug-in?
+    private func isLive(_ b: HostBinding) -> Bool {
+        live.values.contains { $0.hostBinding === b || $0.effectHostBindings.values.contains { $0 === b } }
+    }
+
+    private func adoptNewNodes(_ nodes: [AVAudioNode]) {
+        if graph.adopt(nodes) { diagnostics.event("restart", ["reason": "newNodes"]) }
     }
 
     private func updateEngineRunning() {
-        guard let e = engineStorage else { return }
-        let needed = live.values.contains { $0.instrument != nil }
-        if needed, !e.isRunning {
-            installMasterTap()
-            e.prepare()
-            do { try e.start(); engineError = nil }
-            catch { engineError = error.localizedDescription }
-        } else if !needed, e.isRunning {
-            e.stop()
+        guard engineStorage != nil else { return }
+        let needed = live.values.contains { $0.instrument != nil || $0.source != nil }
+        if needed, !graph.isRunning {
+            graph.installMasterTap()
+            graph.start()
+        } else if !needed, graph.isRunning {
+            graph.stop()
             masterMeter.reset()
             live.values.forEach { $0.meter.reset() }
         }
-        if isAudioRunning != e.isRunning { isAudioRunning = e.isRunning }
+        if isAudioRunning != graph.isRunning {
+            isAudioRunning = graph.isRunning
+            if !graph.isRunning { onOutputConfigChange?() }   // wieder vom Standardgerät
+        }
+        loops.devices.refresh()
         updateWatchdog(needed: needed)
     }
 
@@ -1184,119 +1405,343 @@ final class InstrumentRack: ObservableObject {
         l.meter.reset()
     }
 
-    private func installMasterTap() {
-        guard !masterTapInstalled, let e = engineStorage, mixFormat() != nil else { return }
-        let meter = masterMeter
-        masterTapNode = masterGainWired ? masterGain : e.mainMixerNode
-        masterTapNode?.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in meter.feed(buffer) }
-        masterTapInstalled = true
-    }
-
-    private func removeMasterTap() {
-        guard masterTapInstalled else { return }
-        masterTapNode?.removeTap(onBus: 0)
-        masterTapNode = nil
-        masterTapInstalled = false
-        masterMeter.reset()
-    }
 
     private func instantiate(_ ref: PluginRef, completion: @escaping (AVAudioUnit?) -> Void) {
-        #if DEBUG
-        if let override = _instantiateOverride { override(ref, completion); return }
-        #endif
-        let d = ref.componentDescription
-        // Nur out-of-process. Ein Rückfall auf das Laden im eigenen Prozess würde in der
-        // Sandbox den Systemdialog „Sicherheitseinstellungen senken" auslösen (v1.13.7).
-        AVAudioUnit.instantiate(with: d, options: .loadOutOfProcess) { [weak self] unit, error in
-            DispatchQueue.main.async {
-                if let error {
-                    self?.diagnostics.event("loadError", ["plugin": ref.name, "error": "\(error)"])
-                }
-                completion(unit)
-            }
-        }
+        plugins.instantiate(ref, completion: completion)
     }
 
     // MARK: - Render-Observer (Übergabe an den Audio-Thread)
 
     private func removeObserver(_ l: Live) {
-        if let t = l.observerToken, let unit = l.instrument {
-            unit.auAudioUnit.removeRenderObserver(t)
-        }
+        plugins.removeObserver(l.observerToken, from: l.instrument)
         l.observerToken = nil
     }
 
     /// Hängt die Warteschlange des Kanals an den Render-Durchlauf seines Instruments.
-    ///
-    /// Der Block läuft auf dem Audio-Thread: er fängt nur die Warteschlange (unretained —
-    /// das Rack hält sie für seine ganze Lebensdauer), den Schedule-Block des AUs und eine
-    /// Konstante. Kein Heap, kein Lock, kein Zugriff auf Rack oder Engine.
     private func installObserver(_ l: Live) {
         removeObserver(l)
-        guard let unit = l.instrument, let schedule = unit.auAudioUnit.scheduleMIDIEventBlock else { return }
-        let scheduleParameter = unit.auAudioUnit.scheduleParameterBlock
-        let sampleRate = unit.outputFormat(forBus: 0).sampleRate
-        guard sampleRate > 0 else { return }
-        let ticksPerFrame = Self.hostTicksPerSecond / sampleRate
-        let queue = queues[l.slot]
-        l.observerToken = unit.auAudioUnit.token(byAddingRenderObserver: { flags, timestamp, frameCount, _ in
-            if flags.contains(.unitRenderAction_PostRender) {
-                // Diagnose: nur Zähler (Atomics), sonst nichts.
-                queue._withUnsafeGuaranteedRef { q in
-                    q.postRenders.wrappingIncrement(ordering: .relaxed)
-                    if flags.contains(.unitRenderAction_PostRenderError) {
-                        q.renderErrors.wrappingIncrement(ordering: .relaxed)
-                    }
-                }
-                return
-            }
-            guard flags.contains(.unitRenderAction_PreRender) else { return }
-            let ts = timestamp.pointee
-            queue._withUnsafeGuaranteedRef { q in
-                q.preRenders.wrappingIncrement(ordering: .relaxed)
-                q.render(hostStart: ts.mHostTime,
-                         hostValid: ts.mFlags.contains(.hostTimeValid),
-                         frames: Int(frameCount),
-                         ticksPerFrame: ticksPerFrame, emit: { offset, packed in
-                    var bytes = (UInt8(truncatingIfNeeded: packed),
-                                 UInt8(truncatingIfNeeded: packed >> 8),
-                                 UInt8(truncatingIfNeeded: packed >> 16))
-                    withUnsafeBytes(of: &bytes) { raw in
-                        schedule(AUEventSampleTimeImmediate + AUEventSampleTime(offset), 0, 3,
-                                 raw.bindMemory(to: UInt8.self).baseAddress!)
-                    }
-                }, emitParameter: { offset, address, value in
-                    scheduleParameter(AUEventSampleTimeImmediate + AUEventSampleTime(offset), 0,
-                                      address, value)
-                })
-            }
-        })
+        guard let unit = l.instrument else { return }
+        l.observerToken = plugins.installInstrumentObserver(unit, queue: queues[l.slot], binding: l.hostBinding)
     }
+
+    /// Belegt für einen geladenen Effekt einen Platz im Block `effectQueues` (v1.17.1); der
+    /// Render-Observer kommt nach dem Verdrahten (`installEffectObserver`).
+    ///
+    /// Der Observer läuft auf dem Audio-Thread, bevor der Effekt rendert, und plant Parameter
+    /// wie beim Instrument mit Sample-Offset ein — sie gelten für denselben Block. Er fängt
+    /// nur die Warteschlange (unretained, das Rack hält den Block) und den Schedule-Block.
+    @discardableResult
+    private func reserveEffectQueue(_ l: Live, token: UUID) -> Int? {
+        releaseEffectQueue(l, token: token)
+        guard let slot = freeEffectQueues.popLast() else { return nil }
+        l.effectQueueSlots[token] = slot
+        let q = effectQueue(slot)
+        q.prefault()
+        q.invalidate(); q.beginOccupancy(); q.setActive(true)
+        updateRouteLatencies()
+        return slot
+    }
+
+    /// Render-Observer des Effekts (nach dem Verdrahten: Abtastrate steht fest).
+    private func installEffectObserver(_ l: Live, token: UUID, unit: AVAudioUnit) {
+        guard let slot = l.effectQueueSlots[token] else { return }
+        l.effectObserverTokens[token] = plugins.installEffectObserver(unit, queue: effectQueues[slot],
+                                                                      binding: l.effectHostBindings[token])
+    }
+
+    /// Gibt den Platz eines Effekts frei: Observer ab, Belegung beendet (verspätete Ereignisse
+    /// für ihn erreichen einen späteren Effekt auf diesem Platz nie), Platz zurück.
+    private func releaseEffectQueue(_ l: Live, token: UUID) {
+        if let t = l.effectObserverTokens.removeValue(forKey: token) {
+            plugins.removeObserver(t, from: l.effectTokens.firstIndex(of: token).flatMap { l.effects[$0] })
+        }
+        catalog.effectUnloaded(token: token)
+        l.effectHostBindings[token] = nil
+        guard let slot = l.effectQueueSlots.removeValue(forKey: token) else { return }
+        let q = effectQueue(slot)
+        q.setActive(false); q.invalidate(); q.beginOccupancy()
+        freeEffectQueues.append(slot)
+    }
+
+    // MARK: - Audio-Loop-Kanäle (v1.15.0)
+
+    /// Legt einen Audio-Loop-Kanal an (Quelle: Loop-Spieler).
+    @discardableResult
+    func addAudioLoopChannel(name: String) -> UUID? {
+        guard canAddChannel, let slot = freeSlots.popLast() else { return nil }
+        let data = InstrumentChannelData(name: name, source: .audioLoop(AudioLoopSettings()))
+        install(data, slot: slot)
+        channels.append(data)
+        updateEngineRunning()
+        onRoutingChange?(); onProjectChange?()
+        return data.id
+    }
+
+    /// Entnimmt einen Audio-Loop-Kanal samt Material (Undo von „Audio-Loop-Spur hinzufügen",
+    /// Codex M3). Rückgabe für `putAudioLoopChannel`.
+    func takeAudioLoopChannel(_ id: UUID) -> (data: InstrumentChannelData, index: Int, storage: AudioLoopStorage?)? {
+        guard let idx = channels.firstIndex(where: { $0.id == id }), channels[idx].audioLoop != nil
+        else { return nil }
+        let taken = (data: channels[idx], index: idx, storage: loops.assets[id])
+        removeChannel(id)
+        return taken
+    }
+
+    /// Setzt einen entnommenen Audio-Loop-Kanal mit derselben Identität und demselben
+    /// Material wieder ein (Redo).
+    func putAudioLoopChannel(_ data: InstrumentChannelData, index: Int, storage: AudioLoopStorage?) {
+        guard channel(data.id) == nil, canAddChannel, let slot = freeSlots.popLast() else { return }
+        install(data, slot: slot)
+        channels.insert(data, at: min(index, channels.count))
+        loops.put(storage, for: data.id)
+        updateEngineRunning()
+        onRoutingChange?(); onProjectChange?()
+    }
+
+    /// Verbindet Gain → (Gate nach dem Fader) → Kanal-Mixer.
+    private func wireFader(_ l: Live) {
+        guard let e = engineStorage else { return }
+        let format = mixFormat()
+        if let gp = l.gatePost {
+            e.connect(l.gain, to: gp, format: format)
+            e.connect(gp, to: l.mixer, format: format)
+        } else {
+            e.connect(l.gain, to: l.mixer, format: format)
+        }
+    }
+
+    /// Quelle des Kanals: rendert Mithören und Loop des Kerns dieses Slots.
+    private func installLoopSource(_ l: Live) {
+        let e = engine()
+        if let old = l.source { e.detach(old) }
+        let format = mixFormat() ?? AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+        let sr = format.sampleRate
+        let core = loops.cores[l.slot]
+        let node = AVAudioSourceNode(format: format) { _, timestamp, frameCount, abl -> OSStatus in
+            let list = UnsafeMutableAudioBufferListPointer(abl)
+            guard list.count > 0, let lp = list[0].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+            let rp = list.count > 1 ? (list[1].mData?.assumingMemoryBound(to: Float.self) ?? lp) : lp
+            let ts = timestamp.pointee
+            let host = ts.mFlags.contains(.hostTimeValid) ? ts.mHostTime : 0
+            let rate = ts.mFlags.contains(.rateScalarValid) ? ts.mRateScalar : 1
+            core._withUnsafeGuaranteedRef {
+                $0.renderOutput(host: host, frames: Int(frameCount), sampleRate: sr, rateScalar: rate,
+                                l: lp, r: rp)
+            }
+            return noErr
+        }
+        e.attach(node)
+        l.source = node
+        rewire(l)
+    }
+
+    /// Einstellungen eines Audio-Loop-Kanals ändern (Länge nur, solange der Loop leer ist).
+    func setAudioLoopSettings(_ s: AudioLoopSettings, for id: UUID) {
+        guard let old = channel(id)?.audioLoop, old != s else { return }
+        var new = s; new.clamp()
+        if new.bars != old.bars, loopCore(for: id)?.hasMaterial == true { new.bars = old.bars }
+        mutate(id) { $0.audioLoop = new }
+        loops.configure(id, new)
+        loops.updateInputNeeded()
+        loops.kickDisplays()
+    }
+
+    /// Setzt das Gate an einem Ort (Pre/Post) ein, stellt es ein oder nimmt es heraus.
+    private func setGate(_ position: GatePosition, _ g: GateSettings, in l: Live) {
+        let wanted = g.position == position
+        let current = position == .preFader ? l.gatePre : l.gatePost
+        if let unit = current {
+            if wanted { (unit.auAudioUnit as? GateAudioUnit)?.control.apply(g, enabled: true); return }
+            removeGate(position, from: l)
+            return
+        }
+        guard wanted else { return }
+        // Eigene, im Prozess registrierte Komponente: synchron anlegen (kein Ladeauftrag).
+        let unit = AVAudioUnitEffect(audioComponentDescription: GateAudioUnit.componentDescription)
+        (unit.auAudioUnit as? GateAudioUnit)?.control.apply(g, enabled: true)
+        let e = engine()
+        e.attach(unit)
+        if position == .preFader {
+            l.gatePre = unit
+            rewire(l)
+        } else {
+            removeMeterTap(l)
+            e.disconnectNodeOutput(l.gain)
+            l.gatePost = unit
+            wireFader(l)
+            installMeterTap(l)
+            adoptNewNodes([unit])
+        }
+    }
+
+    private func removeGate(_ position: GatePosition, from l: Live) {
+        guard let e = engineStorage else { return }
+        if position == .preFader, let unit = l.gatePre {
+            e.disconnectNodeOutput(unit)
+            l.gatePre = nil
+            e.detach(unit)
+            rewire(l)
+        } else if position == .postFader, let unit = l.gatePost {
+            removeMeterTap(l)
+            e.disconnectNodeOutput(l.gain)
+            e.disconnectNodeOutput(unit)
+            l.gatePost = nil
+            e.detach(unit)
+            wireFader(l)
+            installMeterTap(l)
+        }
+    }
+
+    // Aufnahme, Material, Transport, Latenzmessung, Speichern: `AudioLoopController`.
+
+    /// Scharfschalten (true) oder Aufnahme beenden (false).
+    func setLoopRecording(_ on: Bool, for id: UUID, bpm: Double, quartersPerBar: Double = 4) {
+        loops.setRecording(on, for: id, bpm: bpm, quartersPerBar: quartersPerBar)
+    }
+    /// Undo/Redo des letzten Durchlaufs (Rückgabe für den versionsgebundenen Dokument-Undo).
+    @discardableResult
+    func undoLoop(_ id: UUID) -> (old: AudioLoopStorage, new: AudioLoopStorage)? { loops.undo(id) }
+    /// Löscht das Material (nur im Ruhezustand). Rückgabe: der gelöste Speicher (für Undo).
+    @discardableResult
+    func clearLoop(_ id: UUID) -> AudioLoopStorage? { loops.clear(id) }
+    /// Versionsgebundener Tausch des Materials (Dokument-Undo, Codex M2).
+    @discardableResult
+    func exchangeLoop(_ id: UUID, expected: AudioLoopStorage?, with new: AudioLoopStorage?,
+                      keepUndo: Bool) -> Bool {
+        loops.exchange(id, expected: expected, with: new, keepUndo: keepUndo)
+    }
+
+    /// Transport angehalten: Anker stoppen (zur Host-Zeit `at`, Standard jetzt), alle
+    /// Aufnahmen beenden.
+    func transportStopped(at host: UInt64 = mach_absolute_time(), session: UInt32? = nil) {
+        hostSync.stop(at: host, session: session)   // Songende hat der Tick schon gesetzt (A17-01)
+        loops.transportStopped(at: host)
+    }
+    func transportStarted() { loops.transportStarted() }
+
+    static var probeTimeout: TimeInterval { AudioLoopController.probeTimeout }
+    func measureLoopLatency(_ id: UUID) { loops.measureLatency(id) }
+    func updateInputNeeded() { loops.updateInputNeeded() }
+
+    func loopFiles() -> [AudioLoopFile]? { loops.files() }
+    func loopSaveJobs() -> [(id: UUID, job: AudioLoopAssets.SaveJob)] { loops.saveJobs() }
+    func adoptEncodedLoop(_ file: AudioLoopFile, storage: AudioLoopStorage, version: Int, for id: UUID) {
+        loops.adoptEncoded(file, storage: storage, version: version, for: id)
+    }
+    @discardableResult
+    func restoreLoops(_ files: [AudioLoopFile]) -> Int { loops.restore(files) }
+    func loopWaveform(_ id: UUID, buckets: Int) -> [AudioLoopDisplay.WaveBucket] { loops.waveform(id, buckets: buckets) }
+    func loopFrames(_ id: UUID) -> Int { loops.frames(id) }
 
     // MARK: - Test-Zugang
 
     #if DEBUG
+    /// Bindet Material ohne Aufnahme (Tests).
+    func _setLoopStorage(_ st: AudioLoopStorage, for id: UUID) { loops._setStorage(st, for: id) }
     func _liveInstrument(_ id: UUID) -> AVAudioUnit? { live[id]?.instrument }
+    /// Gain-Stufe des Kanals (Tap vor Stumm/Panorama, Messungen).
+    func _liveGain(_ id: UUID) -> AVAudioNode? { live[id]?.gain }
+    /// Neu gesetzte Host-Blöcke des Instruments seit dem Laden (Diagnose).
+    func _instrumentHostReinstalls(_ id: UUID) -> Int? {
+        live[id]?.hostBinding?.reinstalls.load(ordering: .relaxed)
+    }
+    /// Renderdurchläufe des Instruments (Vor-Render-Observer) — belegt, dass es rendert.
+    func _instrumentPreRenders(_ id: UUID) -> Int? {
+        live[id].map { queue($0.slot).preRenders.load(ordering: .relaxed) }
+    }
+    func _liveEffect(_ id: UUID, at i: Int) -> AVAudioUnit? {
+        guard let l = live[id], l.effects.indices.contains(i) else { return nil }
+        return l.effects[i]
+    }
     var _engineIsRunning: Bool { engineStorage?.isRunning ?? false }
+    var _engineStarts: Int { graph.starts }
+    /// Renderressourcen der Kanalknoten (Diagnose): Instrument, Gain, Mixer.
+    func _allocation(_ id: UUID) -> String {
+        guard let l = live[id] else { return "-" }
+        func f(_ n: AVAudioNode?) -> String { n.map { $0.auAudioUnit.renderResourcesAllocated ? "1" : "0" } ?? "n" }
+        return "inst \(f(l.instrument)) gain \(f(l.gain)) mix \(f(l.mixer))"
+    }
     /// Tatsächlich anliegender Kanalpegel als linearer Gain (Gain-Stufe × Stumm/Solo).
     func _liveOutputVolume(_ id: UUID) -> Float? {
         live[id].map { $0.mixer.outputVolume * powf(10, $0.gain.globalGain / 20) }
     }
     func _stopEngineBehindTheRacksBack() { engineStorage?.stop() }
-    func _watchdogTick() { watchdogLastRecovery = .distantPast; watchdogTick() }
+    func _watchdogTick() { watchdog._tickIgnoringLockout() }
     /// Ersetzt das Laden von Plug-ins: der Test bekommt den Abschluss und ruft ihn selbst auf.
-    var _instantiateOverride: ((PluginRef, @escaping (AVAudioUnit?) -> Void) -> Void)?
+    var _instantiateOverride: ((PluginRef, @escaping (AVAudioUnit?) -> Void) -> Void)? {
+        get { plugins._instantiateOverride }
+        set { plugins._instantiateOverride = newValue }
+    }
     /// Setzt das Instrument eines Kanals ohne Laden auf „bereit" (Parameterbindungs-Tests).
     func _markInstrumentReady(_ id: UUID, as ref: PluginRef) {
         guard let idx = channels.firstIndex(where: { $0.id == id }) else { return }
         channels[idx].instrument = ref
         instrumentStatus[id] = .ready
     }
-    func _setParameters(_ list: [ParameterInfo], for id: UUID) { live[id]?.parameterCache = list }
+    func _setParameters(_ list: [ParameterInfo], for id: UUID) { catalog._setInstrumentParameters(list, for: id) }
+    /// Hängt einen Effekt ohne Laden an und meldet ihn bereit, mit Warteschlange und
+    /// Parametern (Effekt-Ziel-Tests). Liefert seinen Platz im Block `effectQueues`.
+    @discardableResult
+    func _addReadyEffect(_ ref: PluginRef, parameters list: [ParameterInfo], to id: UUID) -> Int? {
+        guard let idx = channels.firstIndex(where: { $0.id == id }), let l = live[id] else { return nil }
+        let token = UUID()
+        channels[idx].effects.append(ref)
+        l.effects.append(nil); l.effectTokens.append(token)
+        reserveEffectQueue(l, token: token)
+        catalog._setEffectParameters(list, token: token)
+        effectStatus[id, default: []].append(.ready)
+        return l.effectQueueSlots[token]
+    }
+    var _freeEffectQueueCount: Int { freeEffectQueues.count }
     func _editorWindow(_ id: UUID, effect index: Int?) -> NSWindow? {
         guard let l = live[id] else { return nil }
-        guard let index else { return l.instrumentWindow }
-        return l.effectTokens.indices.contains(index) ? l.effectWindows[l.effectTokens[index]] : nil
+        guard let index else { return plugins.window(.instrument(id)) }
+        return l.effectTokens.indices.contains(index) ? plugins.window(.effect(l.effectTokens[index])) : nil
     }
     #endif
+}
+
+// MARK: - Lesezugang des Parameterkatalogs (v1.18.0)
+
+extension InstrumentRack: ParameterCatalogHost {
+    func catalogChannel(_ id: UUID) -> InstrumentChannelData? { channel(id) }
+    func catalogInstrument(_ id: UUID) -> (unit: AVAudioUnit?, ready: Bool) {
+        (live[id]?.instrument, instrumentStatus[id] == .ready)
+    }
+    func catalogEffects(_ id: UUID) -> [(token: UUID, unit: AVAudioUnit?, ready: Bool)] {
+        guard let l = live[id] else { return [] }
+        let st = effectStatus[id] ?? []
+        return l.effectTokens.enumerated().map { i, t in
+            (t, l.effects.indices.contains(i) ? l.effects[i] : nil, st.indices.contains(i) && st[i] == .ready)
+        }
+    }
+    func catalogEffectQueue(_ id: UUID, token: UUID) -> (slot: Int, epoch: UInt32)? {
+        guard let slot = live[id]?.effectQueueSlots[token] else { return nil }
+        return (slot, effectQueue(slot).occupancyEpoch)
+    }
+}
+
+// MARK: - Zugang der Loop-Steuerung (v1.18.4)
+
+extension InstrumentRack: AudioLoopHost {
+    var loopChannels: [(id: UUID, settings: AudioLoopSettings)] {
+        channels.compactMap { c in c.audioLoop.map { (c.id, $0) } }
+    }
+    var loopSampleRate: Double? { mixFormat()?.sampleRate }
+    var loopOutputRunning: Bool { graph.isRunning }
+    var loopOutputLatencyFrames: Int {
+        if graph.isRunning, let id = AudioDevices.current(of: engineStorage?.outputNode.audioUnit) {
+            return AudioDevices.latencyFrames(id, input: false)
+        }
+        return AudioInputEngine.deviceLatency(scope: kAudioDevicePropertyScopeOutput,
+                                              selector: kAudioHardwarePropertyDefaultOutputDevice)
+    }
+    func loopConfigured(_ id: UUID, _ settings: AudioLoopSettings) {
+        guard let l = live[id] else { return }
+        setGate(.preFader, settings.gate, in: l)
+        setGate(.postFader, settings.gate, in: l)
+        updateRouteLatencies()
+    }
+    func loopSettingsMeasured(_ settings: AudioLoopSettings, for id: UUID) { setAudioLoopSettings(settings, for: id) }
+    func loopProjectChanged() { onProjectChange?() }
 }

@@ -19,7 +19,6 @@ struct CCLaneHeaderView: View {
     var accentColor:  Color
     @Binding var drawMode: Bool
     var onDelete:     (() -> Void)?
-    var onDuplicate:  (() -> Void)?
 
     @Environment(\.undoManager) private var undoManager
     @EnvironmentObject private var engine: SequencerEngine
@@ -29,10 +28,8 @@ struct CCLaneHeaderView: View {
     private var s: Str { Str(lang) }
     private func tip(_ t: String) -> String { showTooltips ? t : "" }
 
-    @FocusState private var nameFocused: Bool
     @FocusState private var labelFocused: Bool
     @FocusState private var numberFocused: Bool
-    @State private var nameEdit:   String = ""
     @State private var labelEdit:  String = ""
     @State private var numberEdit: String = ""
     private let writer = ModelWriter()
@@ -53,57 +50,9 @@ struct CCLaneHeaderView: View {
             HStack(spacing: 4) {
                 if onDelete != nil { Spacer().frame(width: 14) }
                 Circle().fill(accentColor).frame(width: 6, height: 6)
-                TextField(s.namePlaceholder, text: $nameEdit)
-                    .font(VintageTheme.monoBold)
-                    .foregroundColor(accentColor)
-                    .textFieldStyle(.plain)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 2)
-                    .background(GlassDisplayBackground(cornerRadius: 3))   // GUI-01: versenktes Namensfeld
-                    .focused($nameFocused)
-                    .onChange(of: nameFocused) { _, focused in
-                        if focused {
-                            nameEdit = track.name
-                        } else {
-                            let old = track.name
-                            guard nameEdit != old else { return }
-                            writer.apply(.setName(trackID: track.id, old: old, new: nameEdit),
-                                         to: track.data, undoManager: undoManager)
-                        }
-                    }
-                    .onChange(of: track.name) { _, ext in
-                        if !nameFocused { nameEdit = ext }
-                    }
-                    .onAppear { nameEdit = track.name }
-                    .onSubmit { nameFocused = false }
+                TrackNameField(track: track, accentColor: accentColor, placeholder: s.namePlaceholder)
 
-                Button(track.isMuted ? "M" : "m") {
-                    writer.apply(.setMuted(trackID: track.id,
-                                           old: track.isMuted,
-                                           new: !track.isMuted),
-                                 to: track.data, undoManager: nil)
-                }
-                .buttonStyle(VintageSmallButtonStyle(isActive: track.isMuted, accent: .orange))
-
-                Button(track.isSolo ? "S" : "s") {
-                    writer.apply(.setSolo(trackID: track.id,
-                                          old: track.isSolo,
-                                          new: !track.isSolo),
-                                 to: track.data, undoManager: nil)
-                }
-                .buttonStyle(VintageSmallButtonStyle(isActive: track.isSolo,
-                    accent: Color(red: 0.9, green: 0.9, blue: 0.1)))
-
-                if let onDuplicate {
-                    Button { onDuplicate() } label: {
-                        Text("⎘")
-                            .font(.system(size: 15))
-                            .foregroundColor(VintageTheme.textSecondary)
-                    }
-                    .buttonStyle(.fullArea)
-                    .help(tip(s.duplicateTooltip))
-                }
+                TrackMuteSoloButtons(track: track, s: s, tip: tip)
             }
 
             // Row 2: direction · CH
@@ -168,7 +117,7 @@ struct CCLaneHeaderView: View {
                     .textFieldStyle(.plain)
                     .frame(width: 34)
                     .focused($numberFocused)
-                    .onChange(of: numberFocused) { _, focused in
+                    .onValueChange(of: numberFocused) { focused in
                         if focused {
                             numberEdit = "\(track.lane.ccNumber)"
                         } else {
@@ -189,7 +138,7 @@ struct CCLaneHeaderView: View {
                     .textFieldStyle(.plain)
                     .frame(maxWidth: .infinity)
                     .focused($labelFocused)
-                    .onChange(of: labelFocused) { _, focused in
+                    .onValueChange(of: labelFocused) { focused in
                         if focused {
                             labelEdit = track.lane.ccLabel
                         } else {
@@ -281,12 +230,12 @@ struct CCLaneHeaderView: View {
 
 // MARK: - CCTargetButton
 
-/// Zielwahl einer CC-Lane, die auf einen Instrumentenkanal geht: MIDI-CC oder ein Parameter
-/// des Instruments. Ohne Instrumentenkanal unsichtbar (dann gilt immer MIDI-CC).
+/// Ziel einer CC-Lane (v1.13.9; Auswahlfenster v1.17.1): MIDI-CC oder ein Parameter des
+/// Instruments oder eines Effekts im Kanal. Ohne Instrumentenkanal unsichtbar.
 ///
-/// Das Menü wird erst beim Klick aus dem Parameterbaum gebaut (AppKit-Menü): so ist es
-/// aktuell, auch wenn das Instrument nach dem Zeichnen des Kopfs fertig geladen hat, und
-/// der Kopf muss dafür das Rack nicht beobachten.
+/// Die Wahl läuft in einem Fenster: erst das Plug-in, dann der Parameter — alphabetisch,
+/// mit Suchfeld. Die Liste wird beim Öffnen aus dem Parameterbaum gelesen; der Kopf
+/// beobachtet nur das Kanalverzeichnis (Laden von Instrument/Effekten), nicht das Rack.
 struct CCTargetButton: View {
     @ObservedObject var track: TrackViewModel
     @ObservedObject var directory: ChannelDirectory
@@ -294,15 +243,16 @@ struct CCTargetButton: View {
     let s: Str
     @EnvironmentObject private var engine: SequencerEngine
     @Environment(\.undoManager) private var undoManager
+    @State private var showPicker = false
 
     var body: some View {
         if let channel = directory.entries.first(where: { $0.id == track.instrumentID }) {
             let target = track.lane.ccParameter
-            // Aufgelöst = das gebundene Instrument ist geladen und hat den Parameter. Sonst
+            // Aufgelöst = das gebundene Plug-in ist geladen und hat den Parameter. Sonst
             // sendet die Lane nichts (v1.13.13); die Taste zeigt das mit „?" und ohne Füllung.
-            let resolved = target.map { Self.isResolved($0, readyInstrument: channel.readyInstrument,
-                                                        hasParameter: engine.rack.parameterRange($0.address, in: channel.id) != nil) } ?? true
-            Button { showMenu(channelID: channel.id) } label: {
+            let resolved = target.map { engine.rack.resolveParameter($0, in: channel.id) != nil } ?? true
+            let source = target.flatMap { engine.rack.parameterSource(of: $0, in: channel.id) }
+            Button { showPicker = true } label: {
                 HStack(spacing: 2) {
                     Text(target.map { resolved ? $0.name : $0.name + " ?" } ?? "CC")
                         .font(VintageTheme.monoSmall)
@@ -329,15 +279,18 @@ struct CCTargetButton: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.fullArea)
-            .help(target.map { resolved ? s.ccTargetParameterHelp($0.name, channel.name)
+            .help(target.map { resolved ? s.ccTargetParameterHelp($0.name, "\(source?.name ?? "?") · \(channel.name)")
                                         : s.ccTargetUnresolvedHelp($0.name) } ?? s.ccTargetChooseHelp)
+            .popover(isPresented: $showPicker, arrowEdge: .bottom) {
+                CCTargetPicker(channelID: channel.id, current: target, ccNumber: track.lane.ccNumber,
+                               initialSource: source?.id ?? engine.rack.parameterSources(for: channel.id).first?.id ?? "",
+                               s: s) { new in
+                    choose(new)
+                    showPicker = false
+                }
+                .environmentObject(engine)
+            }
         }
-    }
-
-    /// Ziel auflösbar? Gebundenes Plug-in (falls vermerkt) muss das geladene sein.
-    static func isResolved(_ ref: ParameterRef, readyInstrument: String?, hasParameter: Bool) -> Bool {
-        guard let ready = readyInstrument, hasParameter else { return false }
-        return ref.component == nil || ref.component == ready
     }
 
     private func choose(_ new: ParameterRef?) {
@@ -346,61 +299,118 @@ struct CCTargetButton: View {
         ModelWriter().apply(.setCCLaneParameter(trackID: track.id, old: old, new: new),
                             to: track.data, undoManager: undoManager)
     }
+}
 
-    private func showMenu(channelID: UUID) {
-        let current = track.lane.ccParameter?.address
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.addItem(ClosureMenuItem(title: s.ccTargetMIDI(track.lane.ccNumber),
-                                     checked: current == nil) { choose(nil) })
-        menu.addItem(.separator())
-        let params = engine.rack.parameters(for: channelID)
-        if params.isEmpty {
-            let empty = NSMenuItem(title: s.ccTargetNoParameters, action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            menu.addItem(empty)
-        }
-        for section in CCTargetButton.sections(params) {
-            let target: NSMenu
-            if let title = section.title {
-                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-                let sub = NSMenu(); sub.autoenablesItems = false
-                item.submenu = sub
-                if section.items.contains(where: { $0.address == current }) { item.state = .on }
-                menu.addItem(item)
-                target = sub
-            } else { target = menu }
-            for p in section.items {
-                target.addItem(ClosureMenuItem(title: p.name, checked: p.address == current) {
-                    choose(ParameterRef(address: p.address, name: p.name,
-                                        component: engine.rack.readyInstrumentKey(channelID)))
-                })
-            }
-        }
-        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+/// Auswahlfenster des CC-Ziels: MIDI-CC, Plug-in (Instrument / Effekt n), Suche, Liste.
+struct CCTargetPicker: View {
+    let channelID: UUID
+    let current: ParameterRef?
+    let ccNumber: Int
+    let s: Str
+    let choose: (ParameterRef?) -> Void
+    @EnvironmentObject private var engine: SequencerEngine
+    @State private var sourceID: String
+    @State private var query = ""
+    @FocusState private var searchFocused: Bool
+
+    init(channelID: UUID, current: ParameterRef?, ccNumber: Int, initialSource: String, s: Str,
+         choose: @escaping (ParameterRef?) -> Void) {
+        self.channelID = channelID; self.current = current; self.ccNumber = ccNumber
+        self.s = s; self.choose = choose
+        _sourceID = State(initialValue: initialSource)
     }
 
-    struct Section: Equatable {
-        let title: String?
-        let items: [InstrumentRack.ParameterInfo]
+    var body: some View {
+        let sources = engine.rack.parameterSources(for: channelID)
+        let source = sources.first { $0.id == sourceID } ?? sources.first
+        VStack(alignment: .leading, spacing: 8) {
+            Button(s.ccTargetMIDI(ccNumber)) { choose(nil) }
+                .buttonStyle(VintageSmallButtonStyle(isActive: current == nil))
+            if let source {
+                Picker(s.ccTargetPlugin, selection: $sourceID) {
+                    ForEach(sources) { Text(title($0)).tag($0.id) }
+                }
+                .font(VintageTheme.monoSmall)
+                TextField(s.ccTargetSearch, text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($searchFocused)
+                list(for: source)
+            } else {
+                Text(s.ccTargetNoPlugins)
+                    .font(VintageTheme.monoSmall).foregroundColor(VintageTheme.textSecondary)
+            }
+        }
+        .padding(12)
+        .frame(width: 340)
+        .onAppear { searchFocused = true }
     }
 
-    /// Gliedert die Parameterliste für das Menü: nach den Gruppen des Plug-ins, wenn es welche
-    /// hat; sonst bis 40 Einträge flach, darüber in Blöcken zu 40 („1–40", „41–80", …).
-    static func sections(_ params: [InstrumentRack.ParameterInfo], chunk: Int = 40) -> [Section] {
-        guard !params.isEmpty else { return [] }
-        if params.contains(where: { !$0.group.isEmpty }) {
-            var order: [String] = []; var byGroup: [String: [InstrumentRack.ParameterInfo]] = [:]
-            for p in params {
-                if byGroup[p.group] == nil { order.append(p.group) }
-                byGroup[p.group, default: []].append(p)
+    private func title(_ src: InstrumentRack.ParameterSource) -> String {
+        let base = src.effectIndex.map { s.ccTargetEffect($0 + 1, src.name) } ?? s.ccTargetInstrument(src.name)
+        return src.ready ? base : base + " — " + s.ccTargetNotLoaded
+    }
+
+    @ViewBuilder
+    private func list(for source: InstrumentRack.ParameterSource) -> some View {
+        let all = engine.rack.parameters(for: channelID, source: source)
+        let shown = Self.filtered(all, query: query)
+        if !source.ready {
+            note(s.ccTargetNotLoaded)
+        } else if all.isEmpty {
+            note(s.ccTargetNoParameters)
+        } else if shown.isEmpty {
+            note(s.ccTargetNoMatch)
+        } else {
+            Text(s.ccTargetCount(shown.count, all.count))
+                .font(.system(size: 9, design: .monospaced)).foregroundColor(VintageTheme.textDim)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(shown) { p in row(p, source: source) }
+                }
             }
-            return order.map { Section(title: $0.isEmpty ? nil : $0, items: byGroup[$0] ?? []) }
+            .frame(height: 320)
         }
-        if params.count <= chunk { return [Section(title: nil, items: params)] }
-        return stride(from: 0, to: params.count, by: chunk).map { start in
-            let end = min(start + chunk, params.count)
-            return Section(title: "\(start + 1)–\(end)", items: Array(params[start..<end]))
+    }
+
+    private func row(_ p: InstrumentRack.ParameterInfo, source: InstrumentRack.ParameterSource) -> some View {
+        let ref = InstrumentRack.parameterRef(p, of: source)
+        let selected = current.map { $0.address == ref.address && $0.component == ref.component && $0.effect == ref.effect } ?? false
+        return Button { choose(ref) } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark").font(.system(size: 9, weight: .bold))
+                    .opacity(selected ? 1 : 0)
+                Text(p.name).font(VintageTheme.monoSmall).foregroundColor(VintageTheme.textPrimary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if !p.group.isEmpty {
+                    Text(p.group).font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(VintageTheme.textDim).lineLimit(1)
+                }
+            }
+            .padding(.vertical, 3).padding(.horizontal, 4)
+            .background(selected ? Color.white.opacity(0.08) : .clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.fullArea)
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text).font(VintageTheme.monoSmall).foregroundColor(VintageTheme.textSecondary)
+    }
+
+    /// Alphabetisch (natürliche Zahlenfolge: „Osc 2" vor „Osc 10"), bei gleichem Namen nach
+    /// Gruppe. Suche: jedes Wort muss in Name oder Gruppe vorkommen (ohne Groß-/Klein- und
+    /// Akzentunterschied).
+    static func filtered(_ params: [InstrumentRack.ParameterInfo], query: String) -> [InstrumentRack.ParameterInfo] {
+        let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        let hits = words.isEmpty ? params : params.filter { p in
+            words.allSatisfy { p.name.range(of: $0, options: opts) != nil || p.group.range(of: $0, options: opts) != nil }
+        }
+        return hits.sorted {
+            let c = $0.name.localizedStandardCompare($1.name)
+            return c == .orderedSame ? $0.group.localizedStandardCompare($1.group) == .orderedAscending
+                                     : c == .orderedAscending
         }
     }
 }

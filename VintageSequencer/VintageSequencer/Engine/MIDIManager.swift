@@ -36,10 +36,14 @@ class MIDIManager: ObservableObject {
     @Published var selectedInput:  MIDIEndpointRef = 0
 
     // Callbacks — called from the MIDI read thread (clock pulse) or main thread
-    var onClockPulse:        (() -> Void)?
+    /// 0xF8 mit der Host-Zeit des Pakets (CoreMIDI-Empfangszeitstempel; 0 → jetzt). Läuft
+    /// direkt auf dem MIDI-Read-Thread.
+    var onClockPulse:        ((UInt64) -> Void)?
     var onStart:             (() -> Void)?
     var onStop:              (() -> Void)?
     var onContinue:          (() -> Void)?
+    /// 0xFA/0xFB direkt auf dem MIDI-Read-Thread, vor der Main-Zustellung (v1.15.2). RT-Pflicht.
+    var onStartRT:           (() -> Void)?
     var onCC:                ((Int, Int, Int) -> Void)?   // (channel 1-16, ccNumber, value)
     var onNoteOn:            ((Int, Int, Int) -> Void)?   // (channel 1-16, note, velocity)
     /// C1: Wird aufgerufen (Main-Thread) wenn das aktuell gewählte Output-Device entfernt wird.
@@ -218,6 +222,11 @@ class MIDIManager: ObservableObject {
         sendRTSafe(0xFA, count: 1, at: timestamp)
     }
 
+    /// RT-SAFE: MIDI-Stop (0xFC) mit Future-Timestamp — Songende aus dem Tick (v1.16.1).
+    func sendStopRT(at timestamp: MIDITimeStamp) {
+        sendRTSafe(0xFC, count: 1, at: timestamp)
+    }
+
     /// Löscht alle noch ausstehenden Future-Timestamp-Events aus der CoreMIDI-Queue.
     /// Muss beim Stop aufgerufen werden, damit geplante Note-Offs nicht nach dem
     /// Stoppen noch feuern.
@@ -252,13 +261,15 @@ class MIDIManager: ObservableObject {
             .assumingMemoryBound(to: MIDIEventPacket.self)
 
         for i in 0..<numPackets {
+            let stamp = pktPtr.pointee.timeStamp
+            let packetTime = stamp != 0 ? stamp : mach_absolute_time()
             let wordCount = min(Int(pktPtr.pointee.wordCount), 64)   // clamp: guard against corrupt data
             for w in 0..<wordCount {
                 // Read each UMP word inline — no heap allocation.
                 let word: UInt32 = withUnsafeBytes(of: pktPtr.pointee.words) {
                     $0.load(fromByteOffset: w * 4, as: UInt32.self)
                 }
-                handleUMPWord(word)
+                handleUMPWord(word, time: packetTime)
             }
             // Do not advance past the last packet (undefined memory beyond list end).
             if i < numPackets - 1 {
@@ -269,7 +280,7 @@ class MIDIManager: ObservableObject {
 
     /// Parses one Universal MIDI Packet (UMP) word and dispatches to the appropriate callback.
     /// MIDI 1.0 protocol: all channel voice and real-time messages are single-word packets.
-    private func handleUMPWord(_ word: UInt32) {
+    private func handleUMPWord(_ word: UInt32, time: UInt64) {
         // UMP message type occupies the top 4 bits.
         let msgType = UInt8((word >> 28) & 0x0F)
 
@@ -277,9 +288,9 @@ class MIDIManager: ObservableObject {
         case 0x1:   // System Real-Time / System Common — 1 word
             let status = UInt8((word >> 16) & 0xFF)
             switch status {
-            case 0xF8: onClockPulse?()   // called directly — clock timing is latency-sensitive
-            case 0xFA: DispatchQueue.main.async { [weak self] in self?.onStart?() }
-            case 0xFB: DispatchQueue.main.async { [weak self] in self?.onContinue?() }
+            case 0xF8: onClockPulse?(time)   // direkt — Zeitbezug ist der Paketzeitstempel
+            case 0xFA: onStartRT?(); DispatchQueue.main.async { [weak self] in self?.onStart?() }
+            case 0xFB: onStartRT?(); DispatchQueue.main.async { [weak self] in self?.onContinue?() }
             case 0xFC: DispatchQueue.main.async { [weak self] in self?.onStop?() }
             default:   break   // SysEx common, MTC, SPP, etc. — not used, silently ignored
             }

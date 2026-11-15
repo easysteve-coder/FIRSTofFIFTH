@@ -27,14 +27,17 @@ struct GUI01SceneRenderTests {
         return engine
     }
 
-    private func render<V: View>(_ view: V, size: CGSize, name: String) -> Bool {
+    /// Wartet durch Suspendieren (v1.16.1): ein verschachtelter RunLoop in einem Main-Job
+    /// arbeitet die Main-Queue nicht ab und hielt Main über alle Szenen hinweg fest — parallele
+    /// Tests, die Main brauchen, liefen in ihre Timeouts (RT3b, S01).
+    private func render<V: View>(_ view: V, size: CGSize, name: String) async -> Bool {
         let host = NSHostingView(rootView: view)
         let win = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                            styleMask: [.borderless], backing: .buffered, defer: false)
         win.contentView = host
         host.frame = NSRect(origin: .zero, size: size)
         host.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.4))      // SwiftUI-Layout/onAppear abwarten
+        try? await Task.sleep(nanoseconds: 400_000_000)             // SwiftUI-Layout/onAppear abwarten
         host.layoutSubtreeIfNeeded()
         defer { win.contentView = nil }
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return false }
@@ -61,7 +64,7 @@ struct GUI01SceneRenderTests {
             .preferredColorScheme(.dark)
     }
 
-    @Test func renderMainViewScenes() {
+    @Test func renderMainViewScenes() async {
         let notes = NotesStore()
         // GUI-01-R1: 920/1600 pt × DE/EN × WIDTH 30/120 (Vergleichsmatrix für Plattenhöhe und Produktnamen)
         var configs: [(String, String, CGSize, Double)] = []
@@ -77,28 +80,48 @@ struct GUI01SceneRenderTests {
             engine.stepWidthState.size = width
             engine.midiLearnState.learnMode = true                   // Learn-Ziel sichtbar machen
             engine.setLearnTarget(track: 0, step: 3)
-            #expect(render(mainView(engine, notes: notes), size: size, name: name), "Render \(name)")
+            #expect(await render(mainView(engine, notes: notes), size: size, name: name), "Render \(name)")
         }
         UserDefaults.standard.removeObject(forKey: "appLanguage")
     }
 
-    /// Pad-Spur (v1.13.19): eigene Optik, eigene Breite, Längenetikett — Bild für den Menschen.
-    @Test func renderPadTrackScene() {
+    /// Lange Steps (v1.13.19 Pad-Spur, v1.18.29 normale Spur): eigene Optik, eigene Breite,
+    /// Längenetikett — Bild für den Menschen.
+    @Test func renderPadTrackScene() async {
         let notes = NotesStore()
         let engine = scene(lang: "de")
-        let pad = engine.addTrack(kind: .step, pad: true).first!.track
+        let pad = engine.addTrack(kind: .step).first!.track
+        pad.lane.stepCount = 4; pad.lane.stepLengthNumerator = 16; pad.lane.rndMode = .chords
         pad.colorIndex = 3
         UserDefaults.standard.set("epic", forKey: SequencerEngine.padChordFamilyKey)
         engine.randomize(track: pad)
         UserDefaults.standard.removeObject(forKey: SequencerEngine.padChordFamilyKey)
-        pad.lane.padWidth = 3
+        pad.lane.stepWidth = 3
         pad.lane.steps[3].isHold = true
         engine.stepWidthState.size = 54
-        #expect(render(mainView(engine, notes: notes), size: CGSize(width: 1600, height: 1400), name: "pad-de"))
+        #expect(await render(mainView(engine, notes: notes), size: CGSize(width: 1600, height: 1400), name: "pad-de"))
         UserDefaults.standard.removeObject(forKey: "appLanguage")
     }
 
-    @Test func renderSongScene() {
+    @Test func renderAudioLoopScene() async throws {
+        let notes = NotesStore()
+        let engine = scene(lang: "de")
+        let td = try #require(engine.addAudioLoopTrack().first { $0.pattern === engine.currentPattern }?.track)
+        let ch = try #require(td.instrumentID)
+        let st = try #require(AudioLoopStorage(bars: 4, sampleRate: 48_000, bpm: 120))
+        for i in 0..<st.frames {
+            let env = Float(i % st.barFrames) / Float(st.barFrames)
+            st.left[i] = (1 - env) * 0.8 * sinf(Float(i) * 0.05); st.right[i] = st.left[i]
+        }
+        engine.rack._setLoopStorage(st, for: ch)
+        var s = try #require(engine.rack.channel(ch)?.audioLoop)
+        s.monitor = true; s.gate.position = .input
+        engine.rack.setAudioLoopSettings(s, for: ch)
+        #expect(await render(mainView(engine, notes: notes), size: CGSize(width: 1600, height: 1800), name: "loop-de"))
+        UserDefaults.standard.removeObject(forKey: "appLanguage")
+    }
+
+    @Test func renderSongScene() async {
         let notes = NotesStore()
         let engine = scene(lang: "de")
         engine.replaceSong(Song(scenes: [SongScene(pattern: 0, bars: 4), SongScene(pattern: 1, bars: 8),
@@ -108,11 +131,11 @@ struct GUI01SceneRenderTests {
         engine.songState.playingScene = 1
         engine.currentPatternIndex = 1
         engine.transportState.queuedPatternIndex = 0
-        #expect(render(mainView(engine, notes: notes), size: CGSize(width: 1600, height: 900), name: "song-de"))
+        #expect(await render(mainView(engine, notes: notes), size: CGSize(width: 1600, height: 900), name: "song-de"))
         UserDefaults.standard.removeObject(forKey: "appLanguage")
     }
 
-    @Test func renderStepButtonStates() {
+    @Test func renderStepButtonStates() async {
         let engine = scene(lang: "en")
         let track = engine.viewModel(for: engine.currentPattern.tracks[0])
         engine.midiLearnState.learnMode = true
@@ -127,7 +150,7 @@ struct GUI01SceneRenderTests {
         }
         .padding(16).background(VintageTheme.panel)
         .environmentObject(engine).environmentObject(engine.midiLearnState)
-        #expect(render(row, size: CGSize(width: 420, height: 90), name: "steps"), "Render steps")
+        #expect(await render(row, size: CGSize(width: 420, height: 90), name: "steps"), "Render steps")
         UserDefaults.standard.removeObject(forKey: "appLanguage")
     }
 }

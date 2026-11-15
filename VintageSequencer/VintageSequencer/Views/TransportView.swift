@@ -11,20 +11,15 @@ struct TransportView: View {
     @AppStorage("showMixer") private var showMixer: Bool = false
     @State private var showQuickCapture = false
     @State private var showNotesReader  = false
-    @State private var tapTimes: [Date] = []
 
     @AppStorage("showTooltips")  private var showTooltips: Bool   = true
     @AppStorage("appLanguage")   private var lang:         String = "en"
     private var s: Str { Str(lang) }
     private func tip(_ text: String) -> String { showTooltips ? text : "" }
 
-    /// GUI-01-R1: gemeinsame sichtbare Außenhöhe der drei hellen Transportplatten (BPM/SWING/WIDTH).
+    /// GUI-01-R1: gemeinsame Außenhöhe von Positionsanzeige und SWING-Platte (BPM-Platte seit v1.18.22 in der Anzeige).
     private static let plateHeight: CGFloat = 84
 
-    private var bpmBinding: Binding<Double> {
-        Binding(get: { ts.bpm },
-                set: { engine.setBPM($0) })
-    }
     // Maps internal 50–75 range to display 0–100%
     private var swingBinding: Binding<Double> {
         Binding(
@@ -114,48 +109,10 @@ struct TransportView: View {
 
             sep
 
-            // ── BPM: Knopf + Anzeigeglas + TAP auf hellem Aluminium (GUI-01) ──
-            MetalPlate(tone: .lightAluminium, cornerRadius: 6) {
-                HStack(spacing: 0) {
-                    KnobView(label: "BPM", value: bpmBinding,
-                             range: 20...300, size: 48,
-                             accentColor: VintageTheme.amber, onLight: true, showsValue: false,
-                             resetValue: 120)
-                        .fixedSize()                 // Label unter dem Knopf nie auf „…“ kürzen
-                        .padding(.horizontal, 2)
-
-                    VStack(spacing: 2) {
-                        Button("▲") { engine.setBPM(ts.bpm + 1) }
-                            .buttonStyle(.fullArea)
-                            .fixedSize()
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(Mat.inkOnLightSecondary)
-
-                        Text(String(format: "%.1f", ts.bpm))
-                            .font(VintageTheme.monoLarge)
-                            .foregroundColor(VintageTheme.textAmber)
-                            .frame(width: 46)
-                            .padding(.vertical, 2)
-                            .background(GlassDisplayBackground())
-                            .monospacedDigit()
-
-                        Button("▼") { engine.setBPM(ts.bpm - 1) }
-                            .buttonStyle(.fullArea)
-                            .fixedSize()
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(Mat.inkOnLightSecondary)
-                    }
-                    .padding(.trailing, 3)
-
-                    Button("TAP") { tapTempo() }
-                        .buttonStyle(VintageSmallButtonStyle(isActive: false, accent: VintageTheme.amber))
-                        .fixedSize()                 // bei Mindestbreite nicht auf einen Streifen quetschen
-                        .padding(.trailing, 4)
-                        .help(tip(s.tapTempoTooltip))
-                }
+            // ── Position, Taktart, Tempo wie in Logic (v1.18.21/22) ───────
+            PositionDisplayView(hostSync: engine.rack.hostSync)
                 .frame(height: Self.plateHeight)
-            }
-            .padding(.horizontal, 2)
+                .padding(.horizontal, 6)
 
             sep
 
@@ -175,10 +132,22 @@ struct TransportView: View {
 
             // ── Patterns ──────────────────────────────────────────────────
             VStack(spacing: 3) {
-                Text("PATTERN")
-                    .font(VintageTheme.monoSmall)
-                    .foregroundColor(VintageTheme.textSecondary)
-                    .fixedSize()
+                // Wechsel ohne Song: nächster Taktstrich oder Ende Spur 1 (v1.18.24, E3).
+                MenuKey(menu: {
+                    .of([NSMenuItem.note(s.patternSwitchMenu),
+                         ClosureMenuItem(title: s.patternSwitchOnBar, checked: ts.switchOnBar) {
+                             engine.setSwitchOnBarUndoable(true, actionName: s.patternSwitchMenu)
+                         },
+                         ClosureMenuItem(title: s.patternSwitchTrack1, checked: !ts.switchOnBar) {
+                             engine.setSwitchOnBarUndoable(false, actionName: s.patternSwitchMenu)
+                         }])
+                }) {
+                    Text("PATTERN " + (ts.switchOnBar ? "▸|" : "▸1"))
+                        .font(VintageTheme.monoSmall)
+                        .foregroundColor(VintageTheme.textSecondary)
+                }
+                .fixedSize()
+                .help(tip(s.patternSwitchHelp))
                 // 16 Patterns (v1.14.0) in zwei Reihen A–H / I–P.
                 VStack(spacing: 2) {
                     ForEach(0..<2, id: \.self) { row in
@@ -339,17 +308,6 @@ struct TransportView: View {
         }
         .frame(height: 52)
         .padding(.horizontal, 1)
-    }
-
-    private func tapTempo() {
-        let now = Date()
-        tapTimes.append(now)
-        tapTimes = tapTimes.filter { now.timeIntervalSince($0) < 3.0 }
-        guard tapTimes.count >= 2 else { return }
-        let intervals = zip(tapTimes, tapTimes.dropFirst())
-            .map { $1.timeIntervalSince($0) }
-        let avg = intervals.reduce(0, +) / Double(intervals.count)
-        engine.setBPM((60.0 / avg).clamped(to: 20...300))
     }
 }
 

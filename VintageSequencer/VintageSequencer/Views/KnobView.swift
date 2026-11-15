@@ -131,13 +131,16 @@ struct GateKnobView: View {
     @Environment(\.knobEditingChanged) private var editingChanged
     @Binding var gate: Double
     var accentColor: Color
+    /// Länge eines Steps der Spur in Sechzehnteln (`stepLengthNumerator / …Denominator`):
+    /// die Stufen zeigen echte Notenlängen (v1.17.1; vorher immer 1 Step = 1/16).
+    var stepSixteenths: Double = 1
     var size: CGFloat = 44
 
     @State private var dragging       = false
     @State private var dragStartY:    CGFloat = 0
     @State private var dragStartIndex: Int    = 0
 
-    private var steps: [Step.GateStep] { Step.gateSteps }
+    private var steps: [Step.GateStep] { Step.gateSteps(stepSixteenths: stepSixteenths) }
 
     private var currentIndex: Int {
         steps.indices.min(by: { abs(steps[$0].value - gate) < abs(steps[$1].value - gate) }) ?? 0
