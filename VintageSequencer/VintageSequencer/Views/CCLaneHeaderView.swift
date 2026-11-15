@@ -83,23 +83,6 @@ struct CCLaneHeaderView: View {
 
                 TrackOutputMenu(track: track, directory: engine.rack.directory,
                                 accent: accentColor, s: s)
-                    .padding(.trailing, 2)
-                Picker("", selection: Binding(
-                    get: { track.midiChannel },
-                    set: { ch in
-                        writer.apply(.setMIDIChannel(trackID: track.id,
-                                                      old: track.midiChannel,
-                                                      new: ch),
-                                     to: track.data, undoManager: nil)
-                    }
-                )) {
-                    ForEach(1...16, id: \.self) { ch in
-                        Text(ch == 10 ? "10 ◆" : "\(ch)").font(VintageTheme.monoSmall).tag(ch)
-                    }
-                }
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 52)
             }
 
             // Row 3: CC# TextField · Label TextField · CC-Mute

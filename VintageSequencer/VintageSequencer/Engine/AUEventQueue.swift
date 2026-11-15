@@ -144,6 +144,14 @@ final class AUEventQueue {
     let postRenders  = ManagedAtomic<Int>(0)
     let renderErrors = ManagedAtomic<Int>(0)
     let backlog  = ManagedAtomic<Int>(0)
+    /// Verworfene überfällige Note-Ons (v1.18.36): Diagnose, nur Inkrement im Render-Durchlauf.
+    let staleNoteOns = ManagedAtomic<Int>(0)
+    /// Ab so vielen Frames Verspätung gilt ein Note-On als verpasst (≈ 85 ms bei 48 kHz).
+    /// Wurde das Instrument eine Weile nicht gerendert (Laden blockiert den Render-Durchlauf,
+    /// Kanal auf Lautstärke 0 durch Solo/Mute), lagen alle aufgelaufenen Noten im nächsten
+    /// Block auf Offset 0 — gemessen +19 dBFS (Shortcircuit XT). Offs, CCs und Parameter
+    /// gehen weiter hinaus, damit nichts hängt und der letzte Stand gilt.
+    static let staleFrames = 4096
 
     /// Drum-Gruppen (v1.18.28): 128 Tasten zu je 8 Bit (`DrumMap`), 8 Tasten je Wort. Main
     /// schreibt, der Render-Durchlauf liest (relaxed: ein halb geschriebener Satz betrifft nur
@@ -311,11 +319,17 @@ final class AUEventQueue {
         let drums   = drumOn.load(ordering: .acquiring)
         let span    = Double(max(frames, 1)) * ticksPerFrame
         let hostEnd = hostStart &+ UInt64(span)
+        let staleTicks = UInt64(Double(Self.staleFrames) * max(ticksPerFrame, 0))
         var keep = 0
         for i in 0..<pendingCount {
             let p = pending[i]
             if p.generation != gen || p.epoch != occ { continue }          // ungültig gemacht
             if !hostValid || p.hostTime == 0 || p.hostTime < hostEnd {
+                if hostValid, p.hostTime != 0, !p.isParameter, staleTicks > 0,
+                   p.hostTime &+ staleTicks < hostStart, Self.isNoteOn(p.packed) {
+                    staleNoteOns.wrappingIncrement(ordering: .relaxed)
+                    continue
+                }
                 var offset = 0
                 if hostValid, p.hostTime > hostStart, ticksPerFrame > 0 {
                     offset = min(max(frames, 1) - 1, Int(Double(p.hostTime - hostStart) / ticksPerFrame))
@@ -329,6 +343,11 @@ final class AUEventQueue {
             }
         }
         pendingCount = keep
+    }
+
+    @inline(__always)
+    static func isNoteOn(_ packed: UInt32) -> Bool {
+        UInt8(truncatingIfNeeded: packed) & 0xF0 == 0x90 && (packed >> 16) & 0x7F != 0
     }
 
     /// Drum-Gruppen (v1.18.28): Note-Off an One-Shot-Tasten entfällt; ein Note-On in einer

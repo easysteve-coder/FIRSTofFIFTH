@@ -180,6 +180,14 @@ final class TrackData: Identifiable {
 
     var name:        String        = "Track"
     var midiChannel: Int           = 1
+    /// Kanal der Ausgabe an `route` (v1.18.33): externes MIDI (route < 0) spielt auf dem
+    /// Spurkanal, ein gehostetes Instrument immer auf Kanal 1. Sonst trafen Spuren mit
+    /// verschiedenen Kanälen im Sampler getrennte Stimmen — die Sperrgruppe (Hi-Hat) ging
+    /// ins Leere, und Kanäle, auf die ein Instrument nicht hört, blieben stumm.
+    static let instrumentChannel = 1
+    func outputChannel(route: Int) -> Int {
+        route >= 0 ? Self.instrumentChannel : max(1, min(16, midiChannel))
+    }
     /// Bearbeitungsmodus der Spur: Drum-Namen und Drum-Auswahl statt Klaviatur/Akkorden.
     /// Seit v1.12.23 eigener Zustand; vorher implizit „MIDI-Kanal 10". Reine
     /// Darstellungs-/Bearbeitungsfrage — der Tick-Pfad liest das Feld nicht.

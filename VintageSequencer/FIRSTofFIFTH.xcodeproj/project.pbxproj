@@ -35,9 +35,22 @@
 		85E31A552F6A1955007AABE7 /* CoreMIDI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMIDI.framework; path = System/Library/Frameworks/CoreMIDI.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		85F0F0F02F00000000000001 /* Exceptions for "VintageSequencer" folder in "VintageSequencer" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			additionalCompilerFlagsByRelativePath = {
+				Engine/Rack/ObjCExceptionBarrier.m = "-fobjc-arc-exceptions";
+			};
+			target = 85E31A072F6A17DC007AABE7 /* VintageSequencer */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		85E31A0A2F6A17DC007AABE7 /* VintageSequencer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				85F0F0F02F00000000000001 /* Exceptions for "VintageSequencer" folder in "VintageSequencer" target */,
+			);
 			path = VintageSequencer;
 			sourceTree = "<group>";
 		};
@@ -447,7 +460,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				MARKETING_VERSION = 1.18.32;
+				MARKETING_VERSION = 1.18.38;
 				PRODUCT_BUNDLE_IDENTIFIER = com.firstoffifth.sequencer;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
@@ -510,7 +523,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				MARKETING_VERSION = 1.18.32;
+				MARKETING_VERSION = 1.18.38;
 				PRODUCT_BUNDLE_IDENTIFIER = com.firstoffifth.sequencer;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",

@@ -5,6 +5,111 @@ Format: [Semantische Versionierung](https://semver.org/lang/de/)
 
 ---
 
+## [1.18.38] — 2026-11-15
+
+- **Zweite Sicherung gegen Abstürze durch tote Plug-ins** (Stephan: „ja zu allem“; offener
+  Punkt aus dem Codex-Review zu 1.18.37).
+  - Stirbt ein Plug-in und FoF verbindet seinen Kanal, bevor macOS den Tod meldet, warf die
+    Audio-Engine eine Ausnahme, die FoF beendete. Jetzt fängt FoF sie direkt an der Engine ab:
+    der Kanal wird getrennt, seine Plug-ins werden abgebaut und laden nach (wie nach einer
+    Meldung). Scheitert es kurz danach erneut, zeigt der Platz „fehlt“ statt in einer Schleife
+    zu laden.
+  - Scheitert danach sogar das Aufräumen, ist der Zustand der Audio-Engine unbekannt. Dann
+    schaltet FoF das Audio ab und zeigt den Fehler im Mixer; FoF bleibt bedienbar, Speichern
+    geht. Audio kommt nach einem Neustart von FoF zurück.
+  - Ebenso beim Start der Engine: eine Ausnahme dort hält die Engine an und zeigt den Fehler.
+  - Viermal von Codex geprüft. Nicht real gemessen: das Verhalten an einem echten toten
+    Plug-in; im Test wird die Ausnahme an derselben Stelle eingespeist.
+- Tests `PluginRecoveryTests.connectFaultTearsDownTheChannelAndReloads`,
+  `repeatedConnectFaultGivesUp`, `failedCleanupTakesTheGraphOutOfService`,
+  `outOfServiceGraphIsNeverRebuilt`, `failedCleanupMidChannelStopsRecovery`,
+  `failedStopIsReportedNotHidden`, `outOfServiceDuringReloadStopsTheLoop`,
+  `removingAChannelWithAnUnremovablePluginStopsAtTheFault`. Presetformat unverändert.
+
+## [1.18.37] — 2026-11-15
+
+- **FoF stürzt nicht mehr ab, wenn ein Plug-in-Prozess abstürzt** (iMac, 17:18, beim Laden und
+  Ersetzen eines Kits in Shortcircuit XT).
+  - Ablauf: SCXT stürzte ab (Fehler in SCXT, siehe unten). macOS meldet jede Instanz des
+    Prozesses einzeln. FoF lud den zuerst gemeldeten Effekt neu und verband ihn dabei mit dem
+    Instrument desselben Kanals, das ebenfalls tot war, aber noch nicht gemeldet. Das Verbinden
+    einer toten Einheit bricht FoF ab.
+  - Jetzt löst jede Meldung ihre Einheit sofort aus der Audio-Engine, ohne etwas zu verbinden;
+    der Platz zeigt „lädt“. Bis alle Meldungen da sind (0,3 s Ruhe), startet FoF die Engine
+    nicht automatisch neu. Dann verbindet es jeden betroffenen Kanal einmal und lädt die Plätze
+    nach. Gesunde Plug-ins bleiben unberührt, auch wenn sie in der Zwischenzeit geladen wurden.
+  - Unabhängig geprüft von Codex in zwei Runden. Offen: Trifft eine Bedienung den Kanal einer
+    toten Einheit, bevor ihre Meldung da ist, kann das Verbinden weiterhin scheitern.
+- **Shortcircuit XT (lokaler Build):** Nach dem Ersetzen eines Kits behielt SCXT beendete
+  Stimmen im Pool, ohne Zone, aber als „spielt“ markiert. Das nächste Note-On mit Sperrgruppe
+  (Hi-Hat) griff darauf zu und brachte den Plug-in-Prozess zum Absturz. Behoben im lokalen
+  SCXT-Build (Prüfung auf zugewiesene Stimmen, beendete Stimmen gelten nicht mehr als
+  spielend), mit Tests; Vorschlag für Upstream folgt.
+- Tests `PluginRecoveryTests.deadUnitsLeaveTheEngineAtOnceAndAreNeverWired`, Mehrkanaltest
+  verschärft. Presetformat unverändert.
+
+## [1.18.36] — 2026-11-15
+
+- **Keine Notenlawine mehr nach Solo, Mute oder dem Laden eines Kits** (Stephan: „solo schalten
+  und solo entfernen gibt es massive übersteuerungen, diese +19 db sache vermutlich“, mit dem Jazz
+  Brush Kit in Shortcircuit XT).
+  - Wurde ein Instrument eine Weile nicht gerendert, sammelten sich die Noten des Sequencers in
+    FoFs Warteschlange und kamen im nächsten Block alle gleichzeitig. Das passiert beim Solo eines
+    anderen Kanals (stumme Kanäle werden nicht abgefragt) und während SCXT ein Kit lädt (Render
+    blockiert mehrere Sekunden). Gemessen im SCXT-Test: +19 dBFS.
+  - Jetzt verwirft die Warteschlange Note-Ons, die mehr als 4096 Samples (≈ 85 ms) überfällig
+    sind. Note-Offs, CCs und Parameter gehen weiter hinaus, damit nichts hängt und der letzte
+    Stand gilt. Pünktliche und knapp verspätete Noten sind unberührt.
+  - Damit war ein Teil von #2810 (Shortcircuit XT) ein FoF-Fehler.
+  - Diagnose: je Kanal `staleOn` (verworfene Note-Ons).
+- Befund Shortcircuit XT: Das Laden per Doppelklick im Browser hängt das Kit an das vorige an.
+  Nach mehreren Kits lagen auf dem iMac 3,2 GB und 150–300 % CPU im Plug-in-Prozess, die
+  Hi-Hat-Sperre wirkte nicht mehr (Kits ohne Sperrgruppe klangen weiter). Neues leeres Patch: 2 %.
+- Tests `StaleNoteOnTests`. Presetformat unverändert.
+
+## [1.18.35] — 2026-11-15
+
+- **Swing wieder als Drehregler, aber zurückhaltend** (Stephan zu 1.18.34: „bitte einen Regler für
+  Swing, nur nicht mehr so optisch dominant“). Kleiner Regler (22 statt 36 Punkte) direkt auf der
+  dunklen Leiste, ohne Alu-Platte; darunter „SWING“ und der Wert. Doppelklick setzt auf 0 %.
+  Das Wertfeld aus 1.18.34 entfällt.
+- Presetformat unverändert.
+
+## [1.18.34] — 2026-11-15
+
+- **Swing als kleines Wertfeld** (Stephan: „der swing regler ist übrigens mit seinem
+  alu-hintergrund prominenter gefeatured, als seine funktion es wert ist“). Die Alu-Platte mit
+  Drehregler entfällt; in der Transportleiste steht wie bei PATTERN und LEARN oben „SWING“, darunter
+  der Wert („32 %“, bernsteinfarben, sobald Swing wirkt). Bedienung wie das Tempo: senkrecht ziehen
+  (1 % je 2 Punkte, ⇧ fein 0,1 %), Doppelklick zum Eintippen. Wertebereich und Wirkung unverändert.
+- Presetformat unverändert.
+
+## [1.18.33] — 2026-11-15
+
+- **Instrumente hören unabhängig vom MIDI-Kanal der Spur** (Stephan: „die Snare höre ich nicht,
+  weil da der MIDI Kanal auf 5 stand. Das sollte eigentlich keine Rolle spielen, wenn AU
+  ausgewählt ist“).
+  - Spuren auf einem Instrumentenkanal spielen jetzt immer auf Kanal 1. Bisher ging der
+    Spurkanal an das Instrument: Ein Instrument, das nur auf Kanal 1 hört, blieb für andere
+    Kanäle stumm.
+  - Behebt auch die Hi-Hat-Sperre (Vintage Kit auf dem iMac, gespielt über Shortcircuit XT):
+    Lagen offene und geschlossene Hi-Hat auf Spuren mit verschiedenen Kanälen, landeten sie in
+    getrennten Stimmen bzw. Parts, und die geschlossene beendete die offene nicht. Shortcircuit XT
+    ordnet MIDI-Kanäle seinen Parts zu — eine Spur auf Kanal 5 traf einen leeren Part (Snare
+    stumm). Im Apple Sampler ging das Sperr-Note-Off von FoF auf den Kanal der neuen Note. Auf
+    einem Kanal schneidet SCXT die offene Hi-Hat selbst ab (gemessen im SCXT-Test, Punkt 4).
+  - Gilt für Steps, CC-Spuren mit MIDI-CC, Vorhören und Stop-Offs. Der gespeicherte MIDI-Kanal
+    bleibt erhalten und gilt wieder, sobald die Spur auf externes MIDI geht.
+- **Ausgangswahl in einem Menü** (Stephan: „Alles im Drop-Down Menü: External Midi > Channel 01
+  etc, Inst 1, Inst 2, + New Inst…“).
+  - Ausgangstaste im Spurkopf (auch CC-Spuren) zeigt „MIDI 05“ bzw. den Namen des
+    Instrumentenkanals und ist breiter. Menü: „Externes MIDI ▸ Kanal 01 … 16“, Trennlinie,
+    Instrumentenkanäle, Trennlinie, „Neuer Instrumentenkanal …“. Ebenso im Spur-Kontextmenü.
+  - Die eigene Kanalwahl daneben entfällt.
+- Befund Basic Kit (Battery 3): die EXS-Datei hat keine Sperrgruppe, die offene Hi-Hat schneidet
+  dort nirgends ab (auch nicht in Logic). Die übrigen 23 Acoustic Kits haben sie.
+- Tests `OutputChannelTests`. Presetformat unverändert.
+
 ## [1.18.32] — 2026-11-15
 
 - **Wiederanlauf nach Absturz eines Plug-in-Prozesses** (Stephan: „ja mach", nach dem

@@ -249,8 +249,8 @@ struct Str {
     var stopTooltip:         String { e("Stop (Space)",  "Stop (Leertaste)") }
     var tapTempoTooltip:     String { e("Tap Tempo: click 2× or more to detect BPM",
                                         "Tap Tempo: 2× oder öfter klicken um BPM zu ermitteln") }
-    var swingTooltip:        String { e("Swing: 0% = straight, 100% = maximum swing (odd steps delayed)",
-                                        "Swing: 0% = gerade, 100% = maximaler Swing (ungerade Steps werden verzögert)") }
+    var swingTooltip:        String { e("Swing: 0% = straight, 100% = maximum swing (odd steps delayed). Double-click: 0%",
+                                        "Swing: 0% = gerade, 100% = maximaler Swing (ungerade Steps werden verzögert). Doppelklick: 0 %") }
     var intClockTooltip:     String { e("Internal clock — sequencer runs at its own BPM",
                                         "Interner Clock — Sequencer läuft mit eigenem BPM-Takt") }
     var extClockTooltip:     String { e("External MIDI clock — sequencer syncs to incoming clock signal",
@@ -703,8 +703,13 @@ struct Str {
     func ccTargetUnresolvedHelp(_ p: String) -> String { e("“\(p)” is not available (instrument loading, replaced, or parameter missing) — the lane sends nothing. Click to choose a target.", "„\(p)“ ist nicht verfügbar (Instrument lädt, wurde getauscht oder der Parameter fehlt) — die Spur sendet nichts. Klicken, um ein Ziel zu wählen.") }
     func ccTargetMIDI(_ n: Int) -> String { e("MIDI CC \(n)", "MIDI-CC \(n)") }
     var ccTargetNoParameters: String { e("No parameters (instrument not loaded)", "Keine Parameter (Instrument nicht geladen)") }
-    var trackOutputNewChannel: String { e("New Instrument Channel", "Neuer Instrumentenkanal") }
-    var trackOutputChooseHelp: String { e("Output: external MIDI — click to choose an instrument channel", "Ausgang: externes MIDI — klicken, um einen Instrumentenkanal zu wählen") }
+    var trackOutputNewChannel: String { e("New Instrument Channel…", "Neuer Instrumentenkanal …") }
+    /// Eintrag im Untermenü „Externes MIDI“ (v1.18.33), zweistellig wie „Channel 05“.
+    func trackOutputChannel(_ ch: Int) -> String {
+        let n = String(format: "%02d", ch) + (ch == 10 ? " ◆" : "")
+        return e("Channel \(n)", "Kanal \(n)")
+    }
+    func trackOutputChooseHelp(_ ch: Int) -> String { e("Output: external MIDI, channel \(ch) — click to choose MIDI channel or instrument channel", "Ausgang: externes MIDI, Kanal \(ch) — klicken, um MIDI-Kanal oder Instrumentenkanal zu wählen") }
     func trackOutputHelp(_ name: String) -> String { e("Plays instrument channel “\(name)”", "Spielt Instrumentenkanal „\(name)“") }
 
     // Drum groups

@@ -380,16 +380,19 @@ final class InstrumentRack: ObservableObject {
         let g = AudioGraph(masterMeter: masterMeter)
         g.onStarted = { [weak self] in self?.graphStarted() }
         g.onWillStart = { [weak self] in self?.reaffirmHostBindings(force: true) }
+        g.onFault = { [weak self] reason in self?.graphFaulted(reason) }
         g.onConfigurationChange = { [weak self] e in
             guard let self else { return }
             self.diagnostics.event("config", ["running": e.isRunning,
                                               "output": Self.describe(e.outputNode.outputFormat(forBus: 0)),
                                               "device": AudioDiagnostics.defaultOutputDevice()])
-            self.rebuildGraph()
+            self.rebuildGraphUnlessRecovering()
         }
         return g
     }()
-    private var engineStorage: AVAudioEngine? { graph.engineIfCreated }
+    /// Die Engine für Umbauten; nil, solange keine angelegt ist oder der Graph außer Betrieb ist
+    /// (`AudioGraph.faulted`, v1.18.38): danach baut kein Weg des Racks mehr um (Codex R38-R2-01).
+    private var engineStorage: AVAudioEngine? { graph.faulted == nil ? graph.engineIfCreated : nil }
     private var invalidationObserver: NSObjectProtocol?
     /// Audio-Diagnose (Aufzeichnung im Betrieb, Menü „Hilfe").
     let diagnostics = AudioDiagnostics()
@@ -628,11 +631,12 @@ final class InstrumentRack: ObservableObject {
         q.setActive(false); q.invalidate(); q.beginOccupancy()
         // Loop-Kern folgt derselben Belegung.
         loops.occupy(slot: slot, epoch: q.occupancyEpoch, loop: data.audioLoop.map { (data.id, $0) })
-        let e = engine()
-        e.attach(l.gain); e.attach(l.mixer)
-        e.connect(l.gain, to: l.mixer, format: mixFormat())
-        hook(l)
-        installMeterTap(l)
+        if let e = engine() {
+            e.attach(l.gain); e.attach(l.mixer)
+            e.connect(l.gain, to: l.mixer, format: mixFormat())
+            hook(l)
+            installMeterTap(l)
+        }
         Self.apply(data.eq, to: l.gain)
         applyMix(data, to: l)
         if let settings = data.audioLoop {
@@ -652,13 +656,16 @@ final class InstrumentRack: ObservableObject {
         removeMeterTap(l)
         loops.vacate(id, slot: l.slot, epoch: q.occupancyEpoch)
         if let e = engineStorage {
-            if let n = l.source { e.detach(n) }
-            if let n = l.gatePre { e.detach(n) }
-            if let n = l.gatePost { e.detach(n) }
-            if let n = l.instrument { e.detach(n) }
-            if let n = l.rateStage { e.detach(n) }
-            l.effects.compactMap { $0 }.forEach { e.detach($0) }
-            e.detach(l.gain); e.detach(l.mixer)
+            // Plug-ins zuerst über die Fehlergrenze; scheitert eines, ist der Graph außer Betrieb
+            // und die gespeicherte Engine `e` wird nicht mehr angefasst (Codex R38-R3-01).
+            let plugins = ([l.instrument] + l.effects).compactMap { $0 }
+            if plugins.allSatisfy({ graph.detach($0) }) {
+                if let n = l.source { e.detach(n) }
+                if let n = l.gatePre { e.detach(n) }
+                if let n = l.gatePost { e.detach(n) }
+                if let n = l.rateStage { e.detach(n) }
+                e.detach(l.gain); e.detach(l.mixer)
+            }
         }
         instrumentStatus[id] = nil
         effectStatus[id] = nil
@@ -795,13 +802,13 @@ final class InstrumentRack: ObservableObject {
         if l.instrument != nil { openInstrumentEditor(id) } else { l.openInstrumentWhenLoaded = true }
     }
 
-    private func teardownInstrument(_ l: Live) {
+    private func teardownInstrument(_ l: Live, rewire doRewire: Bool = true) {
         l.openInstrumentWhenLoaded = false
         l.instrumentRequest = nil
         let q = queue(l.slot)
         q.setActive(false); q.invalidate(); q.beginOccupancy(); q.setDrumMap(nil)
         removeObserver(l)
-        if let n = l.instrument, let e = engineStorage { e.detach(n) }
+        if let n = l.instrument, engineStorage != nil { graph.detach(n) }
         if let m = l.rateStage, let e = engineStorage { e.disconnectNodeOutput(m); e.detach(m); l.rateStage = nil }
         l.instrument = nil
         l.hostBinding = nil
@@ -810,11 +817,12 @@ final class InstrumentRack: ObservableObject {
             catalog.instrumentUnloaded(channel: id)
             rackDiagnostics.forget(channel: id)
         }
-        rewire(l)
+        if doRewire { rewire(l) }
     }
 
     private func loadInstrument(_ ref: PluginRef, into id: UUID) {
         guard let l = live[id] else { return }
+        guard graph.faulted == nil else { instrumentStatus[id] = .missing; return }   // außer Betrieb
         let request = UUID()
         l.instrumentRequest = request
         instantiate(ref) { [weak self, weak l] unit in
@@ -828,9 +836,11 @@ final class InstrumentRack: ObservableObject {
             }
             PluginLifecycle.restoreState(ref.state, into: unit)
             l.hostBinding = self.plugins.bindHost(unit, queue: self.queues[l.slot])
-            self.engine().attach(unit)
+            guard self.graph.attach(unit) else {                 // Graph außer Betrieb
+                l.hostBinding = nil; self.instrumentStatus[id] = .missing; return
+            }
             l.instrument = unit
-            self.rewire(l)
+            guard self.rewire(l) else { return }     // Kette tot: abgebaut, Durchlauf lädt nach
             self.installObserver(l)
             if !self.graph.isRunning { self.plugins.confirm(l.hostBinding, unit) }   // nie beim Rendern
             let q = self.queue(l.slot)
@@ -890,7 +900,7 @@ final class InstrumentRack: ObservableObject {
         l.openEffectWhenLoaded.remove(token)
         plugins.closeEditor(.effect(token))
         releaseEffectQueue(l, token: token)               // vor dem Abhängen: Observer zuerst weg
-        if let n = l.effects[index], let e = engineStorage { e.detach(n) }
+        if let n = l.effects[index], engineStorage != nil { graph.detach(n) }
         channels[idx].effects.remove(at: index)
         l.effects.remove(at: index); l.effectTokens.remove(at: index)
         effectStatus[id]?.remove(at: index)
@@ -927,6 +937,7 @@ final class InstrumentRack: ObservableObject {
 
     private func loadEffect(_ ref: PluginRef, into id: UUID, at index: Int) {
         guard let l = live[id], l.effectTokens.indices.contains(index) else { return }
+        guard graph.faulted == nil else { effectStatus[id]?[index] = .missing; return }   // außer Betrieb
         let token = l.effectTokens[index]
         instantiate(ref) { [weak self] unit in
             // Position über das Token suchen: die Kette kann sich inzwischen verschoben haben.
@@ -940,9 +951,11 @@ final class InstrumentRack: ObservableObject {
             if let slot = self.reserveEffectQueue(l, token: token) {
                 l.effectHostBindings[token] = self.plugins.bindHost(unit, queue: self.effectQueues[slot])
             }
-            self.engine().attach(unit)
+            guard self.graph.attach(unit) else {                 // Graph außer Betrieb
+                self.releaseEffectQueue(l, token: token); self.effectStatus[id]?[i] = .missing; return
+            }
             l.effects[i] = unit
-            self.rewire(l)
+            guard self.rewire(l) else { return }     // Kette tot: abgebaut, Durchlauf lädt nach
             self.installEffectObserver(l, token: token, unit: unit)
             if !self.graph.isRunning { self.plugins.confirm(l.effectHostBindings[token], unit) }
             self.catalog.effectLoaded(unit, token: token)
@@ -1033,7 +1046,8 @@ final class InstrumentRack: ObservableObject {
 
     // MARK: - Audio-Engine und Verdrahtung
 
-    private func engine() -> AVAudioEngine { graph.engine() }
+    /// Legt die Engine bei Bedarf an; nil, wenn der Graph außer Betrieb ist.
+    private func engine() -> AVAudioEngine? { graph.faulted == nil ? graph.engine() : nil }
 
     /// Nach jedem (Neu-)Start der Engine: Fehler und Laufzustand veröffentlichen. Die
     /// Host-Blöcke bestätigt `onWillStart` vorher, solange die Engine steht.
@@ -1057,6 +1071,7 @@ final class InstrumentRack: ObservableObject {
         graph.removeMasterTap()
         graph.wireMaster()
         for l in live.values {
+            guard graph.faulted == nil else { break }        // Umbau ab Stilllegung sofort beenden
             removeMeterTap(l)
             e.disconnectNodeOutput(l.gain)
             if let gp = l.gatePost { e.disconnectNodeOutput(gp) }
@@ -1119,13 +1134,14 @@ final class InstrumentRack: ObservableObject {
         w.read = { [weak self] in
             guard let self, let e = self.engineStorage else { return nil }
             return OutputWatchdog.Reading(
-                needed: self.live.values.contains { $0.instrument != nil },
+                needed: self.graph.faulted == nil && !self.isRecoveringPlugins
+                    && self.live.values.contains { $0.instrument != nil },
                 running: e.isRunning, tapInstalled: self.graph.masterTapInstalled,
                 blocks: self.masterMeter.blockCount,
                 nonFinite: self.masterMeter.hasNonFinite || self.live.values.contains { $0.meter.hasNonFinite })
         }
         w.recover = { [weak self] finding in
-            guard let self, self.engineStorage != nil else { return 0 }
+            guard let self, self.engineStorage != nil else { return 0 }   // nil auch außer Betrieb
             _ = self.masterMeter.takeNonFinite()
             self.live.values.forEach { _ = $0.meter.takeNonFinite() }
             self.diagnostics.event("watchdog", ["finding": finding.rawValue])
@@ -1182,22 +1198,151 @@ final class InstrumentRack: ObservableObject {
     var recoveryLockout: TimeInterval = 10
     private var recoveredAt: [UUID: Date] = [:]          // Kanal (Instrument) bzw. Token (Effekt)
 
+    // Gesammelter Durchlauf (v1.18.37, iMac-Absturz 17:18): die Meldungen kommen je Instanz
+    // einzeln auf Main an. Der alte Weg lud den gemeldeten Effekt neu und verband dabei den
+    // Kanal mit seinem noch nicht gemeldeten, toten Instrument — `AVAudioEngine.connect` wirft
+    // dann eine ObjC-Ausnahme (AUInterfaceBaseV3::SetFormat) und beendet FoF. Darum:
+    // 1. Jede Meldung löst ihre Einheit sofort aus der Engine (abbauen bzw. lösen, ohne zu
+    //    verbinden); danach berührt kein Start, kein `prepare`, keine Host-Bestätigung sie mehr.
+    // 2. Bis zum Durchlauf keine automatischen Starts, `adopt`-Neustarts, Wächter- oder
+    //    Geräte-Neuaufbauten (`isRecoveringPlugins`).
+    // 3. Erst wenn `recoveryQuietTime` lang keine Meldung mehr kam, verbindet ein Durchlauf
+    //    jeden betroffenen Kanal einmal neu und lädt die Plätze nach.
+    // Keine Annahme über Prozesse (Codex-Review 1.18.37: native und Rosetta-Plug-ins haben
+    // getrennte Hosting-Dienste) und keine gespeicherten Objektkennungen: tot ist, was sich
+    // meldet. Grenze: eine tote Einheit, deren Meldung noch aussteht, kennt FoF nicht; trifft
+    // eine Nutzeraktion ihren Kanal vor der Meldung, kann `connect` weiterhin werfen.
+
+    /// Ruhezeit nach der letzten Meldung bis zum Durchlauf. Bündelt die Meldungen eines
+    /// Absturzes; sie garantiert nicht, dass alle toten Einheiten gemeldet sind.
+    var recoveryQuietTime: TimeInterval = 0.3
+    /// Tests: jede Kette, die `rewire` verbindet.
+    var _rewireObserver: (([AVAudioNode]) -> Void)?
+    /// Kanäle mit gelösten toten Plätzen bis zum Durchlauf: Instrument, Effektplätze (Token).
+    private var pendingRecovery: [UUID: (instrument: Bool, effects: Set<UUID>)] = [:]
+    private var recoveryGeneration = 0
+    /// Ein Gerätewechsel während der Ruhezeit baut erst nach dem Durchlauf neu.
+    private var rebuildAfterRecovery = false
+
+    /// Von der ersten Meldung bis zum Durchlauf: keine automatischen Starts, Neustarts
+    /// (`adopt`, Wächter) oder Neuaufbauten — sie berührten alle Knoten der Engine, auch tote,
+    /// deren Meldung noch aussteht. Nutzeraktionen laufen weiter.
+    var isRecoveringPlugins: Bool { !pendingRecovery.isEmpty }
+
+    private func rebuildGraphUnlessRecovering() {
+        guard graph.faulted == nil else { return }
+        if isRecoveringPlugins { rebuildAfterRecovery = true } else { rebuildGraph() }
+    }
+
     private func pluginInvalidated(_ object: AnyObject?) {
         guard let object else { return }
-        for (id, l) in live {
-            if let unit = l.instrument, unit.auAudioUnit === object {
-                report(id, slot: "instrument")
-                recoverInstrument(id, l)
-                return
-            }
-            if let i = l.effects.firstIndex(where: { $0.map { $0.auAudioUnit === object } == true }) {
-                report(id, slot: "effect \(i + 1)")
-                recoverEffect(id, l, index: i)
-                return
-            }
+        guard graph.faulted == nil else {              // außer Betrieb: nichts mehr umbauen
+            diagnostics.event("invalidated", ["channel": "?", "faulted": true])
+            return
         }
-        Self.log.error("Plug-in-Prozess beendet (keiner aktiven Instanz zugeordnet)")
-        diagnostics.event("invalidated", ["channel": "?"])
+        guard let (id, l, slot) = locate(object) else {
+            Self.log.error("Plug-in-Prozess beendet (keiner aktiven Instanz zugeordnet)")
+            diagnostics.event("invalidated", ["channel": "?"])
+            return
+        }
+        if let i = slot { report(id, slot: "effect \(i + 1)") } else { report(id, slot: "instrument") }
+        markDead(id, l, slot: slot)
+        scheduleRecoveryPass()
+    }
+
+    /// Löst einen Platz aus der Engine (ohne Verbinden) und merkt ihn für den Durchlauf vor.
+    private func markDead(_ id: UUID, _ l: Live, slot: Int?) {
+        guard graph.faulted == nil else { return }
+        // Erst vormerken und Status setzen, dann abbauen (der Abbau kann den Graph außer
+        // Betrieb nehmen, Codex R38-04).
+        var p = pendingRecovery[id] ?? (false, [])
+        if let i = slot { p.effects.insert(l.effectTokens[i]); effectStatus[id]?[i] = .loading }
+        else { p.instrument = true; instrumentStatus[id] = .loading }
+        pendingRecovery[id] = p
+        if let i = slot { removeDeadEffect(l, index: i) } else { teardownInstrument(l, rewire: false) }
+    }
+
+    /// Der Graph ist außer Betrieb (Aufräumen nach einer Ausnahme gescheitert): kein Wiederanlauf,
+    /// kein Start mehr; Anzeige und Diagnose. Erst ein Neustart von FoF bringt Audio zurück.
+    private func graphFaulted(_ reason: String) {
+        Self.log.error("Audio-Engine außer Betrieb: \(reason, privacy: .public)")
+        diagnostics.event("graphFault", ["reason": reason])
+        pendingRecovery = [:]
+        rebuildAfterRecovery = false
+        recoveryGeneration &+= 1                      // geplanten Durchlauf verwerfen
+        // Plätze, die auf ein Nachladen warteten, bekommen keines mehr.
+        for (id, st) in instrumentStatus where st == .loading { instrumentStatus[id] = .missing }
+        for (id, list) in effectStatus { effectStatus[id] = list.map { $0 == .loading ? .missing : $0 } }
+        engineError = reason
+        // Tatsächlicher Zustand: scheiterte auch das Anhalten, läuft die Engine womöglich weiter.
+        if isAudioRunning != graph.isRunning { isAudioRunning = graph.isRunning }
+    }
+
+    private func scheduleRecoveryPass() {
+        guard graph.faulted == nil else { return }
+        recoveryGeneration &+= 1
+        let generation = recoveryGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + recoveryQuietTime) { [weak self] in
+            guard let self, self.recoveryGeneration == generation else { return }
+            self.recoverPendingPlugins()
+        }
+    }
+
+    /// Verbinden des Kanals ist gescheitert (v1.18.38, zweite Linie zu den Meldungen) — ein
+    /// Kanalfehler, kein bestätigter Prozesstod: meist ist eine Einheit der Kette tot und ihre
+    /// Meldung steht aus; die Ausnahme sagt nicht, welche. Darum baut FoF alle Plug-ins des
+    /// Kanals ab und lädt sie im Durchlauf nach (ungesicherte Klangänderungen gehen dabei
+    /// verloren). Die Sperre `recoveryLockout` begrenzt das: scheitert es gleich wieder, bleibt
+    /// der Platz „fehlt". Kein `hook`, kein `adopt` für diese Kette.
+    private func connectFailed(_ l: Live, _ fault: String) {
+        guard graph.faulted == nil, let id = live.first(where: { $0.value === l })?.key else { return }
+        Self.log.error("Verbinden gescheitert (Kanal \(self.channel(id)?.name ?? "?", privacy: .public)): \(fault, privacy: .public)")
+        diagnostics.event("connectFault", ["channel": channel(id)?.name ?? "?", "fault": fault])
+        for i in l.effects.indices where l.effects[i] != nil {
+            markDead(id, l, slot: i)
+            if graph.faulted != nil { return }           // Abbau scheiterte: Stilllegung, nichts mehr vormerken
+        }
+        if l.instrument != nil { markDead(id, l, slot: nil) }
+        if graph.faulted == nil, pendingRecovery[id] != nil { scheduleRecoveryPass() }
+    }
+
+    /// Kanal und Platz einer geladenen Einheit (Platz nil = Instrument).
+    private func locate(_ object: AnyObject) -> (UUID, Live, Int?)? {
+        for (id, l) in live {
+            if let u = l.instrument, u.auAudioUnit === object { return (id, l, nil) }
+            if let i = l.effects.firstIndex(where: { $0?.auAudioUnit === object }) { return (id, l, i) }
+        }
+        return nil
+    }
+
+    private func recoverPendingPlugins() {
+        let pending = pendingRecovery
+        pendingRecovery = [:]
+        // Alle gemeldeten toten Knoten sind gelöst; erst jetzt wird verbunden und geladen.
+        if rebuildAfterRecovery { rebuildAfterRecovery = false; rebuildGraph() }
+        for (id, p) in pending {
+            guard graph.faulted == nil else { return }
+            guard let l = live[id] else { continue }
+            guard rewire(l) else {
+                if graph.faulted != nil { return }       // Stilllegung: nichts wieder einsetzen
+                // Neuer Fehler: offene Plätze verlustfrei in die nächste Runde (Codex R38-03).
+                var q = pendingRecovery[id] ?? (false, [])
+                q.instrument = q.instrument || p.instrument
+                q.effects.formUnion(p.effects)
+                pendingRecovery[id] = q
+                continue
+            }
+            for token in p.effects {
+                // Ein synchroner Ladeabschluss kann stilllegen: vor jedem Auftrag prüfen (R38-R3-03).
+                guard graph.faulted == nil else { return }
+                // Nur wenn der Platz noch derselbe und leer ist (der Nutzer kann inzwischen
+                // Effekte entfernt oder verschoben haben).
+                if let i = l.effectTokens.firstIndex(of: token), l.effects[i] == nil { reloadEffect(id, l, index: i) }
+            }
+            guard graph.faulted == nil else { return }
+            if p.instrument, l.instrument == nil, l.instrumentRequest == nil { reloadInstrument(id) }
+        }
+        updateEngineRunning()
     }
 
     private func report(_ id: UUID, slot: String) {
@@ -1213,32 +1358,34 @@ final class InstrumentRack: ObservableObject {
         return true
     }
 
-    private func recoverInstrument(_ id: UUID, _ l: Live) {
+    private func reloadInstrument(_ id: UUID) {
         guard let ref = channel(id)?.instrument else { return }
         let name = channel(id)?.name ?? "?"
-        teardownInstrument(l)
         guard mayRecover(id) else {
             instrumentStatus[id] = .missing
             diagnostics.event("pluginRecovery", ["channel": name, "slot": "instrument", "gaveUp": true])
-            updateEngineRunning()
             return
         }
         instrumentStatus[id] = .loading
         diagnostics.event("pluginRecovery", ["channel": name, "slot": "instrument", "plugin": ref.name])
         loadInstrument(ref, into: id)
         onRoutingChange?()           // neue Belegung → Snapshot mit neuer Epoche
-        updateEngineRunning()
     }
 
-    private func recoverEffect(_ id: UUID, _ l: Live, index i: Int) {
+    /// Löst einen toten Effekt aus dem Kanal, ohne neu zu verbinden.
+    private func removeDeadEffect(_ l: Live, index i: Int) {
+        guard l.effectTokens.indices.contains(i), l.effects.indices.contains(i) else { return }
+        let token = l.effectTokens[i]
+        plugins.closeEditor(.effect(token))
+        releaseEffectQueue(l, token: token)                // Observer der toten Instanz zuerst weg
+        if let n = l.effects[i], engineStorage != nil { graph.detach(n) }
+        l.effects[i] = nil
+    }
+
+    private func reloadEffect(_ id: UUID, _ l: Live, index i: Int) {
         guard let data = channel(id), data.effects.indices.contains(i), l.effectTokens.indices.contains(i) else { return }
         let token = l.effectTokens[i]
         let ref = data.effects[i]
-        plugins.closeEditor(.effect(token))
-        releaseEffectQueue(l, token: token)                // Observer der toten Instanz zuerst weg
-        if let n = l.effects[i], let e = engineStorage { e.detach(n) }
-        l.effects[i] = nil
-        rewire(l)
         guard mayRecover(token) else {
             effectStatus[id]?[i] = .missing
             diagnostics.event("pluginRecovery", ["channel": data.name, "slot": "effect \(i + 1)", "gaveUp": true])
@@ -1254,19 +1401,27 @@ final class InstrumentRack: ObservableObject {
     private func mixFormat() -> AVAudioFormat? { graph.mixFormat }
 
     /// Verbindet Instrument → Effekte (in Reihenfolge, nur geladene) → Gain-Stufe des Kanals.
-    private func rewire(_ l: Live) {
-        guard let e = engineStorage else { return }
+    /// - Returns: false, wenn das Verbinden scheiterte und der Kanal abgebaut wurde (`connectFailed`).
+    @discardableResult
+    private func rewire(_ l: Live) -> Bool {
+        guard graph.faulted == nil else { return false }       // vor engineStorage (nil außer Betrieb)
+        guard let e = engineStorage else { return true }
         let head: AVAudioNode? = l.instrument ?? l.source
         // Eigene Rate des Instruments (v1.18.9): Umrechnungsstufe direkt dahinter.
         let rate = l.instrument != nil ? stageRate(l) : nil
         if rate != nil, l.rateStage == nil { let m = AVAudioMixerNode(); e.attach(m); l.rateStage = m }
         if rate == nil, let m = l.rateStage { e.disconnectNodeOutput(m); e.detach(m); l.rateStage = nil }
         let chain: [AVAudioNode] = ([head, l.rateStage] + l.effects + [l.gatePre]).compactMap { $0 }
-        guard head != nil else { graph.disconnect(chain, from: l.gain); return }
-        graph.connectChain(chain, into: l.gain,
-                           headFormat: rate.flatMap { AVAudioFormat(standardFormatWithSampleRate: $0, channels: 2) })
-        hook(l)
-        if graph.adopt(chain + [l.gain, l.mixer]) { diagnostics.event("restart", ["reason": "newNodes"]) }
+        guard head != nil else { return graph.disconnect(chain, from: l.gain) }
+        _rewireObserver?(chain)
+        if let fault = graph.connectChain(chain, into: l.gain,
+                                          headFormat: rate.flatMap { AVAudioFormat(standardFormatWithSampleRate: $0, channels: 2) }) {
+            connectFailed(l, fault)
+            return false
+        }
+        if let fault = hook(l) { connectFailed(l, fault); return false }
+        if !isRecoveringPlugins, graph.adopt(chain + [l.gain, l.mixer]) { diagnostics.event("restart", ["reason": "newNodes"]) }
+        return graph.faulted == nil                            // `adopt` kann stilllegen (R38-R3-02)
     }
 
     /// Hängt den Kanalausgang an die Summe (v1.18.10).
@@ -1279,11 +1434,15 @@ final class InstrumentRack: ObservableObject {
     /// gelöst, der alle Kanäle unterbrach). Darum hängt ein leerer Kanal bei laufender Engine
     /// erst, wenn Instrument oder Loop-Quelle da sind; Effekte in einem hängenden Zweig
     /// einzufügen oder zu tauschen ist dagegen ohne Weiteres möglich.
-    private func hook(_ l: Live) {
-        guard !l.hooked, let e = engineStorage else { return }
-        if e.isRunning, l.instrument == nil, l.source == nil { return }
-        e.connect(l.mixer, to: e.mainMixerNode, format: mixFormat())
+    /// - Returns: nil, oder die Ausnahme beim Verbinden (die Engine bereitet dabei den ganzen
+    ///   Zweig vor, also auch seine Plug-ins).
+    @discardableResult
+    private func hook(_ l: Live) -> String? {
+        guard !l.hooked, let e = engineStorage else { return nil }
+        if e.isRunning, l.instrument == nil, l.source == nil { return nil }
+        if let fault = graph.connect(l.mixer, to: e.mainMixerNode, format: mixFormat()) { return fault }
         l.hooked = true
+        return nil
     }
 
     /// Abweichende Rate des Instruments eines Kanals, nil = Geräterate.
@@ -1304,9 +1463,8 @@ final class InstrumentRack: ObservableObject {
             let running = graph.isRunning
             if running { graph.stop() }
             removeObserver(l)
-            rewire(l)
-            installObserver(l)                     // Rate des Instruments → Frames je Host-Tick
-            if running { graph.start() }
+            if rewire(l) { installObserver(l) }    // Rate des Instruments → Frames je Host-Tick
+            if running, !isRecoveringPlugins { graph.start() }
             updateRouteLatencies()
             diagnostics.event("renderRate", ["channel": channels[idx].name, "rate": r ?? 0])
         }
@@ -1362,13 +1520,13 @@ final class InstrumentRack: ObservableObject {
     }
 
     private func adoptNewNodes(_ nodes: [AVAudioNode]) {
-        if graph.adopt(nodes) { diagnostics.event("restart", ["reason": "newNodes"]) }
+        if !isRecoveringPlugins, graph.adopt(nodes) { diagnostics.event("restart", ["reason": "newNodes"]) }
     }
 
     private func updateEngineRunning() {
         guard engineStorage != nil else { return }
         let needed = live.values.contains { $0.instrument != nil || $0.source != nil }
-        if needed, !graph.isRunning {
+        if needed, !graph.isRunning, !isRecoveringPlugins {
             graph.installMasterTap()
             graph.start()
         } else if !needed, graph.isRunning {
@@ -1512,7 +1670,7 @@ final class InstrumentRack: ObservableObject {
 
     /// Quelle des Kanals: rendert Mithören und Loop des Kerns dieses Slots.
     private func installLoopSource(_ l: Live) {
-        let e = engine()
+        guard let e = engine() else { return }
         if let old = l.source { e.detach(old) }
         let format = mixFormat() ?? AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
         let sr = format.sampleRate
@@ -1557,9 +1715,9 @@ final class InstrumentRack: ObservableObject {
         }
         guard wanted else { return }
         // Eigene, im Prozess registrierte Komponente: synchron anlegen (kein Ladeauftrag).
+        guard let e = engine() else { return }
         let unit = AVAudioUnitEffect(audioComponentDescription: GateAudioUnit.componentDescription)
         (unit.auAudioUnit as? GateAudioUnit)?.control.apply(g, enabled: true)
-        let e = engine()
         e.attach(unit)
         if position == .preFader {
             l.gatePre = unit
@@ -1649,6 +1807,9 @@ final class InstrumentRack: ObservableObject {
     func _instrumentPreRenders(_ id: UUID) -> Int? {
         live[id].map { queue($0.slot).preRenders.load(ordering: .relaxed) }
     }
+    /// Starts der Engine seit Anlegen und ihr echter Laufzustand (Tests, v1.18.38).
+    var _graphStarts: Int { graph.starts }
+    var _graphIsRunning: Bool { graph.isRunning }
     func _liveEffect(_ id: UUID, at i: Int) -> AVAudioUnit? {
         guard let l = live[id], l.effects.indices.contains(i) else { return nil }
         return l.effects[i]

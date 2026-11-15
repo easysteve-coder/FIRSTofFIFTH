@@ -17,7 +17,7 @@ struct TransportView: View {
     private var s: Str { Str(lang) }
     private func tip(_ text: String) -> String { showTooltips ? text : "" }
 
-    /// GUI-01-R1: gemeinsame Außenhöhe von Positionsanzeige und SWING-Platte (BPM-Platte seit v1.18.22 in der Anzeige).
+    /// GUI-01-R1: Außenhöhe der Positionsanzeige (BPM seit v1.18.22 in der Anzeige, Swing seit v1.18.34 als kleiner Regler ohne Platte).
     private static let plateHeight: CGFloat = 84
 
     // Maps internal 50–75 range to display 0–100%
@@ -116,17 +116,12 @@ struct TransportView: View {
 
             sep
 
-            // ── Swing ─────────────────────────────────────────────────────
-            MetalPlate(tone: .lightAluminium, cornerRadius: 6) {
-                KnobView(label: "SWING", value: swingBinding,
-                         range: 0...100, size: 36,
-                         accentColor: VintageTheme.amber, onLight: true, showsValue: false)
-                    .fixedSize()
-                    .padding(.horizontal, 4)
-                    .frame(height: Self.plateHeight)
-                    .help(tip(s.swingTooltip))
-            }
-            .padding(.horizontal, 2)
+            // ── Swing: kleiner Drehregler auf der Leiste, ohne Alu-Platte (v1.18.34) ──
+            KnobView(label: "SWING", value: swingBinding, range: 0...100, size: 22,
+                     accentColor: VintageTheme.amber, resetValue: 0)
+                .fixedSize()
+                .help(tip(s.swingTooltip))
+                .padding(.horizontal, 6)
 
             sep
 

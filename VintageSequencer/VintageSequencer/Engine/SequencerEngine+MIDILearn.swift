@@ -208,6 +208,7 @@ extension SequencerEngine {
     /// `route`: −1 = externe MIDI-Ausgabe, sonst Slot eines gehosteten Instruments.
     func previewPlay(notes: [Int], channel: Int, velocity: Int = 90, route: Int = -1) {
         stopPreview()
+        let channel = route >= 0 ? TrackData.instrumentChannel : channel
         previewChannel = channel
         previewRoute   = route
         previewEpoch   = route < 0 ? 0 : rack.queue(route).occupancyEpoch

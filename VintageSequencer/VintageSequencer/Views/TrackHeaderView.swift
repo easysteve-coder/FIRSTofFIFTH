@@ -103,32 +103,11 @@ struct TrackHeaderView: View {
 
                 Spacer()
 
-                // Ausgangswahl: „MIDI" = externes MIDI, „AU" = Instrumentenkanal (der MIDI-Kanal
-                // gilt dann innerhalb des Instruments). Eigene Blatt-View: nur sie folgt der
-                // Kanalliste des Racks.
+                // Ausgangswahl (v1.18.33): ein Menü für externes MIDI mit Kanal und die
+                // Instrumentenkanäle. Der MIDI-Kanal gilt nur für externes MIDI. Eigene
+                // Blatt-View: nur sie folgt der Kanalliste des Racks.
                 TrackOutputMenu(track: track, directory: engine.rack.directory,
                                 accent: accentColor, s: s)
-                    .padding(.trailing, 2)
-                Picker("", selection: Binding(
-                    get: { track.midiChannel },
-                    set: { ch in
-                        writer.apply(.setMIDIChannel(trackID: track.id,
-                                                      old: track.midiChannel,
-                                                      new: ch),
-                                     to: track.data, undoManager: nil)
-                    }
-                )) {
-                    ForEach(1...16, id: \.self) { ch in
-                        Text(ch == 10 ? "10 ◆" : "\(ch)")
-                            .font(VintageTheme.monoSmall)
-                            .tag(ch)
-                    }
-                }
-                .labelsHidden()
-                .controlSize(.small)
-                .font(VintageTheme.monoSmall)
-                .frame(width: 52)
-                .help(tip(s.midiChannelTooltip))
             }
 
             // ── Row 3: FEEL · SCL  ·  RND · CLR ──────────────────────────
@@ -337,7 +316,20 @@ struct TrackOutputItems: View {
         // Audio-Loop-Spuren spielen nur Audio-Loop-Kanäle, alle anderen nur Instrumentenkanäle.
         let loop = track.data.isAudioLoop
         let entries = directory.entries.filter { $0.isAudioLoop == loop }
-        if !loop { item(nil, s.trackOutputMIDI, current) }
+        if !loop {
+            // Externes MIDI ▸ Kanal 01 … 16 (v1.18.33): Ausgang und Kanal in einem Schritt.
+            Menu {
+                ForEach(1...16, id: \.self) { ch in
+                    Button { engine.setMIDIOutput(of: track.data, channel: ch) } label: {
+                        if current == nil && track.midiChannel == ch {
+                            Label(s.trackOutputChannel(ch), systemImage: "checkmark")
+                        } else { Text(s.trackOutputChannel(ch)) }
+                    }
+                }
+            } label: {
+                if current == nil { Label(s.trackOutputMIDI, systemImage: "checkmark") } else { Text(s.trackOutputMIDI) }
+            }
+        }
         if !entries.isEmpty && !loop { Divider() }
         ForEach(entries) { item($0.id, $0.name, current) }
         if !loop { Divider() }
@@ -361,7 +353,9 @@ struct TrackOutputItems: View {
     }
 }
 
-/// Taste „MIDI"/„AU" im Spurkopf mit der Ausgangswahl als Menü.
+/// Ausgangstaste im Spurkopf: zeigt „MIDI 05“ bzw. den Namen des Instrumentenkanals und
+/// öffnet die Ausgangswahl (v1.18.33: der MIDI-Kanal steckt im Untermenü „Externes MIDI“,
+/// die eigene Kanalwahl daneben entfällt).
 ///
 /// Klickfläche ist die ganze Taste (v1.16.2): ein Button mit `.fullArea` öffnet beim Klick ein
 /// AppKit-Menü — wie `CCTargetButton`. Ein SwiftUI-`Menu` (borderless) reagiert nur auf die
@@ -376,15 +370,20 @@ struct TrackOutputMenu: View {
 
     var body: some View {
         let routed = directory.entries.first { $0.id == track.instrumentID }
+        let ch = track.midiChannel
         Button { showMenu() } label: {
-            HStack(spacing: 1) {
-                Text(routed == nil ? "MIDI" : "AU")
+            HStack(spacing: 3) {
+                Text(routed?.name ?? "MIDI \(String(format: "%02d", ch))\(ch == 10 ? " ◆" : "")")
                     .font(VintageTheme.monoSmall)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 6, weight: .bold))
             }
+            .padding(.horizontal, 5)
             .foregroundColor(routed == nil ? VintageTheme.textPrimary : .black)
-            .frame(width: 38, height: 20)
+            .frame(width: 82, height: 20)
             .background(
                 ZStack {
                     PlasticKeyBackground(cornerRadius: 3)
@@ -401,7 +400,7 @@ struct TrackOutputMenu: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.fullArea)
-        .help(routed.map { s.trackOutputHelp($0.name) } ?? s.trackOutputChooseHelp)
+        .help(routed.map { s.trackOutputHelp($0.name) } ?? s.trackOutputChooseHelp(ch))
     }
 
     /// Dieselben Einträge wie `TrackOutputItems` (Kontextmenü), beim Klick gebaut.
@@ -413,9 +412,18 @@ struct TrackOutputMenu: View {
         let menu = NSMenu()
         menu.autoenablesItems = false
         if !loop {
-            menu.addItem(ClosureMenuItem(title: s.trackOutputMIDI, checked: current == nil) {
-                engine.setOutput(of: td, to: nil)
-            })
+            let midi = NSMenuItem(title: s.trackOutputMIDI, action: nil, keyEquivalent: "")
+            midi.state = current == nil ? .on : .off
+            let sub = NSMenu()
+            sub.autoenablesItems = false
+            for ch in 1...16 {
+                sub.addItem(ClosureMenuItem(title: s.trackOutputChannel(ch),
+                                            checked: current == nil && td.midiChannel == ch) {
+                    engine.setMIDIOutput(of: td, channel: ch)
+                })
+            }
+            midi.submenu = sub
+            menu.addItem(midi)
             if !entries.isEmpty { menu.addItem(.separator()) }
         }
         for e in entries {

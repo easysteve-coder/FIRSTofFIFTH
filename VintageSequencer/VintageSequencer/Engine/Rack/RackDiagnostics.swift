@@ -36,7 +36,7 @@ final class RackDiagnostics {
     let recorder: AudioDiagnostics
     private var lastMasterBlocks = 0
     private var lastChannelBlocks: [UUID: Int] = [:]
-    private var lastQueue: [UUID: (rejected: Int, backlog: Int, pre: Int, post: Int, err: Int)] = [:]
+    private var lastQueue: [UUID: (rejected: Int, backlog: Int, pre: Int, post: Int, err: Int, stale: Int)] = [:]
     private var lastSample: Date?
     private var observations: [UUID: [NSKeyValueObservation]] = [:]
 
@@ -91,7 +91,7 @@ final class RackDiagnostics {
             let q = c.queue
             let cur = (rejected: q.rejected.load(ordering: .relaxed), backlog: q.backlog.load(ordering: .relaxed),
                        pre: q.preRenders.load(ordering: .relaxed), post: q.postRenders.load(ordering: .relaxed),
-                       err: q.renderErrors.load(ordering: .relaxed))
+                       err: q.renderErrors.load(ordering: .relaxed), stale: q.staleNoteOns.load(ordering: .relaxed))
             let last = lastQueue[id] ?? cur
             lastQueue[id] = cur
             row["name"] = c.data.name
@@ -102,6 +102,7 @@ final class RackDiagnostics {
             row["auPre"] = cur.pre &- last.pre             // Render-Durchläufe des Instruments
             row["auPost"] = cur.post &- last.post
             row["auErr"] = cur.err &- last.err
+            row["staleOn"] = cur.stale &- last.stale       // verworfene überfällige Note-Ons (v1.18.36)
             if let u = c.instrument {
                 row["rr"] = u.auAudioUnit.renderResourcesAllocated
                 row["format"] = Self.describe(u.outputFormat(forBus: 0))

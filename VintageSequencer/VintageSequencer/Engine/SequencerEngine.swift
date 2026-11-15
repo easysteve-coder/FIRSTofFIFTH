@@ -1169,7 +1169,7 @@ class SequencerEngine: ObservableObject {
             }
             return TrackSnapshot(
                 lane:          laneSnap,
-                midiChannel:   max(1, min(16, track.midiChannel)),
+                midiChannel:   track.outputChannel(route: route),
                 isMuted:       track.isMuted,
                 isSolo:        track.isSolo,
                 timingOffset:  track.timingOffset,
@@ -1964,7 +1964,7 @@ class SequencerEngine: ObservableObject {
         if route < 0 {
             midi.noteOff(channel: td.midiChannel, note: note)
         } else {
-            rack.sendFromMain(route: route, UInt8(0x80 | (td.midiChannel - 1) & 0x0F), UInt8(note & 0x7F), 0)
+            rack.sendFromMain(route: route, UInt8(0x80 | (td.outputChannel(route: route) - 1) & 0x0F), UInt8(note & 0x7F), 0)
         }
     }
 
@@ -1986,6 +1986,16 @@ class SequencerEngine: ObservableObject {
         rack.highlightedChannel = channelID
     }
 
+    /// Externes MIDI auf Kanal `channel` (v1.18.33, Untermenü der Ausgangswahl). Undo wie
+    /// bisher: der Ausgang ja, der Kanal nein (Containerfeld; wirkt nur bei externem MIDI).
+    func setMIDIOutput(of td: TrackData, channel: Int) {
+        let ch = max(1, min(16, channel))
+        if td.midiChannel != ch {
+            ModelWriter().apply(.setMIDIChannel(trackID: td.id, old: td.midiChannel, new: ch), to: td)
+        }
+        setOutput(of: td, to: nil)
+    }
+
     /// Legt einen Instrumentenkanal an und macht ihn zum Ausgang der Spur. nil, wenn das
     /// Rack voll ist. Undo nimmt nur die Zuweisung zurück; der Kanal bleibt bestehen.
     @discardableResult
@@ -1999,7 +2009,7 @@ class SequencerEngine: ObservableObject {
     func previewNote(_ note: Int, on td: TrackData, velocity: Int = 90, duration: Double = 0.35) {
         let route = rack.route(for: td.output)
         let epoch = rack.routeEpoch(for: td.output)   // Off nur an dieselbe Belegung
-        let ch    = td.midiChannel
+        let ch    = td.outputChannel(route: route)
         if route < 0 {
             midi.noteOn(channel: ch, note: note, velocity: velocity)
         } else {

@@ -1,13 +1,120 @@
 # FIRSTofFIFTH — Engineering
 
-Stand: v1.18.32 (15. November 2026). Aktuelle Verträge stehen oben, je Abschnitt mit der
+Stand: v1.18.38 (15. November 2026). Aktuelle Verträge stehen oben, je Abschnitt mit der
 Version, ab der sie gelten; ältere Abschnitte sind historische Nachweise ihrer Version.
 Prinzip: evolutionär, kein Big Bang. Für neue Echtzeitpfade gilt keine pauschale Freigabe aus
 früheren Läufen — jeder Pfad braucht seinen eigenen Nachweis (Test bzw. Messung).
 
 ---
 
-## Plug-in-Wiederanlauf (ab v1.18.32)
+## Fehlergrenze um Engine-Operationen an Plug-ins (ab v1.18.38)
+
+- `Engine/Rack/ObjCExceptionBarrier.{h,m}` (Bridging-Header): je eine C-Funktion für `connect`,
+  `disconnectNodeOutput`, `disconnectNodeInput`, `attach`, `detach`, `prepare`+`start`, `stop`.
+  Jede führt genau den Framework-Aufruf in `@try` aus und gibt die Beschreibung einer
+  ObjC-Ausnahme zurück. Kein Swift zwischen Wurfstelle und `@catch` (Apple: ObjC-Ausnahmen nur
+  in Objective-C behandeln; Codex R38-01). `-fobjc-arc-exceptions` nur für diese Datei
+  (Ausnahmeliste der synchronisierten Gruppe im Projekt). Testhaken `FoFConnectFaultHook`,
+  `FoFCleanupFaultHook` (DEBUG) werfen innerhalb desselben `@try`.
+- `AudioGraph` benutzt sie für alle Operationen an Ketten und Plug-in-Knoten:
+  - `connectChain` → `String?`: scheitert ein `connect`, trennt der Graph die Kette wieder.
+  - Scheitert ein Aufräumen (Trennen, Lösen, Stoppen), ist der Zustand der Engine unbekannt:
+    `enterFault` → `faulted` (endgültig bis zum Neustart von FoF), höchstens ein Versuch
+    anzuhalten (scheitert er, nennt die Meldung das: die Engine kann weiterlaufen), `startError`,
+    `onFault`. Cocoa ist nicht ausnahmefest; FoF arbeitet nicht auf unbekanntem Zustand weiter.
+  - Sperre `faulted` an jedem Umbauzugang: `attach`, `detach`, `connect`, `disconnect`,
+    `connectChain`, `start`, `stop`, `adopt`, `stopAndReset`, `wireMaster`, Summen-Tap. Im Rack
+    liefern `engineStorage` und `engine()` dann nil, damit endet jeder Rack-Weg (Kanal anlegen,
+    Loop-Quelle, Gates, Fader, Taps); Wächter ohne Befund, kein Geräte-Neuaufbau, laufender
+    Neuaufbau bricht ab, späte Meldungen und Ladeabschlüsse bauen nichts mehr (Codex R38-R2-01).
+  - `start`: Ausnahme in `prepare`/`start` → `stop`; gelingt das, steht die Engine mit
+    `startError` (die Meldung des Plug-ins führt später zum Wiederanlauf), sonst `faulted`.
+    `onWillStart` liegt außerhalb der Grenze: er setzt `musicalContextBlock`/`transportStateBlock`
+    an den `AUAudioUnit`s. Ob das an einer toten Einheit eine Ausnahme wirft, ist nicht belegt
+    (offenes Risiko, im realen Absturzversuch beobachten).
+- `InstrumentRack`:
+  - `rewire` → Bool (false: Graph außer Betrieb oder `connectFailed`). `hook` verbindet über
+    den Graph; scheitert es, gilt das wie ein gescheitertes `connectChain`.
+  - `connectFailed`: Kanalfehler, kein bestätigter Prozesstod. Alle Plug-ins des Kanals per
+    `markDead` (erst vormerken und Status `.loading`, dann abbauen, R38-04), Durchlauf planen.
+    `recoveryLockout` begrenzt Wiederholungen. Ungesicherte Klangänderungen gesunder Plug-ins
+    desselben Kanals gehen dabei verloren.
+  - Ladeabschlüsse: `graph.attach`, `rewire`; scheitert eines, bricht der Abschluss ab.
+    `loadInstrument`/`loadEffect` laden außer Betrieb gar nicht erst (Status `.missing`); ein
+    abgewiesenes `attach` setzt `.missing`. `rewire` prüft `faulted` vor allem anderen und nach
+    `adopt` (R38-R3-02).
+  - Kanal entfernen (`uninstall`): erst die Plug-ins über die Grenze lösen; scheitert eines,
+    bleibt die gespeicherte Engine unberührt, nur das Modell wird bereinigt (R38-R3-01).
+  - `recoverPendingPlugins`: scheitert `rewire` eines Kanals, gehen seine offenen Plätze
+    verlustfrei in die nächste Runde; bei `faulted` endet der Durchlauf sofort, ohne etwas
+    wieder einzusetzen. `connectFailed` bricht nach dem ersten gescheiterten Abbau ab;
+    `markDead`/`scheduleRecoveryPass` tun außer Betrieb nichts. Vor jedem einzelnen Nachladeauftrag
+    erneute Prüfung (ein synchroner Abschluss kann stilllegen, R38-R3-03).
+  - `setRenderRate`: Observer nur nach gelungenem `rewire`, Start nicht während des Wiederanlaufs.
+  - `graphFaulted`: Wiederanlauf verworfen, wartende Plätze `.loading` → `.missing`,
+    `engineError` sichtbar, `isAudioRunning` = tatsächlicher Laufzustand, Diagnose `graphFault`.
+  - Nach gelungenem Aufräumen arbeitet FoF mit derselben Engine weiter. Dafür gibt es keinen
+    Framework-Vertrag; das ist ein Wiederherstellungsversuch, kein Beweis.
+- Nicht abgedeckt: interne Knoten (Gain, Mixer, Gates, Loop-Quellen, Summe), Taps,
+  Formatabfragen, `renderResourcesAllocated`. Nicht gemessen: Verhalten an einem echten toten
+  XPC-Proxy (Tests speisen die Ausnahme im `@try` ein; In-Process-Ersatzobjekte, synchrone
+  Ladeabschlüsse).
+
+## Plug-in-Wiederanlauf ohne tote Knoten (ab v1.18.37; ersetzt den Ablauf von v1.18.32)
+
+- Auslöser (iMac 17:18, Crash-Reports `.agent_handoff/crash_2026-11-15/`): Effekt und Instrument
+  eines Kanals starben mit ihrem Host-Prozess; die Meldung des Effekts kam zuerst, sein
+  Wiederanlauf verband den Kanal mit dem noch nicht gemeldeten toten Instrument.
+  `AVAudioEngine.connect` wirft dann eine ObjC-Ausnahme (`AUInterfaceBaseV3::SetFormat`), FoF endet.
+- Vertrag (`InstrumentRack.pluginInvalidated`, Main):
+  - Tot ist, was sich meldet, je Instanz (`locate`: konkrete aktuelle AU-Instanz). Keine Annahme
+    eines gemeinsamen Prozesses (native/Rosetta-Plug-ins haben getrennte Hosting-Dienste), keine
+    gespeicherten Objektkennungen.
+  - Die Meldung löst ihre Einheit sofort: Instrument `teardownInstrument(rewire: false)`, Effekt
+    `removeDeadEffect` (Editor, Warteschlange, Observer, Host-Bindung, `detach`). Status des
+    Platzes sofort `.loading`. Kanal und Plätze (Effekt nach Token) in `pendingRecovery`.
+  - `isRecoveringPlugins` (pendingRecovery ≠ leer): keine automatischen Starts
+    (`updateEngineRunning`), keine `adopt`-Neustarts, Wächter ohne Befund (`needed` false),
+    Geräte-Neuaufbau vorgemerkt (`rebuildAfterRecovery`). Nutzeraktionen laufen weiter.
+  - Durchlauf `recoverPendingPlugins`, wenn `recoveryQuietTime` (0,3 s) ohne neue Meldung
+    vergangen ist (Generationszähler): ggf. vorgemerkter Neuaufbau, je Kanal einmal `rewire`,
+    Effekte nachladen (nur wenn das Token noch besteht und der Platz leer ist), Instrument
+    nachladen (nur wenn leer und kein Ladeauftrag), am Ende `updateEngineRunning`.
+    Ladeabschlüsse verbinden ihren Kanal danach wie gewohnt.
+  - Sperre `recoveryLockout` je Platz wie bisher.
+- Grenze (Codex R2-01, offen): Eine tote Einheit, deren Meldung noch aussteht, kennt FoF nicht.
+  Trifft eine Nutzeraktion (Laden, Effekt verschieben, Render-Rate) ihren Kanal vorher, kann
+  `connect` weiterhin werfen. Die Ruhezeit bündelt, sie beweist keine Vollständigkeit. Seit
+  v1.18.38 fängt die Fehlergrenze (oben) diesen Fall ab.
+- Nachweis: `PluginRecoveryTests` (In-Process-Ersatzobjekte, synchrone Ladeabschlüsse; belegt die
+  Zustandsmaschine, nicht das Verhalten toter XPC-Proxies).
+
+## Überfällige Note-Ons (ab v1.18.36)
+
+- `AUEventQueue.render` (Audio-Thread): Ein Ereignis mit Zeitstempel ≠ 0, das mehr als
+  `staleFrames` (4096) · `ticksPerFrame` vor Blockbeginn liegt, wird verworfen, wenn es ein
+  Note-On mit Anschlag > 0 ist (`isNoteOn`). Alles andere (Offs, Note-On 0, CC, Parameter, Main-
+  Ereignisse mit Zeit 0) wird wie bisher auf Offset 0 ausgegeben. Zähler `staleNoteOns` (nur
+  Inkrement), Diagnose `staleOn` je Kanal.
+- Grund: Ein nicht gerendertes Instrument (Kanal stumm durch Solo/Mute, Plug-in blockiert beim
+  Laden) sammelt Tick-Ereignisse; bisher kamen sie im nächsten Block alle zugleich (+19 dBFS).
+- Das Notenbuch bleibt unberührt: es sieht die Note als ausgegeben, ihr Off geht regulär hinaus.
+
+## Ausgabekanal gehosteter Instrumente (ab v1.18.33)
+
+- `TrackData.outputChannel(route:)`: route < 0 (externes MIDI) → `midiChannel` (1…16),
+  sonst `TrackData.instrumentChannel` = 1. Einzige Quelle für den Kanal der Ausgabe: Snapshot
+  (`TrackSnapshot.midiChannel`, damit Steps, Ratchets, CC und Notenbuch), `previewPlay`,
+  `previewNote`, `sendImmediateNoteOff`. Tick-Pfad unverändert (liest den Snapshot).
+- Grund: Die Sperrgruppe (`AUEventQueue.emitDrum`) sendet ihre Offs auf dem Kanal der neuen
+  Note; der Sampler führt Stimmen je Kanal. Mit einem Kanal je Instrument treffen sich alle
+  Spuren eines Kits. Folge: zwei Spuren mit derselben Note auf einem Instrument teilen sich
+  eine Stimme (wie ein Kanal am Gerät). Mehrkanalbetrieb eines Plug-ins wird nicht angeboten.
+- Ausgangswahl: `TrackOutputMenu` (AppKit-Menü, Untermenü „Externes MIDI ▸ Kanal“) und
+  `TrackOutputItems` (Kontextmenü) mit denselben Einträgen; `SequencerEngine.setMIDIOutput`
+  setzt Kanal (ModelWriter, ohne Undo wie bisher) und Ausgang (Undo).
+
+## Plug-in-Wiederanlauf (v1.18.32; Ablauf ersetzt ab v1.18.37, siehe oben)
 
 - Out-of-process geladene Plug-ins teilen sich einen AU-Host-Prozess. Stirbt er, meldet macOS
   jede Instanz einzeln (`kAudioComponentInstanceInvalidationNotification`, Beobachter ohne
@@ -458,8 +565,9 @@ Alle Wege laufen auf Main. „Dirty" = `hasUnsavedChanges`; „Snapshot" = Playb
 
 | Aktion | Weg | Undo | Dirty | Snapshot |
 |---|---|---|---|---|
-| Steps, Länge, Ratio, Tonhöhen, Name, Farbe, Drum-Modus, MIDI-Kanal, Offset, Skala | `ModelWriter` | ja | ja | bei Playback |
-| Richtung, Mute, Solo | `ModelWriter` | nein (bewusst: Spielhandlung) | ja | bei Playback |
+| Steps, Länge, Ratio, Tonhöhen, Name, Farbe, Drum-Modus, Offset, Skala | `ModelWriter` | ja | ja | bei Playback |
+| Ausgang (Externes MIDI ▸ Kanal, Instrumentenkanal) | Engine `setMIDIOutput`/`setOutput` | Ausgang ja, Kanal nein | ja | ja |
+| Richtung, Mute, Solo, MIDI-Kanal | `ModelWriter` | nein (bewusst: Spielhandlung; Kanal seit jeher ohne Undo) | ja | bei Playback |
 | Spur anlegen/einfügen/duplizieren/löschen | Engine `…Undoable` (Platzierungen, Transaktion) | ja | ja | ja |
 | Spur verschieben | Engine `moveTrackUndoable` (`TrackOrder`) | ja | ja | ja |
 | Spur ein-/ausklappen | Engine `setTrackCollapsedUndoable` (`CollapseChange`, `viewChanged`) | ja | ja | nein |

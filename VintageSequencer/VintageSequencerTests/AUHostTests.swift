@@ -52,7 +52,7 @@ struct AUEventQueueTests {
     /// Überfällige und „sofort"-Ereignisse gehen mit Offset 0 in den nächsten Block.
     @Test func lateAndImmediateEventsGoOutAtOffsetZero() {
         let q = activeQueue()
-        q.pushFromTick(0x90, 60, 100, at: 500)       // schon vorbei
+        q.pushFromTick(0x90, 60, 100, at: 90_000)    // schon vorbei (unter der Verwurfsgrenze, v1.18.36)
         q.pushFromMain(0x80, 61, 0)                   // hostTime 0 = sofort
         let out = render(q, start: 100_000)
         #expect(Set(out.map(\.b1)) == [60, 61])
@@ -193,7 +193,7 @@ struct AUEventQueueTests {
         let new = q.beginOccupancy()
         #expect(q.pushFromTick(0x90, 61, 100, at: 1, epoch: old), "verworfen gilt als erledigt")
         #expect(q.pushFromMain(0x80, 62, 0, epoch: old))
-        q.pushFromTick(0x90, 63, 100, at: 1, epoch: new)
+        q.pushFromTick(0x90, 63, 100, at: 40_000, epoch: new)   // knapp überfällig, nicht verworfen
         let out = render(q, start: 50_000)
         #expect(out.map(\.b1) == [63])
         // Wechsel mitten im Block: Ereignis der neuen Belegung kommt durch.
@@ -255,20 +255,20 @@ struct AUEventQueueTests {
         engine._rt3aDriveOneExternalTick(at: mach_absolute_time() + 1_000_000)
 
         let au = drain(engine.rack.queue(route))
-        #expect(au.contains { $0.b0 == 0x92 && $0.b1 == 60 }, "Note-On Kanal 3 im Instrument")
+        #expect(au.contains { $0.b0 == 0x90 && $0.b1 == 60 }, "Note-On im Instrument auf Kanal 1, Spurkanal 3 gilt nur für MIDI (v1.18.33)")
         let midiOns = log.all.filter { $0.0 & 0xF0 == 0x90 }
         #expect(midiOns.contains { $0.1 == 67 }, "ungeroutete Spur → CoreMIDI")
         #expect(!midiOns.contains { $0.1 == 60 }, "geroutete Spur darf nicht an CoreMIDI gehen")
-        #expect(engine._noteBookPendingOff(channel: 3, note: 60, route: route) != 0, "Off im Buchabschnitt des Instruments")
+        #expect(engine._noteBookPendingOff(channel: 1, note: 60, route: route) != 0, "Off im Buchabschnitt des Instruments")
         #expect(engine._noteBookPendingOff(channel: 3, note: 60) == 0)
 
         // Stop: geplante Ereignisse verworfen, Note beendet, Buch leer.
         engine.stop()
         let after = drain(engine.rack.queue(route))
-        #expect(after.contains { $0.b0 == 0x82 && $0.b1 == 60 }, "Note-Off nach Stop")
+        #expect(after.contains { $0.b0 == 0x80 && $0.b1 == 60 }, "Note-Off nach Stop")
         #expect(after.contains { $0.b0 & 0xF0 == 0xB0 && $0.b1 == 123 }, "All Notes Off nach Stop")
         #expect(!after.contains { $0.b0 & 0xF0 == 0x90 })
-        #expect(engine._noteBookEntry(channel: 3, note: 60, route: route) == 0)
+        #expect(engine._noteBookEntry(channel: 1, note: 60, route: route) == 0)
     }
 
     /// CC-Lane mit Instrument-Parameter als Ziel (v1.13.9): der Tick-Pfad reiht ein
@@ -305,7 +305,7 @@ struct AUEventQueueTests {
         #expect(!midi.contains { $0 & 0xF0 == 0xB0 && ($0 >> 8) & 0x7F == 74 })
         engine.stop()
 
-        // Ziel entfernt → wieder MIDI-CC auf Kanal 5 im Instrument.
+        // Ziel entfernt → wieder MIDI-CC im Instrument, auf Kanal 1 (Spurkanal 5 gilt nur für MIDI, v1.18.33).
         ModelWriter().apply(.setCCLaneParameter(trackID: td.id, old: td.lane.ccParameter, new: nil),
                             to: td, undoManager: nil)
         engine.play()
@@ -315,7 +315,7 @@ struct AUEventQueueTests {
                                         emit: { _, p in midi.append(p) },
                                         emitParameter: { _, a, v in params.append((a, v)) })
         #expect(params.isEmpty)
-        #expect(midi.contains { $0 & 0xFF == 0xB4 && ($0 >> 8) & 0x7F == 74 && ($0 >> 16) & 0x7F == 127 })
+        #expect(midi.contains { $0 & 0xFF == 0xB0 && ($0 >> 8) & 0x7F == 74 && ($0 >> 16) & 0x7F == 127 })
         engine.stop()
     }
 

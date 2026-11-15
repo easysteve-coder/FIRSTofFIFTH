@@ -1,6 +1,6 @@
 # FIRSTofFIFTH — Lizenz und Drittkomponenten / License and third-party notices
 
-Stand: v1.18.32 (15.11.2026). Diese Datei liegt im Quellcode und im App-Bundle
+Stand: v1.18.38 (15.11.2026). Diese Datei liegt im Quellcode und im App-Bundle
 (`FIRSTofFIFTH.app/Contents/Resources/`). Sie dokumentiert die Lizenzlage nach bestem Wissen; sie
 ist keine Rechtsberatung und keine rechtliche Freigabe.
 

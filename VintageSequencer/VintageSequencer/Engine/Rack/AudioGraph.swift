@@ -42,10 +42,11 @@ final class AudioGraph {
 
     deinit {
         if let o = configObserver { NotificationCenter.default.removeObserver(o) }
-        engineIfCreated?.stop()
+        if let e = engineIfCreated { _ = FoFEngineStop(e) }
     }
 
     /// Die Engine, bei Bedarf angelegt (mit verdrahteter Summe und Wechselbeobachtung).
+    /// Außer Betrieb liefert sie weiter die alte Engine; Umbauer fragen vorher `faulted`.
     func engine() -> AVAudioEngine {
         if let e = engineIfCreated { return e }
         let e = AVAudioEngine()
@@ -71,7 +72,7 @@ final class AudioGraph {
     /// Main-Mixer → Gain-Stufe der Summe → Ausgang. Ohne bekanntes Ausgabeformat bleibt die
     /// Standardverbindung (Main-Mixer → Ausgang) bestehen.
     func wireMaster() {
-        guard let e = engineIfCreated else { return }
+        guard faulted == nil, let e = engineIfCreated else { return }
         if let format = mixFormat {
             e.connect(e.mainMixerNode, to: masterGain, format: format)
             e.connect(masterGain, to: e.outputNode, format: format)
@@ -97,7 +98,7 @@ final class AudioGraph {
     var masterGainDB: Float { masterGain.globalGain }
 
     func installMasterTap() {
-        guard !masterTapInstalled, let e = engineIfCreated, mixFormat != nil else { return }
+        guard faulted == nil, !masterTapInstalled, let e = engineIfCreated, mixFormat != nil else { return }
         let meter = masterMeter
         masterTapNode = masterGainWired ? masterGain : e.mainMixerNode
         masterTapNode?.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in meter.feed(buffer) }
@@ -105,7 +106,7 @@ final class AudioGraph {
     }
 
     func removeMasterTap() {
-        guard masterTapInstalled else { return }
+        guard faulted == nil, masterTapInstalled else { return }
         masterTapNode?.removeTap(onBus: 0)
         masterTapNode = nil
         masterTapInstalled = false
@@ -114,27 +115,100 @@ final class AudioGraph {
 
     // MARK: Verbindungen
 
-    /// Trennt die Ausgänge von `chain` und den Eingang von `sink`.
-    func disconnect(_ chain: [AVAudioNode], from sink: AVAudioNode) {
-        guard let e = engineIfCreated else { return }
-        chain.forEach { e.disconnectNodeOutput($0) }
-        e.disconnectNodeInput(sink)
+    // MARK: Fehlergrenze (v1.18.38)
+    //
+    // `connect` an einer toten ausgelagerten Einheit wirft eine ObjC-Ausnahme (iMac 17:18,
+    // `AUInterfaceBaseV3::SetFormat`), die FoF sonst beendet. Alle Engine-Operationen an
+    // Plug-in-Knoten laufen über die Funktionen in `ObjCExceptionBarrier.m`: eine Operation je
+    // @try, kein Swift zwischen Wurfstelle und @catch. Scheitert ein Verbinden, trennt der Graph
+    // die Kette wieder. Scheitert dieses Aufräumen (oder ein Lösen/Stoppen), ist der Zustand der
+    // Engine unbekannt: der Graph geht in `faulted`, hält an und nimmt keine Operation mehr an.
+    // Audio bleibt dann aus, bis FoF neu startet (Cocoa ist nicht ausnahmefest; Codex R38-02).
+
+    /// Grund, warum der Graph außer Betrieb ist (nil = in Ordnung). Endgültig bis zum Neustart.
+    private(set) var faulted: String?
+    /// Der Graph ist eben außer Betrieb gegangen (Main).
+    var onFault: ((String) -> Void)?
+
+    /// `stopFailed`: der auslösende Fehler war schon ein gescheitertes Anhalten (kein zweiter Versuch).
+    private func enterFault(_ reason: String, stopFailed: Bool = false) {
+        guard faulted == nil else { return }
+        var text = reason
+        // Höchstens ein Versuch anzuhalten, kein Wiederholen auf unbekanntem Zustand. Scheitert er,
+        // sagt die Meldung das: die Engine kann weiterlaufen (Codex R38-R2-03).
+        if !stopFailed, let e = engineIfCreated, e.isRunning, let f = FoFEngineStop(e) { text += " — stop: \(f)" }
+        faulted = text
+        startError = text
+        onFault?(text)
+    }
+
+    /// Hängt einen Knoten an. false: gescheitert, Graph außer Betrieb.
+    @discardableResult
+    func attach(_ node: AVAudioNode) -> Bool {
+        guard faulted == nil else { return false }
+        if let f = FoFEngineAttach(engine(), node) { enterFault("attach: \(f)"); return false }
+        return true
+    }
+
+    /// Löst einen Knoten. false: gescheitert, Graph außer Betrieb.
+    @discardableResult
+    func detach(_ node: AVAudioNode) -> Bool {
+        guard faulted == nil, let e = engineIfCreated else { return false }
+        if let f = FoFEngineDetach(e, node) { enterFault("detach: \(f)"); return false }
+        return true
+    }
+
+    /// Trennt den Ausgang eines Knotens. false: gescheitert, Graph außer Betrieb.
+    @discardableResult
+    func disconnectOutput(_ node: AVAudioNode) -> Bool {
+        guard faulted == nil, let e = engineIfCreated else { return false }
+        if let f = FoFEngineDisconnectOutput(e, node) { enterFault("disconnect: \(f)"); return false }
+        return true
+    }
+
+    /// Verbindet zwei Knoten. Rückgabe: nil = verbunden, sonst die Ausnahme (Graph bleibt in Betrieb;
+    /// der Aufrufer räumt auf).
+    func connect(_ a: AVAudioNode, to b: AVAudioNode, format: AVAudioFormat?) -> String? {
+        guard faulted == nil, let e = engineIfCreated else { return faulted ?? "no engine" }
+        return FoFEngineConnect(e, a, b, format)
+    }
+
+    /// Trennt die Ausgänge von `chain` und den Eingang von `sink`. false: Aufräumen gescheitert,
+    /// Graph außer Betrieb.
+    @discardableResult
+    func disconnect(_ chain: [AVAudioNode], from sink: AVAudioNode) -> Bool {
+        guard faulted == nil, let e = engineIfCreated else { return false }
+        for n in chain {
+            if let f = FoFEngineDisconnectOutput(e, n) { enterFault("disconnect: \(f)"); return false }
+        }
+        if let f = FoFEngineDisconnectInput(e, sink) { enterFault("disconnect: \(f)"); return false }
+        return true
     }
 
     /// Verbindet `chain` (Quelle zuerst) der Reihe nach in `sink`. Neue Knoten bei laufender
     /// Engine nimmt `adopt` in den Renderweg auf.
     /// `headFormat`: Format der ersten Verbindung (eigene Rate des Instruments vor der
     /// Umrechnungsstufe), sonst das Mischformat.
-    func connectChain(_ chain: [AVAudioNode], into sink: AVAudioNode, headFormat: AVAudioFormat? = nil) {
-        guard let e = engineIfCreated else { return }
-        disconnect(chain, from: sink)
-        guard var upstream = chain.first else { return }
+    /// - Returns: nil = verbunden; sonst die Ausnahme. Die Kette ist dann wieder ganz getrennt,
+    ///   oder (Aufräumen gescheitert) der Graph ist außer Betrieb (`faulted`).
+    @discardableResult
+    func connectChain(_ chain: [AVAudioNode], into sink: AVAudioNode, headFormat: AVAudioFormat? = nil) -> String? {
+        guard faulted == nil, engineIfCreated != nil else { return faulted }
+        guard disconnect(chain, from: sink) else { return faulted }
+        guard var upstream = chain.first else { return nil }
         let format = mixFormat
         for (i, node) in chain.dropFirst().enumerated() {
-            e.connect(upstream, to: node, format: i == 0 ? (headFormat ?? format) : format)
+            if let f = connect(upstream, to: node, format: i == 0 ? (headFormat ?? format) : format) {
+                disconnect(chain, from: sink)
+                return f
+            }
             upstream = node
         }
-        e.connect(upstream, to: sink, format: format)
+        if let f = connect(upstream, to: sink, format: format) {
+            disconnect(chain, from: sink)
+            return f
+        }
+        return nil
     }
 
     /// Nimmt bei laufender Engine neu verbundene Knoten in den Renderweg auf.
@@ -147,8 +221,8 @@ final class AudioGraph {
     /// - Returns: true, wenn neu gestartet wurde.
     @discardableResult
     func adopt(_ nodes: [AVAudioNode]) -> Bool {
-        guard adoptNeeded(nodes), let e = engineIfCreated else { return false }
-        e.stop()
+        guard faulted == nil, adoptNeeded(nodes), let e = engineIfCreated else { return false }
+        if let f = FoFEngineStop(e) { enterFault("stop: \(f)", stopFailed: true); return false }
         start()
         return true
     }
@@ -161,23 +235,33 @@ final class AudioGraph {
 
     // MARK: Lauf
 
-    /// (Neu-)Start: vorbereiten, starten, `onStarted` melden.
+    /// (Neu-)Start: vorbereiten, starten, `onStarted` melden. Außer Betrieb: nichts.
     func start() {
-        guard let e = engineIfCreated else { return }
+        guard faulted == nil, let e = engineIfCreated else { return }
         if !e.isRunning { onWillStart?() }
         starts += 1
-        e.prepare()
-        do { try e.start(); startError = nil }
-        catch { startError = error.localizedDescription }
+        // `prepare` reicht Formate an alle Knoten weiter; eine tote Einheit, deren Meldung noch
+        // aussteht, kann dort werfen. Dann steht die Engine mit Fehlertext; die Meldung des
+        // Plug-ins führt später zum Wiederanlauf.
+        var error: NSError?
+        if let f = FoFEnginePrepareAndStart(e, &error) {
+            if let g = FoFEngineStop(e) { enterFault("\(f) — stop: \(g)", stopFailed: true); return }
+            startError = f
+        } else {
+            startError = error?.localizedDescription
+        }
         onStarted?()
     }
 
-    func stop() { engineIfCreated?.stop() }
+    func stop() {
+        guard let e = engineIfCreated, faulted == nil else { return }
+        if let f = FoFEngineStop(e) { enterFault("stop: \(f)", stopFailed: true) }
+    }
 
     /// Wiederherstellung: Knotenzustand verwerfen (NaN im Filtergedächtnis).
     func stopAndReset() {
-        guard let e = engineIfCreated else { return }
-        e.stop()
+        guard let e = engineIfCreated, faulted == nil else { return }
+        if let f = FoFEngineStop(e) { enterFault("stop: \(f)", stopFailed: true); return }
         e.reset()
     }
 }

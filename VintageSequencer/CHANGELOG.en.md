@@ -5,6 +5,45 @@ Notable changes per version. The detailed German changelog, including technical 
 
 ---
 
+## [1.18.38] — 2026-11-15
+
+- A second safeguard against crashes caused by dead plug-ins: if connecting a channel or starting
+  the audio engine fails because a plug-in has died, FoF disconnects that channel and reloads its
+  plug-ins instead of quitting. If even the cleanup fails, FoF switches audio off and shows the
+  error in the mixer; FoF stays usable and audio returns after a restart.
+
+## [1.18.37] — 2026-11-15
+
+- FoF no longer crashes when a plug-in process crashes: each crashed plug-in is removed from the
+  audio engine as soon as macOS reports it, and the affected channels are reconnected and
+  reloaded together once all reports are in. Healthy plug-ins are left alone.
+
+## [1.18.36] — 2026-11-15
+
+- No more burst of notes after solo, mute or loading a kit: when an instrument was not rendered
+  for a while (another channel soloed, or a plug-in busy loading), the queued notes played all at
+  once. Note-ons more than about 85 ms late are now dropped; note-offs, CCs and parameters still
+  go out.
+
+## [1.18.35] — 2026-11-15
+
+- Swing is a knob again, but small and without the aluminium plate. Double-click resets it to 0%.
+
+## [1.18.34] — 2026-11-15
+
+- Swing is now a small value field in the transport bar instead of a knob on an aluminium plate:
+  drag up or down (Shift: fine), double-click to type.
+
+## [1.18.33] — 2026-11-15
+
+- Tracks playing an instrument channel now always send on MIDI channel 1; the track's MIDI
+  channel only applies to external MIDI. Before, an instrument listening on channel 1 stayed
+  silent for tracks on other channels, and hi-hat choke groups failed when open and closed
+  hi-hat were on tracks with different channels.
+- One output menu in the track header: "External MIDI ▸ Channel 01 … 16", the instrument
+  channels, and "New Instrument Channel…". The button shows "MIDI 05" or the channel name; the
+  separate channel picker is gone.
+
 ## [1.18.32] — 2026-11-15
 
 - If a plug-in crashes its out-of-process host, FoF reloads every instrument and effect that was

@@ -263,7 +263,7 @@ Die Anzahl der Steps pro Spur (1–64) änderst du:
 
 ### Swing
 
-Der **Swing-Regler** in der Transportleiste verschiebt jede zweite Sechzehntelnote leicht nach hinten.
+Der **SWING-Regler** in der Transportleiste verschiebt jede zweite Sechzehntelnote leicht nach hinten. Doppelklick setzt ihn auf 0 %.
 
 - **0%:** Gerade, mechanisch
 - **50%:** Leicht groovend
@@ -384,7 +384,7 @@ Wenn eine Spur auf **MIDI-Kanal 10** steht, schaltet sie in den Drum-Modus:
 
 ### MIDI-Kanäle
 
-Jede Spur sendet auf ihrem eigenen MIDI-Kanal (1–16). Stelle sicher, dass dein Empfänger auf dem gleichen Kanal empfängt.
+Der Ausgang einer Spur wird mit der Ausgangstaste im Spurkopf gewählt: **Externes MIDI ▸ Kanal 01–16** oder ein Instrumentenkanal. Bei externem MIDI sendet die Spur auf dem gewählten Kanal; stelle sicher, dass dein Empfänger auf dem gleichen Kanal empfängt. Gehostete Instrumente spielen immer auf Kanal 1, der MIDI-Kanal der Spur spielt dort keine Rolle (ab 1.18.33).
 
 Kanal 10 ist konventionell für Drums reserviert (General MIDI).
 
@@ -581,7 +581,7 @@ Jede Spur zeigt links:
 - **Spurname** (editierbar)
 - **M** (Mute) und **S** (Solo)
 - **Richtungs-Buttons** (Forward, Reverse, Ping-Pong, Random)
-- **CH** (MIDI-Kanal, 1–16)
+- **Ausgang** („MIDI 05“ oder Name des Instrumentenkanals; der MIDI-Kanal steckt im Untermenü „Externes MIDI“)
 - **FEEL** (Timing-Offset)
 - **SCL** (Skala)
 - **RND** (Randomize) und **CLR** (Clear)
